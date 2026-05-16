@@ -79,9 +79,9 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             device=device,
         )
 
-        # Update frame length in model
+        # Update frame length in model (must match pipeline's kv_cache allocation)
         self.generator.model._update_frame_length(
-            self.frame_seq_length, self.num_frame_per_block)
+            self.frame_seq_length, self.num_frame_per_block, self.num_kv_cache)
 
         # Initialize text encoder
         self.text_encoder = NeuronWanTextEncoder(

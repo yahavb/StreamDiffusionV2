@@ -76,14 +76,17 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         self.freqs_cos, self.freqs_sin = _init_rope_freqs(dim, num_heads)
         self.num_frame_per_block = 1
 
-    def _update_frame_length(self, new_frame_length, num_frame_per_block=3):
+    def _update_frame_length(self, new_frame_length, num_frame_per_block=3, num_kv_cache=6):
+        """Update self-attention dims to match pipeline's actual cache allocation."""
         block_length = num_frame_per_block * new_frame_length
+        kv_cache_logical_size = num_kv_cache * new_frame_length
+        max_attention_size = min(num_kv_cache, 21) * new_frame_length
         for block in self.blocks:
             attn = block.self_attn
             attn.frame_length = new_frame_length
             attn.block_length = block_length
-            attn.max_attention_size = 21 * new_frame_length
-            attn.kv_cache_logical_size = 24 * new_frame_length
+            attn.max_attention_size = max_attention_size
+            attn.kv_cache_logical_size = kv_cache_logical_size
 
     def _forward_inference(self, x, t, context, updating_cache=False,
                            kv_cache=None, crossattn_cache=None,
