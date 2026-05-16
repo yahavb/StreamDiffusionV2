@@ -16,9 +16,8 @@ import torch.nn as nn
 from einops import rearrange
 
 from models.model_interface import DiffusionModelInterface, VAEInterface, TextEncoderInterface
-from models.scheduler import FlowMatchingScheduler
+from models.wan.flow_match import FlowMatchScheduler
 from models.wan.neuron_causal_model import NeuronCausalWanModel
-from models.wan.neuron_layers import convert_flow_pred_to_x0
 
 
 # ── Text Encoder ────────────────────────────────────────────────────────
@@ -173,13 +172,25 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         # Move to Neuron
         self.model = self.model.to(device).eval()
 
-        # Scheduler
+        # Scheduler (same pattern as WanDiffusionWrapper)
         if denoising_step_list is None:
             denoising_step_list = [700, 500, 400, 200, 0]
-        self.scheduler = FlowMatchingScheduler(
-            shift=timestep_shift, num_train_timesteps=1000,
-            denoising_step_list=denoising_step_list)
+        self.scheduler = FlowMatchScheduler(
+            shift=timestep_shift, sigma_min=0.0, extra_one_step=True)
+        self.scheduler.set_timesteps(1000, training=True)
         self.post_init()
+
+    def _convert_flow_pred_to_x0(self, flow_pred, xt, timestep):
+        """Convert flow prediction to x0: x0 = xt - sigma_t * flow_pred."""
+        original_dtype = flow_pred.dtype
+        flow_pred, xt, sigmas, timesteps = map(
+            lambda x: x.float().to(flow_pred.device),
+            [flow_pred, xt, self.scheduler.sigmas, self.scheduler.timesteps])
+        timestep_id = torch.argmin(
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        x0_pred = xt - sigma_t * flow_pred
+        return x0_pred.to(original_dtype)
 
     def forward(self, noisy_image_or_video, conditional_dict, timestep,
                 kv_cache=None, crossattn_cache=None,
@@ -190,8 +201,9 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         x = noisy_image_or_video
         t = timestep
 
+        # DiT expects [B, C, F, H, W], input is [B, F, C, H, W]
         model_out = self.model(
-            x, t, context,
+            x.permute(0, 2, 1, 3, 4), t[:, 0] if t.dim() > 1 else t, context,
             updating_cache=updating_cache,
             kv_cache=kv_cache,
             crossattn_cache=crossattn_cache,
@@ -199,11 +211,16 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
             cache_start=cache_start,
             num_valid_frames=num_valid_frames,
             shared_buffers=shared_buffers,
-        )
+        ).permute(0, 2, 1, 3, 4)  # back to [B, F, C, H, W]
 
-        sigma = self.scheduler.sigma(timestep)
-        x0 = convert_flow_pred_to_x0(model_out, x, sigma)
-        return x0
+        # Convert flow prediction to x0
+        pred_x0 = self._convert_flow_pred_to_x0(
+            flow_pred=model_out.flatten(0, 1),
+            xt=x.flatten(0, 1),
+            timestep=t.flatten(0, 1) if t.dim() > 1 else t,
+        ).unflatten(0, model_out.shape[:2])
+
+        return pred_x0
 
     def enable_gradient_checkpointing(self):
         pass  # Not needed for inference
