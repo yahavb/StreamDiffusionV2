@@ -169,8 +169,8 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
                 cleaned[k] = v
             self.model.load_state_dict(cleaned, strict=False)
 
-        # Move to Neuron
-        self.model = self.model.to(device).eval()
+        # Move to Neuron in bfloat16 (Neuron requires matching dtypes for matmul)
+        self.model = self.model.to(dtype=torch.bfloat16, device=device).eval()
 
         # Scheduler (same pattern as WanDiffusionWrapper)
         if denoising_step_list is None:

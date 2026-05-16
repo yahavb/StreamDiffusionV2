@@ -138,7 +138,10 @@ class WanPatchEmbed(nn.Module):
         x = x.reshape(B, C, F // pT, pT, H // pH, pH, W // pW, pW)
         x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
         x = x.reshape(B, (F // pT) * (H // pH) * (W // pW), C * pT * pH * pW)
-        out = torch.matmul(x, self.weight.flatten(1).t()) + self.bias
+        # Neuron requires matching dtypes for matmul
+        w = self.weight.flatten(1).to(x.dtype).t()
+        b = self.bias.to(x.dtype)
+        out = torch.matmul(x, w) + b
         out = out.transpose(1, 2).reshape(
             B, self.out_channels, F // pT, H // pH, W // pW)
         return out
