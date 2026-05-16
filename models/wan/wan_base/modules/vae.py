@@ -49,9 +49,10 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.
 
     def forward(self, x):
-        return F.normalize(
-            x, dim=(1 if self.channel_first else
-                    -1)) * self.scale * self.gamma + self.bias
+        # Explicit normalize for Neuron compatibility (F.normalize creates non-contiguous tensors)
+        dim = 1 if self.channel_first else -1
+        norm = torch.sqrt(torch.sum(x * x, dim=dim, keepdim=True).clamp(min=1e-12))
+        return ((x / norm).contiguous() * self.scale * self.gamma + self.bias).contiguous()
 
 
 class Upsample(nn.Upsample):
@@ -136,9 +137,9 @@ class Resample(nn.Module):
                                     3)
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
-        x = rearrange(x, 'b c t h w -> (b t) c h w')
+        x = rearrange(x, 'b c t h w -> (b t) c h w').contiguous()
         x = self.resample(x)
-        x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
+        x = rearrange(x, '(b t) c h w -> b c t h w', t=t).contiguous()
 
         if self.mode == 'downsample3d':
             if feat_cache is not None:
@@ -240,7 +241,7 @@ class AttentionBlock(nn.Module):
     def forward(self, x):
         identity = x
         b, c, t, h, w = x.size()
-        x = rearrange(x, 'b c t h w -> (b t) c h w')
+        x = rearrange(x, 'b c t h w -> (b t) c h w').contiguous()
         x = self.norm(x)
         # compute query, key, value
         q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,
@@ -586,10 +587,10 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         # z: [b,c,t,h,w]
         if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
-                1, self.z_dim, 1, 1, 1)
+            z = (z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)).contiguous()
         else:
-            z = z / scale[1] + scale[0]
+            z = (z / scale[1] + scale[0]).contiguous()
         iter_ = z.shape[2]
         x = self.conv2(z)
         for i in range(iter_):
