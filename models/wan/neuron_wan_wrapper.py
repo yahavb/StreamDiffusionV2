@@ -104,7 +104,7 @@ class NeuronWanVAEWrapper(VAEInterface):
         self._ensure_model()
         device = latent.device
         scale = [self._mean.to(device), (1.0 / self._std).to(device)]
-        latent = rearrange(latent, 'b t c h w -> b c t h w')
+        latent = rearrange(latent, 'b t c h w -> b c t h w').contiguous()
         with torch.no_grad():
             video = self._model.decode(latent, scale)
         video = rearrange(video, 'b c t h w -> b t c h w')
