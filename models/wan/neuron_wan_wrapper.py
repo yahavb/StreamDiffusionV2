@@ -202,8 +202,9 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         t = timestep
 
         # DiT expects [B, C, F, H, W], input is [B, F, C, H, W]
+        # t must keep [B, num_frames] shape for model's unflatten(dim=0, sizes=t.shape)
         model_out = self.model(
-            x.permute(0, 2, 1, 3, 4), t[:, 0] if t.dim() > 1 else t, context,
+            x.permute(0, 2, 1, 3, 4), t, context,
             updating_cache=updating_cache,
             kv_cache=kv_cache,
             crossattn_cache=crossattn_cache,
