@@ -98,7 +98,7 @@ class NeuronWanVAEWrapper(VAEInterface):
         from modules.vae import _video_vae
         self._model = _video_vae(
             pretrained_path=self.vae_pth, z_dim=self.z_dim
-        ).eval().requires_grad_(False).to(self.target_device)
+        ).eval().requires_grad_(False).to(dtype=torch.bfloat16, device=self.target_device)
 
     def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
         self._ensure_model()
