@@ -1,0 +1,209 @@
+"""Neuron-compatible wrappers for T5, VAE, and DiT in StreamDiffusionV2.
+
+These wrap the Neuron-ported models so they conform to the StreamDiffusionV2
+model interfaces (DiffusionModelInterface, VAEInterface, TextEncoderInterface).
+"""
+import os
+import sys
+import json
+import math
+import time
+from collections import OrderedDict
+from typing import List, Optional
+
+import torch
+import torch.nn as nn
+from einops import rearrange
+
+from models.model_interface import DiffusionModelInterface, VAEInterface, TextEncoderInterface
+from models.scheduler import FlowMatchingScheduler
+from models.wan.neuron_causal_model import NeuronCausalWanModel
+from models.wan.neuron_layers import convert_flow_pred_to_x0
+
+
+# ── Text Encoder ────────────────────────────────────────────────────────
+
+class NeuronWanTextEncoder(TextEncoderInterface):
+    """T5 text encoder running on Neuron device."""
+
+    def __init__(self, model_path="wan_models/Wan2.1-T2V-1.3B", device="neuron"):
+        super().__init__()
+        self.model_path = model_path
+        self.device = torch.device(device)
+
+        # Add the Wan modules path
+        wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
+        if wan_base not in sys.path:
+            sys.path.insert(0, wan_base)
+
+        from modules.tokenizers import HuggingfaceTokenizer
+        from modules.t5 import umt5_xxl
+
+        # Load tokenizer
+        tokenizer_path = os.path.join(model_path, "google/umt5-xxl/")
+        self.tokenizer = HuggingfaceTokenizer(
+            name=tokenizer_path, seq_len=512, clean='whitespace')
+
+        # Load T5 encoder
+        self.text_encoder = umt5_xxl(
+            encoder_only=True, return_tokenizer=False,
+            dtype=torch.bfloat16, device=torch.device('cpu')
+        ).eval().requires_grad_(False)
+
+        weights_path = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
+        self.text_encoder.load_state_dict(
+            torch.load(weights_path, map_location='cpu', weights_only=False))
+        self.text_encoder = self.text_encoder.to(device=self.device)
+
+    def forward(self, text_prompts: List[str]) -> dict:
+        ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
+        ids = ids.to(self.device)
+        mask = mask.to(self.device)
+        seq_len = mask.gt(0).sum(dim=1).long()
+
+        with torch.no_grad():
+            context = self.text_encoder(ids, mask)
+
+        context_cpu = context.cpu()
+        for b in range(context_cpu.shape[0]):
+            context_cpu[b, seq_len[b].cpu():] = 0.0
+        return {"prompt_embeds": context_cpu}
+
+
+# ── VAE ─────────────────────────────────────────────────────────────────
+
+class NeuronWanVAEWrapper(VAEInterface):
+    """Wan VAE decoder running on Neuron device."""
+
+    def __init__(self, vae_pth="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+                 z_dim=16, device="neuron"):
+        super().__init__()
+        self.z_dim = z_dim
+        self.vae_pth = vae_pth
+        self.target_device = device
+        self._model = None
+
+        mean = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+                0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921]
+        std = [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+               3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160]
+        self.register_buffer('_mean', torch.tensor(mean, dtype=torch.bfloat16))
+        self.register_buffer('_std', torch.tensor(std, dtype=torch.bfloat16))
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
+        if wan_base not in sys.path:
+            sys.path.insert(0, wan_base)
+        from modules.vae import _video_vae
+        self._model = _video_vae(
+            pretrained_path=self.vae_pth, z_dim=self.z_dim
+        ).eval().requires_grad_(False).to(self.target_device)
+
+    def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
+        self._ensure_model()
+        device = latent.device
+        scale = [self._mean.to(device), (1.0 / self._std).to(device)]
+        latent = rearrange(latent, 'b t c h w -> b c t h w')
+        with torch.no_grad():
+            video = self._model.decode(latent, scale)
+        video = rearrange(video, 'b c t h w -> b t c h w')
+        return video
+
+
+# ── DiT Wrapper ─────────────────────────────────────────────────────────
+
+class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
+    """Neuron-compatible wrapper for CausalWanModel DiT."""
+
+    def __init__(self, model_name="Wan2.1-T2V-1.3B", model_path=None,
+                 checkpoint_path=None, use_ema=False,
+                 denoising_step_list=None, timestep_shift=8.0,
+                 num_frame_per_block=1, device="neuron"):
+        super().__init__()
+        self.device_name = device
+
+        # Load model config
+        if model_path is None:
+            model_path = f"wan_models/{model_name}"
+        config_path = os.path.join(model_path, "config.json")
+        with open(config_path) as f:
+            config = json.load(f)
+
+        # Determine architecture params
+        dim = config.get("dim", 1536)
+        ffn_dim = config.get("ffn_dim", 8960)
+        num_heads = config.get("num_heads", 12)
+        num_layers = config.get("num_layers", 30)
+        text_dim = config.get("text_dim", 4096)
+        freq_dim = config.get("freq_dim", 256)
+
+        self.model = NeuronCausalWanModel(
+            model_type='t2v', patch_size=(1, 2, 2), text_len=512,
+            in_dim=16, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim,
+            text_dim=text_dim, out_dim=16, num_heads=num_heads,
+            num_layers=num_layers, qk_norm=True, cross_attn_norm=True,
+        )
+        self.model.num_frame_per_block = num_frame_per_block
+
+        # Load base weights
+        base_weights = os.path.join(model_path, "diffusion_pytorch_model.safetensors")
+        if os.path.exists(base_weights):
+            from safetensors.torch import load_file
+            state_dict = load_file(base_weights)
+            self.model.load_state_dict(state_dict, strict=False)
+
+        # Load fine-tuned checkpoint
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            ckpt = torch.load(checkpoint_path, map_location='cpu')
+            if 'generator_ema' in ckpt and use_ema:
+                sd = ckpt['generator_ema']
+            elif 'generator' in ckpt:
+                sd = ckpt['generator']
+            else:
+                sd = ckpt
+            cleaned = OrderedDict()
+            for k, v in sd.items():
+                k = k.replace("_fsdp_wrapped_module.", "")
+                k = k.replace("model.", "", 1) if k.startswith("model.") else k
+                cleaned[k] = v
+            self.model.load_state_dict(cleaned, strict=False)
+
+        # Move to Neuron
+        self.model = self.model.to(device).eval()
+
+        # Scheduler
+        if denoising_step_list is None:
+            denoising_step_list = [700, 500, 400, 200, 0]
+        self.scheduler = FlowMatchingScheduler(
+            shift=timestep_shift, num_train_timesteps=1000,
+            denoising_step_list=denoising_step_list)
+        self.post_init()
+
+    def forward(self, noisy_image_or_video, conditional_dict, timestep,
+                kv_cache=None, crossattn_cache=None,
+                current_start=None, current_end=None,
+                updating_cache=False, cache_start=None,
+                num_valid_frames=None, shared_buffers=None):
+        context = conditional_dict["prompt_embeds"]
+        x = noisy_image_or_video
+        t = timestep
+
+        model_out = self.model(
+            x, t, context,
+            updating_cache=updating_cache,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start=current_start if current_start is not None else 0,
+            cache_start=cache_start,
+            num_valid_frames=num_valid_frames,
+            shared_buffers=shared_buffers,
+        )
+
+        sigma = self.scheduler.sigma(timestep)
+        x0 = convert_flow_pred_to_x0(model_out, x, sigma)
+        return x0
+
+    def enable_gradient_checkpointing(self):
+        pass  # Not needed for inference
