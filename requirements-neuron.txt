@@ -1,0 +1,19 @@
+# StreamDiffusionV2 Neuron/Trainium inference requirements
+# Based on rolling-forcing requirements, trimmed for inference
+opencv-python>=4.9.0.80
+diffusers==0.31.0
+transformers>=4.49.0
+tokenizers>=0.20.3
+accelerate>=1.1.1
+tqdm
+imageio
+easydict
+ftfy
+imageio-ffmpeg
+omegaconf
+einops
+av==13.1.0
+sentencepiece
+huggingface_hub[cli]
+safetensors
+Pillow
