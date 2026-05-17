@@ -95,13 +95,14 @@ def save_video(video_tensor, output_path, fps=16):
             LOGGER.info(f"Saved frames: {frame_dir}")
 
 
-def run_inference(pipeline, args, config):
+def run_inference(pipeline, args, config, verbose=False):
     """Run streaming inference and return latents + timing info."""
     device = pipeline.device
     dtype = pipeline.dtype
     num_frames = args.num_frames
     num_frame_per_block = pipeline.num_frame_per_block
     frame_seq_length = pipeline.frame_seq_length
+    rank = pipeline.rank
 
     # Generate initial noise for anchor block
     num_anchor_frames = num_frame_per_block
@@ -110,9 +111,9 @@ def run_inference(pipeline, args, config):
         args.height // 8, args.width // 8,
         dtype=dtype, device=device)
 
-    timings = {"encode": 0, "dit_anchor": 0, "dit_stream": [], "vae": 0}
+    timings = {"t5_encode": 0, "dit_anchor": 0, "dit_stream": [], "vae": 0}
 
-    # Step 1: Encode prompt
+    # Step 1: Encode prompt + anchor denoising (inside prepare)
     t0 = time.perf_counter()
     anchor_pred = pipeline.prepare(
         text_prompts=[args.prompt],
@@ -124,8 +125,8 @@ def run_inference(pipeline, args, config):
     )
     if hasattr(torch, 'neuron'):
         torch.neuron.synchronize()
-    timings["encode"] = time.perf_counter() - t0
-    timings["dit_anchor"] = timings["encode"]  # includes first DiT pass
+    timings["t5_encode"] = time.perf_counter() - t0
+    timings["dit_anchor"] = timings["t5_encode"]
 
     # Collect all latent blocks
     all_latents = [anchor_pred]
@@ -157,6 +158,10 @@ def run_inference(pipeline, args, config):
         timings["dit_stream"].append(dt)
         all_latents.append(pred)
 
+        if verbose and rank == 0 and block_idx < 5:
+            LOGGER.info(f"  Block {block_idx}: {dt*1000:.0f}ms "
+                        f"({dt/5*1000:.0f}ms/step × 5 steps)")
+
     # Concatenate all latents
     latents = torch.cat(all_latents, dim=1)[:, :num_frames]
 
@@ -182,15 +187,15 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
       - Steady-state FPS (DiT-only, excluding first block)
     """
     # Warmup/compilation timing (first warmup is compilation)
-    compile_time = warmup_timings[0]["encode"] + sum(warmup_timings[0]["dit_stream"]) + warmup_timings[0]["vae"]
+    compile_time = warmup_timings[0]["t5_encode"] + sum(warmup_timings[0]["dit_stream"]) + warmup_timings[0]["vae"]
 
     # Benchmark timings (post-compilation)
-    encode_times = [t["encode"] for t in all_timings]
+    encode_times = [t["t5_encode"] for t in all_timings]
     dit_stream_all = []
     for t in all_timings:
         dit_stream_all.extend(t["dit_stream"])
     vae_times = [t["vae"] for t in all_timings]
-    total_times = [t["encode"] + sum(t["dit_stream"]) + t["vae"] for t in all_timings]
+    total_times = [t["t5_encode"] + sum(t["dit_stream"]) + t["vae"] for t in all_timings]
 
     def avg(lst):
         return sum(lst) / len(lst) if lst else 0
@@ -272,7 +277,7 @@ def main():
             pipeline.shared_buffers = None
             video, _, timings = run_inference(pipeline, args, config)
             warmup_timings.append(timings)
-            LOGGER.info(f"  warmup encode={timings['encode']*1000:.0f}ms "
+            LOGGER.info(f"  warmup t5+anchor={timings['t5_encode']*1000:.0f}ms "
                         f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
                         f"vae={timings['vae']*1000:.0f}ms")
 
@@ -284,17 +289,20 @@ def main():
             pipeline.kv_cache1 = None
             pipeline.crossattn_cache = None
             pipeline.shared_buffers = None
-            video, _, timings = run_inference(pipeline, args, config)
+            video, _, timings = run_inference(pipeline, args, config,
+                                             verbose=(i == 0))  # detail on first run
             all_timings.append(timings)
-            LOGGER.info(f"  encode={timings['encode']*1000:.0f}ms "
+            LOGGER.info(f"  t5+anchor={timings['t5_encode']*1000:.0f}ms "
                         f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
                         f"vae={timings['vae']*1000:.0f}ms")
 
-        print_benchmark_results(all_timings, warmup_timings, args.num_frames, args.benchmark_runs)
+        # Only rank 0 prints results (avoid 4× duplicate output)
+        if dist.get_rank() == 0:
+            print_benchmark_results(all_timings, warmup_timings, args.num_frames, args.benchmark_runs)
     else:
         LOGGER.info("Running inference...")
         video, latents, timings = run_inference(pipeline, args, config)
-        LOGGER.info(f"Encode: {timings['encode']*1000:.0f}ms, "
+        LOGGER.info(f"T5+anchor: {timings['t5_encode']*1000:.0f}ms, "
                     f"DiT stream: {sum(timings['dit_stream'])*1000:.0f}ms, "
                     f"VAE: {timings['vae']*1000:.0f}ms")
 
