@@ -1,5 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+import math
+import os
 
 import torch
 import torch.cuda.amp as amp
@@ -10,6 +12,99 @@ from einops import rearrange
 __all__ = [
     'WanVAE',
 ]
+
+# ─── NKI Kernel Loading for Neuron ─────────────────────────────────────
+_nki_conv2d_k1 = None
+_nki_conv2d_k3 = None
+_nki_self_attn = None
+_NKI_AVAILABLE = False
+
+try:
+    from torch_neuronx.nki_hop import wrap_nki
+    from models.wan.kernels.vae_conv2d import vae_conv2d_k1, vae_conv2d_k3_shifted
+    from models.wan.kernels.vae_attention import vae_self_attention
+    _nki_conv2d_k1 = wrap_nki(vae_conv2d_k1)
+    _nki_conv2d_k3 = wrap_nki(vae_conv2d_k3_shifted)
+    _nki_self_attn = wrap_nki(vae_self_attention)
+    _NKI_AVAILABLE = True
+    logging.info("[vae] NKI VAE kernels: LOADED")
+except Exception as e:
+    logging.warning(f"[vae] NKI VAE kernels: not available ({e})")
+
+
+def _is_neuron_tensor(x):
+    """Check if tensor is on a Neuron device."""
+    return x.device.type == "neuron" or (hasattr(x.device, 'type') and 'xla' in str(x.device))
+
+
+def _nki_conv2d_forward(weight, bias, x_2d, kernel_size, C_in, C_out, H, W, padding=0):
+    """Run spatial conv2d via NKI kernel. x_2d is (BT, C, H, W)."""
+    BT = x_2d.shape[0]
+    device = x_2d.device
+    P = 128
+    SPATIAL_TILE = 512
+
+    results = []
+    for bt in range(BT):
+        frame = x_2d[bt]  # (C_in, H, W)
+        HW = H * W
+
+        if kernel_size == 1:
+            inp_flat = frame.reshape(C_in, HW).to(torch.bfloat16)
+            C_in_p = ((C_in + P - 1) // P) * P
+            C_out_p = ((C_out + P - 1) // P) * P
+            HW_p = ((HW + SPATIAL_TILE - 1) // SPATIAL_TILE) * SPATIAL_TILE
+
+            inp_padded = torch.zeros(C_in_p, HW_p, dtype=torch.bfloat16, device=device)
+            inp_padded[:C_in, :HW] = inp_flat
+
+            w = weight.reshape(C_out, C_in).to(torch.bfloat16)
+            w_T = torch.zeros(C_in_p, C_out_p, dtype=torch.bfloat16, device=device)
+            w_T[:C_in, :C_out] = w.T
+
+            b_padded = torch.zeros(C_out_p, 1, dtype=torch.bfloat16, device=device)
+            if bias is not None:
+                b_padded[:C_out, 0] = bias.to(torch.bfloat16)
+
+            out = _nki_conv2d_k1(inp_padded, w_T, b_padded, HW)
+            results.append(out[:C_out, :HW].reshape(C_out, H, W))
+
+        elif kernel_size == 3:
+            inp_flat = frame.reshape(C_in, HW).to(torch.bfloat16)
+            HW_p = ((HW + SPATIAL_TILE - 1) // SPATIAL_TILE) * SPATIAL_TILE
+            C_in_p = ((C_in + P - 1) // P) * P
+            C_out_p = ((C_out + P - 1) // P) * P
+
+            # Build shifted inputs
+            frame_3d = frame.reshape(C_in, H, W)
+            x_padded_spatial = F.pad(frame_3d.float(), (padding, padding, padding, padding))
+            shifts = []
+            for kh in range(3):
+                for kw in range(3):
+                    window = x_padded_spatial[:, kh:kh + H, kw:kw + W]
+                    shifts.append(window.reshape(C_in, HW))
+            shifted = torch.stack(shifts, dim=0).reshape(9 * C_in, HW).to(torch.bfloat16)
+
+            shifted_padded = torch.zeros(9 * C_in_p, HW_p, dtype=torch.bfloat16, device=device)
+            for k_idx in range(9):
+                shifted_padded[k_idx * C_in_p:k_idx * C_in_p + C_in, :HW] = \
+                    shifted[k_idx * C_in:k_idx * C_in + C_in, :HW]
+
+            w_4d = weight.reshape(C_out, C_in, 3, 3)
+            w_T_padded = torch.zeros(C_in_p * 9, C_out_p, dtype=torch.bfloat16, device=device)
+            for k_idx in range(9):
+                kh, kw = k_idx // 3, k_idx % 3
+                w_slice = w_4d[:, :, kh, kw].T.to(torch.bfloat16)
+                w_T_padded[k_idx * C_in_p:k_idx * C_in_p + C_in, :C_out] = w_slice
+
+            b_padded = torch.zeros(C_out_p, 1, dtype=torch.bfloat16, device=device)
+            if bias is not None:
+                b_padded[:C_out, 0] = bias.to(torch.bfloat16)
+
+            out = _nki_conv2d_k3(shifted_padded, w_T_padded, b_padded, HW)
+            results.append(out[:C_out, :HW].reshape(C_out, H, W))
+
+    return torch.stack(results, dim=0)  # (BT, C_out, H, W)
 
 CACHE_T = 2
 
@@ -243,22 +338,62 @@ class AttentionBlock(nn.Module):
         b, c, t, h, w = x.size()
         x = rearrange(x, 'b c t h w -> (b t) c h w').contiguous()
         x = self.norm(x)
-        # compute query, key, value
-        q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,
-                                         -1).permute(0, 1, 3,
-                                                     2).contiguous().chunk(
-                                                         3, dim=-1)
 
-        # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
-        x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
+        # Use NKI kernels if available and on Neuron
+        if _NKI_AVAILABLE and _is_neuron_tensor(x):
+            P = 128
+            CHUNK = 512
+            seq = h * w
+            seq_padded = ((seq + CHUNK - 1) // CHUNK) * CHUNK
 
-        # output
-        x = self.proj(x)
+            # QKV via NKI conv2d_k1
+            qkv = _nki_conv2d_forward(
+                self.to_qkv.weight, self.to_qkv.bias,
+                x, kernel_size=1, C_in=c, C_out=c * 3, H=h, W=w)
+            # qkv: (BT, 3*c, h, w)
+
+            results = []
+            for bt_idx in range(b * t):
+                qkv_frame = qkv[bt_idx]  # (3*c, h, w)
+                qkv_flat = qkv_frame.reshape(3 * c, seq)
+                q_flat, k_flat, v_flat = qkv_flat.chunk(3, dim=0)  # each (c, seq)
+
+                # NKI attention expects: q(1,d,seq), k(1,d,seq), v(1,seq,d)
+                q_nki = q_flat.unsqueeze(0).to(torch.bfloat16)  # (1, c, seq)
+                k_nki = k_flat.unsqueeze(0).to(torch.bfloat16)  # (1, c, seq)
+                v_nki = v_flat.T.unsqueeze(0).to(torch.bfloat16)  # (1, seq, c)
+
+                # Pad seq to multiple of 512
+                if seq < seq_padded:
+                    q_nki = F.pad(q_nki, (0, seq_padded - seq))
+                    k_nki = F.pad(k_nki, (0, seq_padded - seq))
+                    v_nki = F.pad(v_nki, (0, 0, 0, seq_padded - seq))
+
+                identity_mat = torch.eye(P, dtype=torch.bfloat16, device=x.device)
+                scale = 1.0 / math.sqrt(c)
+
+                out_nki = _nki_self_attn(q_nki, k_nki, v_nki, identity_mat, softmax_scale=scale)
+                # out_nki: (seq_padded, 1, c) → trim to (seq, c)
+                out_frame = out_nki[:seq, 0, :]  # (seq, c)
+                out_frame = out_frame.T.reshape(c, h, w)  # (c, h, w)
+                results.append(out_frame)
+
+            x = torch.stack(results, dim=0)  # (BT, c, h, w)
+
+            # Proj via NKI conv2d_k1
+            x = _nki_conv2d_forward(
+                self.proj.weight, self.proj.bias,
+                x, kernel_size=1, C_in=c, C_out=c, H=h, W=w)
+        else:
+            # PyTorch fallback
+            q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,
+                                             -1).permute(0, 1, 3,
+                                                         2).contiguous().chunk(
+                                                             3, dim=-1)
+            x = F.scaled_dot_product_attention(q, k, v)
+            x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
+            x = self.proj(x)
+
         x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
         return x + identity
 
@@ -591,6 +726,8 @@ class WanVAE_(nn.Module):
                 1, self.z_dim, 1, 1, 1)).contiguous()
         else:
             z = (z / scale[1] + scale[0]).contiguous()
+        # Cast back to model dtype after scale division (avoids float32 vs bf16 mismatch)
+        z = z.to(self.conv2.weight.dtype)
         iter_ = z.shape[2]
         x = self.conv2(z)
         for i in range(iter_):
@@ -617,6 +754,8 @@ class WanVAE_(nn.Module):
                 1, self.z_dim, 1, 1, 1)
         else:
             z = z / scale[1] + scale[0]
+        # Cast back to model dtype after scale division (avoids float32 vs bf16 mismatch)
+        z = z.to(self.conv2.weight.dtype)
         x = self.conv2(z)
         if self.first_decode:
             self.first_decode = False

@@ -15,9 +15,13 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+import logging
+
 from models.model_interface import DiffusionModelInterface, VAEInterface, TextEncoderInterface
 from models.wan.flow_match import FlowMatchScheduler
 from models.wan.neuron_causal_model import NeuronCausalWanModel
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ── Text Encoder ────────────────────────────────────────────────────────
@@ -114,14 +118,16 @@ class NeuronWanVAEWrapper(VAEInterface):
 # ── DiT Wrapper ─────────────────────────────────────────────────────────
 
 class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
-    """Neuron-compatible wrapper for CausalWanModel DiT."""
+    """Neuron-compatible wrapper for CausalWanModel DiT with TP-4 support."""
 
     def __init__(self, model_name="Wan2.1-T2V-1.3B", model_path=None,
                  checkpoint_path=None, use_ema=False,
                  denoising_step_list=None, timestep_shift=8.0,
-                 num_frame_per_block=1, device="neuron"):
+                 num_frame_per_block=1, device="neuron",
+                 tp_degree=4):
         super().__init__()
         self.device_name = device
+        self.tp_degree = tp_degree
 
         # Load model config
         if model_path is None:
@@ -138,6 +144,9 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         text_dim = config.get("text_dim", 4096)
         freq_dim = config.get("freq_dim", 256)
 
+        self.num_heads = num_heads
+        self.num_heads_per_rank = num_heads // tp_degree
+
         self.model = NeuronCausalWanModel(
             model_type='t2v', patch_size=(1, 2, 2), text_len=512,
             in_dim=16, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim,
@@ -146,7 +155,7 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         )
         self.model.num_frame_per_block = num_frame_per_block
 
-        # Load base weights
+        # Load base weights (FULL weights - before sharding)
         base_weights = os.path.join(model_path, "diffusion_pytorch_model.safetensors")
         if os.path.exists(base_weights):
             from safetensors.torch import load_file
@@ -168,6 +177,16 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
                 k = k.replace("model.", "", 1) if k.startswith("model.") else k
                 cleaned[k] = v
             self.model.load_state_dict(cleaned, strict=False)
+
+        # Apply TP-4 sharding BEFORE moving to device (shard on CPU, then move)
+        if tp_degree > 1:
+            from models.wan.tp_utils import (
+                init_tp_group, get_tp_rank, shard_model_tp
+            )
+            init_tp_group(tp_degree)
+            tp_rank = get_tp_rank()
+            LOGGER.info(f"Applying TP-{tp_degree} sharding (rank {tp_rank})")
+            shard_model_tp(self.model, tp_rank, tp_degree)
 
         # Move to Neuron in bfloat16 (Neuron requires matching dtypes for matmul)
         self.model = self.model.to(dtype=torch.bfloat16, device=device).eval()

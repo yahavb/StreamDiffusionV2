@@ -1,10 +1,12 @@
-"""Neuron/Trainium inference entry point for StreamDiffusionV2.
+"""Neuron/Trainium inference entry point for StreamDiffusionV2 with TP-4.
 
 Runs the full streaming pipeline on Trainium: T5 encode → DiT denoise → VAE decode.
+DiT runs with TP-4 (tensor parallelism across 4 NeuronCores).
 Measures and reports FPS for each stage and end-to-end.
 
 Usage:
-    python streamv2v/inference_neuron.py --config streamv2v/configs/wan_causal_dmd_v2v_neuron.yaml \
+    torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
+        --config streamv2v/configs/wan_causal_dmd_v2v_neuron.yaml \
         --prompt "A cat walking on the beach" --num_frames 81 --benchmark
 """
 import argparse
@@ -14,6 +16,7 @@ import sys
 import time
 
 import torch
+import torch.distributed as dist
 from omegaconf import OmegaConf
 from einops import rearrange
 
@@ -24,6 +27,18 @@ from models.wan.neuron_causal_stream_inference import NeuronCausalStreamInferenc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("inference_neuron")
+
+
+def init_distributed():
+    """Initialize torch.distributed for TP (required before model init)."""
+    if dist.is_initialized():
+        return
+    # torchrun sets RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="xla")
+        LOGGER.info(f"Distributed initialized: rank={dist.get_rank()}/{dist.get_world_size()}")
+    else:
+        LOGGER.warning("Not launched with torchrun — running single-process (no TP)")
 
 
 def parse_args():
@@ -202,6 +217,9 @@ def main():
 
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
+
+    # Initialize distributed for TP-4
+    init_distributed()
 
     LOGGER.info("Building Neuron pipeline...")
     pipeline = NeuronCausalStreamInferencePipeline(args, device=args.device)

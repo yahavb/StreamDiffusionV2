@@ -23,7 +23,11 @@ if [[ "${1:-}" == "--benchmark" ]]; then
     EXTRA_ARGS="--benchmark --warmup_runs 2 --benchmark_runs 5"
 fi
 
-python streamv2v/inference_neuron.py \
+# TP-4: launch 4 processes across 4 NeuronCores (2 NeuronDevices)
+TP_DEGREE="${TP_DEGREE:-4}"
+
+torchrun --nproc_per_node="$TP_DEGREE" \
+    streamv2v/inference_neuron.py \
     --config "$CONFIG" \
     --prompt "$PROMPT" \
     --num_frames "$NUM_FRAMES" \

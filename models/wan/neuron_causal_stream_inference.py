@@ -32,6 +32,9 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.device = torch.device(device)
         self.dtype = torch.bfloat16
 
+        # TP config
+        self.tp_degree = getattr(args, "tp_degree", 4)
+
         # Model config
         model_path = getattr(args, "model_path", "wan_models/Wan2.1-T2V-1.3B")
         checkpoint_path = getattr(args, "generator_ckpt", None)
@@ -58,6 +61,8 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         else:
             raise ValueError(f"Model type {model_type} not supported")
 
+        # With TP, each rank only holds num_heads / tp_degree heads
+        self.num_heads_per_rank = self.num_heads // self.tp_degree
         self.head_dim = self.dim // self.num_heads
 
         # Spatial dims
@@ -68,7 +73,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.num_kv_cache = getattr(args, "num_kv_cache", 6)
         self.kv_cache_length = self.frame_seq_length * self.num_kv_cache
 
-        # Initialize generator (DiT)
+        # Initialize generator (DiT) with TP
         self.generator = NeuronCausalWanDiffusionWrapper(
             model_path=model_path,
             checkpoint_path=checkpoint_path,
@@ -77,6 +82,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             timestep_shift=timestep_shift,
             num_frame_per_block=self.num_frame_per_block,
             device=device,
+            tp_degree=self.tp_degree,
         )
 
         # Update frame length in model (must match pipeline's kv_cache allocation)
@@ -124,15 +130,18 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                      self.frame_seq_length, self.kv_cache_length)
 
     def _initialize_kv_cache(self, batch_size, dtype, device):
-        """Initialize KV cache with Python int indices (Neuron-safe)."""
+        """Initialize KV cache with Python int indices (Neuron-safe).
+        
+        With TP-4, each rank only stores num_heads_per_rank heads.
+        """
         kv_cache = []
         for i in range(self.num_transformer_blocks):
             kv_cache.append({
                 "k": torch.zeros([batch_size, self.kv_cache_length,
-                                  self.num_heads, self.head_dim],
+                                  self.num_heads_per_rank, self.head_dim],
                                  dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, self.kv_cache_length,
-                                  self.num_heads, self.head_dim],
+                                  self.num_heads_per_rank, self.head_dim],
                                  dtype=dtype, device=device),
                 "global_end_index": 0,  # Python int for Neuron
                 "local_end_index": 0,   # Python int for Neuron
@@ -140,28 +149,28 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.kv_cache1 = kv_cache
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
-        """Initialize cross-attention cache."""
+        """Initialize cross-attention cache (TP-aware: local heads only)."""
         crossattn_cache = []
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, self.num_heads, self.head_dim],
+                "k": torch.zeros([batch_size, 512, self.num_heads_per_rank, self.head_dim],
                                  dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, self.num_heads, self.head_dim],
+                "v": torch.zeros([batch_size, 512, self.num_heads_per_rank, self.head_dim],
                                  dtype=dtype, device=device),
                 "is_init": False,
             })
         self.crossattn_cache = crossattn_cache
 
     def _initialize_shared_buffers(self, batch_size, dtype, device):
-        """Allocate shared K/V buffers for NKI attention kernels."""
+        """Allocate shared K/V buffers for NKI attention kernels (TP-aware)."""
         max_attn_size = 21 * self.frame_seq_length
         # Round up to ATTN_SEQLEN_MULTIPLE for NKI
         padded = ((max_attn_size + ATTN_SEQLEN_MULTIPLE - 1)
                   // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
         self.shared_buffers = (
-            torch.zeros([batch_size, padded, self.num_heads, self.head_dim],
+            torch.zeros([batch_size, padded, self.num_heads_per_rank, self.head_dim],
                         dtype=dtype, device=device),
-            torch.zeros([batch_size, padded, self.num_heads, self.head_dim],
+            torch.zeros([batch_size, padded, self.num_heads_per_rank, self.head_dim],
                         dtype=dtype, device=device),
         )
 
