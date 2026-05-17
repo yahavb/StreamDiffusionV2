@@ -99,18 +99,16 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             self.frame_seq_length, self.num_frame_per_block, self.num_kv_cache)
 
         # Per-rank model placement to avoid OOM:
-        # T5 (~9.6 GB) only on T5_RANK, VAE (~0.66 GB) only on VAE_RANK
+        # T5 runs on CPU on ALL ranks (CPU RAM is 128GB+, T5 is ~9.6GB)
+        # VAE (~0.66 GB HBM) only on VAE_RANK
         self.rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # Initialize text encoder (only on T5_RANK)
-        if self.rank == T5_RANK:
-            LOGGER.info(f"Loading T5 text encoder on rank {T5_RANK}...")
-            self.text_encoder = NeuronWanTextEncoder(
-                model_path=model_path, device=device)
-        else:
-            self.text_encoder = None
+        # Initialize text encoder on CPU (all ranks — no HBM consumed)
+        LOGGER.info(f"Loading T5 text encoder on CPU (rank {self.rank})...")
+        self.text_encoder = NeuronWanTextEncoder(
+            model_path=model_path, device="cpu")
 
-        # Initialize VAE (only on VAE_RANK)
+        # Initialize VAE (only on VAE_RANK — uses HBM)
         if self.rank == VAE_RANK:
             LOGGER.info(f"Loading VAE decoder on rank {VAE_RANK}...")
             self.vae = NeuronWanVAEWrapper(
@@ -200,7 +198,8 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 batch_denoise=True, **kwargs):
         """Encode prompt, initialize caches, run first-block anchor denoising.
         
-        T5 runs only on T5_RANK; embeddings are broadcast to all ranks.
+        T5 runs on CPU on all ranks (no broadcast needed).
+        Result is moved to neuron device for DiT consumption.
         """
         if device is None:
             device = self.device
@@ -209,28 +208,12 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         batch_size = noise.shape[0]
 
-        # Text encoding — only T5_RANK runs T5, then broadcast to all
-        if self.rank == T5_RANK:
-            enc_result = self.text_encoder(text_prompts)
-            prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
-            # Also get context_lens if present
-            context_lens = enc_result.get('context_lens',
-                torch.tensor([prompt_embeds.shape[1]], dtype=torch.long, device=device))
-        else:
-            # Allocate placeholder — will be filled by broadcast
-            # T5 output: [batch, seq_len=512, dim=2048] for umt5-xxl
-            prompt_embeds = torch.zeros(
-                [batch_size, 512, 2048], dtype=dtype, device=device)
-            context_lens = torch.tensor([512], dtype=torch.long, device=device)
-
-        # Broadcast T5 embeddings from T5_RANK to all ranks
-        if dist.is_initialized():
-            dist.broadcast(prompt_embeds, src=T5_RANK)
-            dist.broadcast(context_lens, src=T5_RANK)
+        # Text encoding — T5 runs on CPU on every rank (no HBM, no broadcast)
+        enc_result = self.text_encoder(text_prompts)
+        prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
 
         self.conditional_dict = {
             'prompt_embeds': prompt_embeds,
-            'context_lens': context_lens,
         }
 
         # Initialize caches
