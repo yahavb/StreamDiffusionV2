@@ -160,10 +160,11 @@ def run_inference(pipeline, args, config):
     # Concatenate all latents
     latents = torch.cat(all_latents, dim=1)[:, :num_frames]
 
-    # Step 3: VAE decode
+    # Step 3: VAE decode (only on VAE_RANK=0, returns None on other ranks)
     t_vae = time.perf_counter()
     video = pipeline.decode_latents(latents)
-    video = video * 0.5 + 0.5
+    if video is not None:
+        video = video * 0.5 + 0.5
     if hasattr(torch, 'neuron'):
         torch.neuron.synchronize()
     timings["vae"] = time.perf_counter() - t_vae
@@ -265,9 +266,10 @@ def main():
                     f"DiT stream: {sum(timings['dit_stream'])*1000:.0f}ms, "
                     f"VAE: {timings['vae']*1000:.0f}ms")
 
-        # Save
-        save_video(video, args.output_path, fps=args.fps)
-        LOGGER.info(f"Video saved to {args.output_path}")
+        # Save (only rank 0 has decoded video)
+        if video is not None:
+            save_video(video, args.output_path, fps=args.fps)
+            LOGGER.info(f"Video saved to {args.output_path}")
 
 
 if __name__ == "__main__":

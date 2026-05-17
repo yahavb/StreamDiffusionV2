@@ -3,16 +3,18 @@
 Adapted from causal_stream_inference.py for Trainium/Neuron devices.
 Key differences from GPU version:
   - KV cache indices are Python int (not tensor) for Neuron tracing
-  - No dist.broadcast (single-device Neuron)
+  - Per-rank model placement: T5 on rank 2, VAE on rank 0, DiT on all
   - Shared attention buffers for NKI kernels
   - Uses NeuronCausalWanDiffusionWrapper, NeuronWanTextEncoder, NeuronWanVAEWrapper
 """
 import logging
+import os
 import time
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from models.wan.neuron_wan_wrapper import (
     NeuronCausalWanDiffusionWrapper,
@@ -22,6 +24,13 @@ from models.wan.neuron_wan_wrapper import (
 from models.wan.neuron_layers import ATTN_SEQLEN_MULTIPLE
 
 LOGGER = logging.getLogger(__name__)
+
+# Per-rank model placement (matches rolling-forcing layout):
+# T5 on rank 2 (ND1) — keeps T5 off the same HBM bank as VAE
+# VAE on rank 0 (ND0) — lightweight, only needed at output time
+# DiT on ALL ranks — TP-4 sharded
+T5_RANK = int(os.environ.get("T5_RANK", "2"))
+VAE_RANK = int(os.environ.get("VAE_RANK", "0"))
 
 
 class NeuronCausalStreamInferencePipeline(nn.Module):
@@ -89,13 +98,25 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.generator.model._update_frame_length(
             self.frame_seq_length, self.num_frame_per_block, self.num_kv_cache)
 
-        # Initialize text encoder
-        self.text_encoder = NeuronWanTextEncoder(
-            model_path=model_path, device=device)
+        # Per-rank model placement to avoid OOM:
+        # T5 (~9.6 GB) only on T5_RANK, VAE (~0.66 GB) only on VAE_RANK
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # Initialize VAE
-        self.vae = NeuronWanVAEWrapper(
-            vae_pth=vae_path, device=device)
+        # Initialize text encoder (only on T5_RANK)
+        if self.rank == T5_RANK:
+            LOGGER.info(f"Loading T5 text encoder on rank {T5_RANK}...")
+            self.text_encoder = NeuronWanTextEncoder(
+                model_path=model_path, device=device)
+        else:
+            self.text_encoder = None
+
+        # Initialize VAE (only on VAE_RANK)
+        if self.rank == VAE_RANK:
+            LOGGER.info(f"Loading VAE decoder on rank {VAE_RANK}...")
+            self.vae = NeuronWanVAEWrapper(
+                vae_pth=vae_path, device=device)
+        else:
+            self.vae = None
 
         # Scheduler
         self.scheduler = self.generator.scheduler
@@ -177,7 +198,10 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
     def prepare(self, text_prompts: List[str], device=None,
                 dtype=None, noise=None, current_start=0, current_end=None,
                 batch_denoise=True, **kwargs):
-        """Encode prompt, initialize caches, run first-block anchor denoising."""
+        """Encode prompt, initialize caches, run first-block anchor denoising.
+        
+        T5 runs only on T5_RANK; embeddings are broadcast to all ranks.
+        """
         if device is None:
             device = self.device
         if dtype is None:
@@ -185,10 +209,28 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         batch_size = noise.shape[0]
 
-        # Text encoding
-        enc_result = self.text_encoder(text_prompts)
+        # Text encoding — only T5_RANK runs T5, then broadcast to all
+        if self.rank == T5_RANK:
+            enc_result = self.text_encoder(text_prompts)
+            prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
+            # Also get context_lens if present
+            context_lens = enc_result.get('context_lens',
+                torch.tensor([prompt_embeds.shape[1]], dtype=torch.long, device=device))
+        else:
+            # Allocate placeholder — will be filled by broadcast
+            # T5 output: [batch, seq_len=512, dim=2048] for umt5-xxl
+            prompt_embeds = torch.zeros(
+                [batch_size, 512, 2048], dtype=dtype, device=device)
+            context_lens = torch.tensor([512], dtype=torch.long, device=device)
+
+        # Broadcast T5 embeddings from T5_RANK to all ranks
+        if dist.is_initialized():
+            dist.broadcast(prompt_embeds, src=T5_RANK)
+            dist.broadcast(context_lens, src=T5_RANK)
+
         self.conditional_dict = {
-            k: v.to(device=device, dtype=dtype) for k, v in enc_result.items()
+            'prompt_embeds': prompt_embeds,
+            'context_lens': context_lens,
         }
 
         # Initialize caches
@@ -326,5 +368,12 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         return denoised_pred
 
     def decode_latents(self, latents):
-        """Decode latents to pixel space using VAE."""
-        return self.vae.decode_to_pixel(latents)
+        """Decode latents to pixel space using VAE (only on VAE_RANK).
+        
+        Returns decoded video on VAE_RANK, None on other ranks.
+        """
+        if self.rank == VAE_RANK:
+            return self.vae.decode_to_pixel(latents)
+        else:
+            # Other ranks don't have VAE loaded — return None
+            return None
