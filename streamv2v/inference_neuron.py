@@ -30,15 +30,24 @@ LOGGER = logging.getLogger("inference_neuron")
 
 
 def init_distributed():
-    """Initialize torch.distributed for TP (required before model init)."""
+    """Initialize distributed process group for Trainium TP.
+
+    Uses the 'neuron' backend which handles per-rank core assignment.
+    torch.neuron.set_device(local_rank) pins each rank to its logical device.
+    After set_device, torch.device("neuron") refers to the current rank's core.
+    """
     if dist.is_initialized():
         return
-    # torchrun sets RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT
-    if "RANK" in os.environ:
-        dist.init_process_group(backend="xla")
-        LOGGER.info(f"Distributed initialized: rank={dist.get_rank()}/{dist.get_world_size()}")
-    else:
-        LOGGER.warning("Not launched with torchrun — running single-process (no TP)")
+    assert "LOCAL_RANK" in os.environ, (
+        "inference_neuron.py must be launched via torchrun (LOCAL_RANK not set)")
+
+    dist.init_process_group(backend="neuron")
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.neuron.set_device(local_rank)
+
+    LOGGER.info(f"Distributed initialized: rank={dist.get_rank()}/{dist.get_world_size()}, "
+                f"local_rank={local_rank}")
 
 
 def parse_args():
