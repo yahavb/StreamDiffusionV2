@@ -27,18 +27,17 @@ LOGGER = logging.getLogger(__name__)
 # ── Text Encoder ────────────────────────────────────────────────────────
 
 class NeuronWanTextEncoder(TextEncoderInterface):
-    """T5 text encoder running on CPU.
+    """T5 text encoder running on Neuron device with torch.compile.
     
-    T5 runs on CPU to avoid consuming scarce NeuronCore HBM.
-    CPU RAM is 128GB+ so T5 (~9.6GB) fits easily on all ranks.
-    The forward pass returns embeddings on CPU; the caller moves to device.
+    Loaded only on T5_RANK (rank 2). Uses torch.compile(backend='neuron')
+    for fast inference (~0.15s vs 30s on CPU).
+    Embeddings are broadcast (bf16) to other ranks by the pipeline.
     """
 
-    def __init__(self, model_path="wan_models/Wan2.1-T2V-1.3B", device="cpu"):
+    def __init__(self, model_path="wan_models/Wan2.1-T2V-1.3B", device="neuron"):
         super().__init__()
         self.model_path = model_path
-        # Always keep T5 on CPU to save HBM
-        self.device = torch.device("cpu")
+        self.device = torch.device(device)
 
         # Add the Wan modules path
         wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
@@ -53,7 +52,7 @@ class NeuronWanTextEncoder(TextEncoderInterface):
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=512, clean='whitespace')
 
-        # Load T5 encoder on CPU (no HBM consumed)
+        # Load T5 encoder on CPU first, then move to Neuron
         self.text_encoder = umt5_xxl(
             encoder_only=True, return_tokenizer=False,
             dtype=torch.bfloat16, device=torch.device('cpu')
@@ -62,7 +61,12 @@ class NeuronWanTextEncoder(TextEncoderInterface):
         weights_path = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
         self.text_encoder.load_state_dict(
             torch.load(weights_path, map_location='cpu', weights_only=False))
-        # Keep on CPU — do NOT move to neuron device
+
+        # Move to Neuron device and compile
+        self.text_encoder = self.text_encoder.to(device=self.device)
+        self.text_encoder = torch.compile(
+            self.text_encoder, backend='neuron', dynamic=False)
+        LOGGER.info("T5 compiled with torch.compile(backend='neuron')")
 
     def forward(self, text_prompts: List[str]) -> dict:
         ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
@@ -74,6 +78,7 @@ class NeuronWanTextEncoder(TextEncoderInterface):
             context = self.text_encoder(ids, mask)
 
         # Zero-out padding positions
+        context = context.to(torch.bfloat16).contiguous()
         for b in range(context.shape[0]):
             context[b, seq_len[b]:] = 0.0
         return {"prompt_embeds": context}

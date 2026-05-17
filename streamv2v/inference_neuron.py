@@ -172,8 +172,19 @@ def run_inference(pipeline, args, config):
     return video, latents, timings
 
 
-def print_benchmark_results(all_timings, num_frames, num_runs):
-    """Print FPS benchmark results in a format matching rolling-forcing."""
+def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
+    """Print FPS benchmark results matching rolling-forcing format.
+    
+    Reports:
+      - Compilation time (warmup run 1) — NEFF compilation overhead
+      - Post-compilation performance (benchmark runs) — steady-state FPS
+      - Time-to-first-frame
+      - Steady-state FPS (DiT-only, excluding first block)
+    """
+    # Warmup/compilation timing (first warmup is compilation)
+    compile_time = warmup_timings[0]["encode"] + sum(warmup_timings[0]["dit_stream"]) + warmup_timings[0]["vae"]
+
+    # Benchmark timings (post-compilation)
     encode_times = [t["encode"] for t in all_timings]
     dit_stream_all = []
     for t in all_timings:
@@ -189,23 +200,38 @@ def print_benchmark_results(all_timings, num_frames, num_runs):
     avg_vae = avg(vae_times)
     avg_total = avg(total_times)
 
-    encode_fps = 1.0 / avg_encode if avg_encode > 0 else 0
-    dit_fps = num_frames / (avg_encode - avg_encode + sum([avg(t["dit_stream"]) for t in all_timings]) / len(all_timings) + avg_encode) if avg_total > 0 else 0
-    vae_fps = num_frames / avg_vae if avg_vae > 0 else 0
+    # Steady-state: time for streaming blocks only (excludes anchor + T5 encode)
+    steady_state_time = avg(total_times) - avg_encode if avg_total > 0 else 0
+    num_stream_frames = num_frames - 1  # all except anchor
+    steady_fps = num_stream_frames / steady_state_time if steady_state_time > 0 else 0
+
+    # Overall FPS (end-to-end including T5 encode)
     e2e_fps = num_frames / avg_total if avg_total > 0 else 0
 
-    print("\n" + "=" * 70)
-    print("StreamDiffusionV2 Neuron Benchmark Results")
-    print("=" * 70)
-    print(f"  Num frames:          {num_frames}")
-    print(f"  Benchmark runs:      {num_runs}")
-    print(f"  Avg encode time:     {avg_encode*1000:.1f} ms")
-    print(f"  Avg DiT/block time:  {avg_dit_per_block*1000:.1f} ms")
-    print(f"  Avg VAE time:        {avg_vae*1000:.1f} ms")
-    print(f"  Avg total time:      {avg_total*1000:.1f} ms")
-    print(f"  End-to-end FPS:      {e2e_fps:.2f}")
-    print(f"  VAE decode FPS:      {vae_fps:.2f}")
-    print("=" * 70 + "\n")
+    # Time-to-first-frame (encode + anchor block)
+    ttff = avg_encode
+
+    # VAE FPS
+    vae_fps = num_frames / avg_vae if avg_vae > 0 else 0
+
+    print("\n┌─────────────────────────────────────────────────────────┐")
+    print("│  BENCHMARK RESULTS (post-compilation)                    │")
+    print("├─────────────────────────────────────────────────────────┤")
+    print(f"│  Num frames:              {num_frames:>6}                      │")
+    print(f"│  Benchmark runs:          {num_runs:>6}                      │")
+    print(f"│  Compilation time:     {compile_time:>8.1f}s (warmup run 1)     │")
+    print(f"│  T5 encode time:       {avg_encode:>8.3f}s                    │")
+    print(f"│  DiT/block time:       {avg_dit_per_block:>8.3f}s                    │")
+    print(f"│  VAE decode time:      {avg_vae:>8.3f}s                    │")
+    print(f"│  Total time:           {avg_total:>8.3f}s                    │")
+    print(f"│  Time-to-first-frame:  {ttff:>8.3f}s                    │")
+    print("├─────────────────────────────────────────────────────────┤")
+    print(f"│  OVERALL FPS:            {e2e_fps:>8.2f} frames/sec         │")
+    print(f"│  STEADY-STATE FPS:       {steady_fps:>8.2f} frames/sec         │")
+    print(f"│  VAE decode FPS:         {vae_fps:>8.2f} frames/sec         │")
+    print(f"│  Real-time ratio:        {e2e_fps/16:>8.3f}x (vs 16fps)      │")
+    print(f"│  Steady real-time ratio: {steady_fps/16:>8.3f}x (vs 16fps)      │")
+    print("└─────────────────────────────────────────────────────────┘\n")
 
 
 def main():
@@ -236,16 +262,22 @@ def main():
 
     if args.benchmark:
         LOGGER.info("=== BENCHMARK MODE ===")
-        # Warmup
+        # Warmup (triggers NEFF compilation on first run)
+        warmup_timings = []
         for i in range(args.warmup_runs):
-            LOGGER.info(f"Warmup run {i+1}/{args.warmup_runs}")
-            video, _, _ = run_inference(pipeline, args, config)
-            # Reset pipeline state for next run
+            LOGGER.info(f"Warmup run {i+1}/{args.warmup_runs} "
+                        f"{'(NEFF compilation)' if i == 0 else '(cache warm)'}")
             pipeline.kv_cache1 = None
             pipeline.crossattn_cache = None
             pipeline.shared_buffers = None
+            video, _, timings = run_inference(pipeline, args, config)
+            warmup_timings.append(timings)
+            LOGGER.info(f"  warmup encode={timings['encode']*1000:.0f}ms "
+                        f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
+                        f"vae={timings['vae']*1000:.0f}ms")
 
-        # Benchmark
+        # Benchmark (post-compilation — steady-state performance)
+        LOGGER.info("=== POST-COMPILATION BENCHMARK ===")
         all_timings = []
         for i in range(args.benchmark_runs):
             LOGGER.info(f"Benchmark run {i+1}/{args.benchmark_runs}")
@@ -258,7 +290,7 @@ def main():
                         f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
                         f"vae={timings['vae']*1000:.0f}ms")
 
-        print_benchmark_results(all_timings, args.num_frames, args.benchmark_runs)
+        print_benchmark_results(all_timings, warmup_timings, args.num_frames, args.benchmark_runs)
     else:
         LOGGER.info("Running inference...")
         video, latents, timings = run_inference(pipeline, args, config)

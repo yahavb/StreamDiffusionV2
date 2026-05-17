@@ -9,6 +9,7 @@ Key differences from GPU version:
 """
 import logging
 import os
+import sys
 import time
 from typing import List, Optional
 
@@ -98,23 +99,60 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.generator.model._update_frame_length(
             self.frame_seq_length, self.num_frame_per_block, self.num_kv_cache)
 
-        # Per-rank model placement to avoid OOM:
-        # T5 runs on CPU on ALL ranks (CPU RAM is 128GB+, T5 is ~9.6GB)
-        # VAE (~0.66 GB HBM) only on VAE_RANK
+        # Per-rank model placement (same as rolling-forcing):
+        # T5 (~9.6 GB) on T5_RANK only (rank 2, ND0-NC2) with torch.compile
+        # VAE (~0.66 GB) on VAE_RANK only (rank 0, ND0-NC0) with torch.compile
+        # DiT TP-4 sharded on all ranks with torch.compile on sub-modules
         self.rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # Initialize text encoder on CPU (all ranks — no HBM consumed)
-        LOGGER.info(f"Loading T5 text encoder on CPU (rank {self.rank})...")
-        self.text_encoder = NeuronWanTextEncoder(
-            model_path=model_path, device="cpu")
+        # All ranks need the tokenizer (lightweight, CPU-only)
+        wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
+        if wan_base not in sys.path:
+            sys.path.insert(0, wan_base)
+        from modules.tokenizers import HuggingfaceTokenizer
+        tokenizer_path = os.path.join(model_path, "google/umt5-xxl/")
+        self.tokenizer = HuggingfaceTokenizer(
+            name=tokenizer_path, seq_len=512, clean='whitespace')
 
-        # Initialize VAE (only on VAE_RANK — uses HBM)
+        # Initialize T5 (only on T5_RANK — on Neuron with torch.compile)
+        if self.rank == T5_RANK:
+            LOGGER.info(f"Loading T5 text encoder on Neuron (rank {T5_RANK})...")
+            self.text_encoder = NeuronWanTextEncoder(
+                model_path=model_path, device=device)
+        else:
+            self.text_encoder = None
+
+        # Initialize VAE (only on VAE_RANK — with torch.compile)
         if self.rank == VAE_RANK:
             LOGGER.info(f"Loading VAE decoder on rank {VAE_RANK}...")
             self.vae = NeuronWanVAEWrapper(
                 vae_pth=vae_path, device=device)
+            # Compile VAE for fast decode
+            self.vae._ensure_model()
+            self.vae._model = torch.compile(
+                self.vae._model, backend='neuron', dynamic=False)
+            LOGGER.info("VAE compiled with torch.compile(backend='neuron')")
         else:
             self.vae = None
+
+        # Compile DiT sub-modules (same as rolling-forcing inference_neuron_tp.py:229-237)
+        dit_model = self.generator.model
+        dit_model.patch_embedding = torch.compile(
+            dit_model.patch_embedding, backend='neuron', dynamic=False)
+        dit_model.text_embedding = torch.compile(
+            dit_model.text_embedding, backend='neuron', dynamic=False)
+        dit_model.time_embedding = torch.compile(
+            dit_model.time_embedding, backend='neuron', dynamic=False)
+        dit_model.time_projection = torch.compile(
+            dit_model.time_projection, backend='neuron', dynamic=False)
+        dit_model.head = torch.compile(
+            dit_model.head, backend='neuron', dynamic=False)
+        # Compile FFN in each block (pure: Linear→GELU→Linear)
+        for block in dit_model.blocks:
+            block.ffn = torch.compile(
+                block.ffn, backend='neuron', dynamic=False)
+        LOGGER.info(f"DiT compiled: patch_embed, text_embed, time_embed, "
+                    f"time_proj, head, FFN×{len(dit_model.blocks)}")
 
         # Scheduler
         self.scheduler = self.generator.scheduler
@@ -198,8 +236,9 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 batch_denoise=True, **kwargs):
         """Encode prompt, initialize caches, run first-block anchor denoising.
         
-        T5 runs on CPU on all ranks (no broadcast needed).
-        Result is moved to neuron device for DiT consumption.
+        T5 runs on T5_RANK (rank 2) on Neuron with torch.compile.
+        Embeddings (bf16) are broadcast to all ranks for DiT.
+        Same pattern as rolling-forcing encode_prompt_distributed().
         """
         if device is None:
             device = self.device
@@ -208,9 +247,26 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         batch_size = noise.shape[0]
 
-        # Text encoding — T5 runs on CPU on every rank (no HBM, no broadcast)
-        enc_result = self.text_encoder(text_prompts)
-        prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
+        # Step 1: Tokenize on all ranks (CPU, fast)
+        ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
+        ids = ids.to(device)
+        mask = mask.to(device)
+
+        # Step 2: T5_RANK encodes with compiled T5 on Neuron
+        if self.rank == T5_RANK:
+            seq_len = mask.gt(0).sum(dim=1).long()
+            enc_result = self.text_encoder(text_prompts)
+            prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
+            # Zero-out padding (already done in encoder, but ensure contiguous)
+            prompt_embeds = prompt_embeds.contiguous()
+        else:
+            # Allocate buffer to receive embeddings: [batch, 512, 4096] for umt5-xxl
+            prompt_embeds = torch.zeros(
+                batch_size, 512, 4096, dtype=dtype, device=device)
+
+        # Step 3: Broadcast bf16 embeddings from T5_RANK to all ranks
+        if dist.is_initialized():
+            dist.broadcast(prompt_embeds, src=T5_RANK)
 
         self.conditional_dict = {
             'prompt_embeds': prompt_embeds,
