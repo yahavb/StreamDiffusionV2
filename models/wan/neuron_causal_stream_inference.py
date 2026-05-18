@@ -41,6 +41,9 @@ class _ContiguousWrapper(nn.Module):
     When num_frame_per_block > 1, various ops (attention reshape, unflatten,
     expand, etc.) produce non-contiguous views. This wrapper calls .contiguous()
     on all tensor args/kwargs before forwarding to the compiled module.
+    
+    Also proxies attribute access (e.g. .weight, .bias) to the inner module
+    so that code like `self.patch_embedding.weight.device` still works.
     """
     def __init__(self, compiled_module):
         super().__init__()
@@ -52,6 +55,14 @@ class _ContiguousWrapper(nn.Module):
         kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) and not v.is_contiguous() else v
                   for k, v in kwargs.items()}
         return self.compiled_module(*args, **kwargs)
+
+    def __getattr__(self, name):
+        if name == 'compiled_module':
+            return super().__getattr__(name)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.compiled_module, name)
 
 
 def _contiguous_compile(module):
