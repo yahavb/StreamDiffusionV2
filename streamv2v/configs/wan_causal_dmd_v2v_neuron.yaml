@@ -30,7 +30,7 @@ height: 480
 width: 832
 num_frames: 81
 
-num_frame_per_block: 1
+num_frame_per_block: 3
 num_kv_cache: 6
 num_sink_tokens: 3
 adapt_sink_threshold: 0.2
