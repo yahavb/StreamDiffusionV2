@@ -353,6 +353,14 @@ def main():
                         f"vae_stream={sum(timings['vae_stream'])*1000:.0f}ms "
                         f"blocks={len(timings['block_e2e'])}")
 
+        # Save video from first benchmark run to /var/mdl/ for quality inspection
+        if dist.get_rank() == 0 and video is not None:
+            output_dir = "/var/mdl"
+            os.makedirs(output_dir, exist_ok=True)
+            video_path = os.path.join(output_dir, "stream_diffusion_output.mp4")
+            save_video(video, video_path, fps=args.fps)
+            LOGGER.info(f"Video saved to {video_path}")
+
         # Only rank 0 prints results (avoid 4× duplicate output)
         if dist.get_rank() == 0:
             print_benchmark_results(all_timings, warmup_timings, args.num_frames, args.benchmark_runs)
