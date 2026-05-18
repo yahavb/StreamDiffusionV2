@@ -1,0 +1,55 @@
+# StreamDiffusionV2 Pipeline-Parallel (PP-4) config for Neuron/Trainium
+# Wan2.1-T2V-1.3B with PP-4: each rank holds full model, processes 1 denoising step
+#
+# PP-4 splits denoising steps across 4 NeuronCores in a ring pipeline.
+# Each micro-step produces 1 clean output block (3 frames).
+# Steady-state throughput: ~4x vs sequential TP-4.
+#
+# Usage:
+#   python streamv2v/inference_neuron_pp.py \
+#     --config streamv2v/configs/wan_causal_pp4_neuron.yaml \
+#     --benchmark
+
+model_name: wan
+generator_name: neuron_causal_wan_pp
+model_type: T2V-1.3B
+model_path: wan_models/Wan2.1-T2V-1.3B
+vae_path: wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+generator_ckpt: checkpoints/rolling_forcing_dmd.pt
+use_ema: false
+
+# PP-4: 4 pipeline stages, each handles subset of denoising steps
+# With 5 steps: rank0=step0, rank1=step1, rank2=step2, rank3=steps3+4
+pp_degree: 4
+tp_degree: 1  # No tensor parallelism — full model per rank
+
+denoising_step_list:
+- 1000
+- 800
+- 600
+- 400
+- 200
+
+num_train_timestep: 1000
+timestep_shift: 5.0
+warp_denoising_step: true
+t2v: true
+
+height: 480
+width: 832
+num_frames: 81
+
+num_frame_per_block: 3
+num_kv_cache: 6
+num_sink_tokens: 3
+
+seed: 0
+
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
