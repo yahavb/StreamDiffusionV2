@@ -181,15 +181,17 @@ def main():
     # Warmup
     if args.benchmark:
         LOGGER.info(f"[Rank {rank}] Warming up ({args.warmup_runs} runs)...")
-        for w in range(args.warmup_runs):
-            t0 = time.time()
-            run_generation()
-            LOGGER.info(f"[Rank {rank}] Warmup {w+1}: {time.time()-t0:.2f}s")
+        with torch.no_grad():
+            for w in range(args.warmup_runs):
+                t0 = time.time()
+                run_generation()
+                LOGGER.info(f"[Rank {rank}] Warmup {w+1}: {time.time()-t0:.2f}s")
 
     # Benchmark
-    t_total_start = time.time()
-    t_anchor, t_stream, block_times = run_generation()
-    t_total = time.time() - t_total_start
+    with torch.no_grad():
+        t_total_start = time.time()
+        t_anchor, t_stream, block_times = run_generation()
+        t_total = time.time() - t_total_start
 
     if args.benchmark and rank == 0:
         # Additional benchmark runs
@@ -197,11 +199,12 @@ def main():
         all_streams = [t_stream]
         all_block_times = [block_times]
 
-        for _ in range(args.benchmark_runs - 1):
-            ta, ts, bt = run_generation()
-            all_anchors.append(ta)
-            all_streams.append(ts)
-            all_block_times.append(bt)
+        with torch.no_grad():
+            for _ in range(args.benchmark_runs - 1):
+                ta, ts, bt = run_generation()
+                all_anchors.append(ta)
+                all_streams.append(ts)
+                all_block_times.append(bt)
 
         # Compute stats
         avg_anchor = sum(all_anchors) / len(all_anchors)
