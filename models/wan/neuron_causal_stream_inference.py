@@ -34,6 +34,32 @@ T5_RANK = int(os.environ.get("T5_RANK", "2"))
 VAE_RANK = int(os.environ.get("VAE_RANK", "0"))
 
 
+class _ContiguousWrapper(nn.Module):
+    """Wraps a compiled module to ensure all tensor inputs are contiguous.
+    
+    Neuron's torch.compile(backend='neuron') requires contiguous tensors.
+    When num_frame_per_block > 1, various ops (attention reshape, unflatten,
+    expand, etc.) produce non-contiguous views. This wrapper calls .contiguous()
+    on all tensor args/kwargs before forwarding to the compiled module.
+    """
+    def __init__(self, compiled_module):
+        super().__init__()
+        self.compiled_module = compiled_module
+
+    def forward(self, *args, **kwargs):
+        args = tuple(a.contiguous() if isinstance(a, torch.Tensor) and not a.is_contiguous() else a
+                     for a in args)
+        kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) and not v.is_contiguous() else v
+                  for k, v in kwargs.items()}
+        return self.compiled_module(*args, **kwargs)
+
+
+def _contiguous_compile(module):
+    """Compile a module with neuron backend and wrap with contiguous guard."""
+    compiled = torch.compile(module, backend='neuron', dynamic=False)
+    return _ContiguousWrapper(compiled)
+
+
 class NeuronCausalStreamInferencePipeline(nn.Module):
     """StreamDiffusionV2 streaming inference pipeline on Neuron/Trainium."""
 
@@ -136,21 +162,18 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             self.vae = None
 
         # Compile DiT sub-modules (same as rolling-forcing inference_neuron_tp.py:229-237)
+        # Wrap with ContiguousWrapper to ensure all tensor inputs are contiguous
+        # before passing to compiled NEFF — required when num_frame_per_block > 1
+        # produces non-contiguous views from attention/reshape ops.
         dit_model = self.generator.model
-        dit_model.patch_embedding = torch.compile(
-            dit_model.patch_embedding, backend='neuron', dynamic=False)
-        dit_model.text_embedding = torch.compile(
-            dit_model.text_embedding, backend='neuron', dynamic=False)
-        dit_model.time_embedding = torch.compile(
-            dit_model.time_embedding, backend='neuron', dynamic=False)
-        dit_model.time_projection = torch.compile(
-            dit_model.time_projection, backend='neuron', dynamic=False)
-        dit_model.head = torch.compile(
-            dit_model.head, backend='neuron', dynamic=False)
+        dit_model.patch_embedding = _contiguous_compile(dit_model.patch_embedding)
+        dit_model.text_embedding = _contiguous_compile(dit_model.text_embedding)
+        dit_model.time_embedding = _contiguous_compile(dit_model.time_embedding)
+        dit_model.time_projection = _contiguous_compile(dit_model.time_projection)
+        dit_model.head = _contiguous_compile(dit_model.head)
         # Compile FFN in each block (pure: Linear→GELU→Linear)
         for block in dit_model.blocks:
-            block.ffn = torch.compile(
-                block.ffn, backend='neuron', dynamic=False)
+            block.ffn = _contiguous_compile(block.ffn)
         LOGGER.info(f"DiT compiled: patch_embed, text_embed, time_embed, "
                     f"time_proj, head, FFN×{len(dit_model.blocks)}")
 
