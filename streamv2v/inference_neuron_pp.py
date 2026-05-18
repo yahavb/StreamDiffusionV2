@@ -116,10 +116,10 @@ def main():
     LOGGER.info(f"[Rank {rank}] Total frames: {total_frames}, "
                 f"streaming blocks: {num_streaming_blocks}")
 
-    # Latent shape
-    scale_size = 16
-    latent_h = config.height // scale_size
-    latent_w = config.width // scale_size
+    # Latent shape — VAE compresses 8x spatial
+    scale_size = 8
+    latent_h = config.height // scale_size   # 60
+    latent_w = config.width // scale_size    # 104
     latent_shape = (1, num_frame_per_block, 16, latent_h, latent_w)
 
     all_frames = []

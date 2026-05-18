@@ -109,18 +109,19 @@ class NeuronPPInferencePipeline(nn.Module):
 
         self.head_dim = self.dim // self.num_heads
 
-        # Spatial dims
-        scale_size = 16
-        self.height = args.height // scale_size * 2
-        self.width = args.width // scale_size * 2
-        self.frame_seq_length = (args.height // scale_size) * (args.width // scale_size)
+        # Spatial dims — VAE compresses 8x, giving latent H/W at scale_size=8
+        scale_size = 8
+        self.height = args.height // scale_size   # 60
+        self.width = args.width // scale_size     # 104
+        # After patch embed (patch_size=2×2), frame_seq_length = (H/2)*(W/2)
+        self.frame_seq_length = (self.height // 2) * (self.width // 2)
         self.num_kv_cache = getattr(args, "num_kv_cache", 6)
         self.kv_cache_length = self.frame_seq_length * self.num_kv_cache
 
         # Latent shape for P2P communication
         # [batch=1, num_frame_per_block, channels=16, h, w]
         self.latent_shape = (1, self.num_frame_per_block, 16,
-                            args.height // scale_size, args.width // scale_size)
+                            self.height, self.width)
 
         # Initialize generator — FULL model per rank (tp_degree=1)
         LOGGER.info(f"[PP-Rank {self.rank}] Loading full DiT model (no TP sharding)...")
