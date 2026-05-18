@@ -194,18 +194,23 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         # Denoising step list
         self.denoising_step_list = torch.tensor(
             denoising_step_list, dtype=torch.long, device=self.device)
-        assert self.denoising_step_list[-1] == 0
 
         t2v = getattr(args, "t2v", True)
-        if not t2v:
+        if not t2v and self.denoising_step_list[-1] == 0:
             self.denoising_step_list = self.denoising_step_list[:-1]
 
         if warp:
+            # Map step indices to actual scheduler timesteps (flow-matching sigma schedule)
             timesteps = torch.cat((
                 self.scheduler.timesteps.cpu(),
                 torch.tensor([0], dtype=torch.float32)
             )).to(self.device)
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
+            LOGGER.info(f"Warped denoising steps: {self.denoising_step_list.tolist()}")
+        else:
+            LOGGER.info(f"Raw denoising steps: {self.denoising_step_list.tolist()}")
+
+        self.denoising_steps = len(self.denoising_step_list)
 
         # State
         self.conditional_dict = None
