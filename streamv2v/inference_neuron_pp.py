@@ -87,8 +87,8 @@ def save_frames(frames, output_dir="/var/mdl/stream_diffusion_pp_frames"):
 def main():
     args = parse_args()
 
-    # Initialize distributed
-    dist.init_process_group(backend="gloo")
+    # Initialize distributed — "neuron" backend handles per-rank NeuronCore pinning
+    dist.init_process_group(backend="neuron")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
