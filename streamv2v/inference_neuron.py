@@ -96,7 +96,11 @@ def save_video(video_tensor, output_path, fps=16):
 
 
 def run_inference(pipeline, args, config, verbose=False):
-    """Run streaming inference and return latents + timing info."""
+    """Run TRUE streaming inference: DiT block → VAE decode per block.
+    
+    Like rolling-forcing, each block is decoded immediately after DiT.
+    This gives real streaming latency (time from noise → pixels per block).
+    """
     device = pipeline.device
     dtype = pipeline.dtype
     num_frames = args.num_frames
@@ -111,7 +115,12 @@ def run_inference(pipeline, args, config, verbose=False):
         args.height // 8, args.width // 8,
         dtype=dtype, device=device)
 
-    timings = {"t5_encode": 0, "dit_anchor": 0, "dit_stream": [], "vae": 0}
+    timings = {
+        "t5_encode": 0,      # T5 + anchor block time
+        "dit_stream": [],     # per-block DiT time (5 denoising steps)
+        "vae_stream": [],     # per-block VAE decode time (1 frame)
+        "block_e2e": [],      # per-block end-to-end (DiT + VAE)
+    }
 
     # Step 1: Encode prompt + anchor denoising (inside prepare)
     t0 = time.perf_counter()
@@ -126,12 +135,18 @@ def run_inference(pipeline, args, config, verbose=False):
     if hasattr(torch, 'neuron'):
         torch.neuron.synchronize()
     timings["t5_encode"] = time.perf_counter() - t0
-    timings["dit_anchor"] = timings["t5_encode"]
 
-    # Collect all latent blocks
-    all_latents = [anchor_pred]
+    # VAE decode anchor block immediately (streaming!)
+    t_vae = time.perf_counter()
+    anchor_video = pipeline.decode_latents(anchor_pred)
+    if hasattr(torch, 'neuron'):
+        torch.neuron.synchronize()
+    anchor_vae_time = time.perf_counter() - t_vae
+    timings["vae_stream"].append(anchor_vae_time)
 
-    # Step 2: Stream remaining frames
+    all_videos = [anchor_video] if anchor_video is not None else []
+
+    # Step 2: Stream remaining frames — DiT + VAE per block
     num_remaining = num_frames - num_anchor_frames
     num_stream_blocks = (num_remaining + num_frame_per_block - 1) // num_frame_per_block
 
@@ -145,7 +160,10 @@ def run_inference(pipeline, args, config, verbose=False):
             args.height // 8, args.width // 8,
             dtype=dtype, device=device)
 
-        t_block = time.perf_counter()
+        t_block_start = time.perf_counter()
+
+        # DiT: 5 denoising steps for this block
+        t_dit = time.perf_counter()
         pred = pipeline.inference_wo_batch(
             noise=block_noise,
             current_start=current_start,
@@ -154,88 +172,104 @@ def run_inference(pipeline, args, config, verbose=False):
         )
         if hasattr(torch, 'neuron'):
             torch.neuron.synchronize()
-        dt = time.perf_counter() - t_block
-        timings["dit_stream"].append(dt)
-        all_latents.append(pred)
+        dit_time = time.perf_counter() - t_dit
+        timings["dit_stream"].append(dit_time)
+
+        # VAE: decode this block immediately (streaming!)
+        t_vae = time.perf_counter()
+        block_video = pipeline.decode_latents(pred)
+        if hasattr(torch, 'neuron'):
+            torch.neuron.synchronize()
+        vae_time = time.perf_counter() - t_vae
+        timings["vae_stream"].append(vae_time)
+
+        block_e2e = time.perf_counter() - t_block_start
+        timings["block_e2e"].append(block_e2e)
+
+        if block_video is not None:
+            all_videos.append(block_video)
 
         if verbose and rank == 0 and block_idx < 5:
-            LOGGER.info(f"  Block {block_idx}: {dt*1000:.0f}ms "
-                        f"({dt/5*1000:.0f}ms/step × 5 steps)")
+            LOGGER.info(f"  Block {block_idx}: DiT={dit_time*1000:.0f}ms "
+                        f"VAE={vae_time*1000:.0f}ms "
+                        f"E2E={block_e2e*1000:.0f}ms")
 
-    # Concatenate all latents
-    latents = torch.cat(all_latents, dim=1)[:, :num_frames]
-
-    # Step 3: VAE decode (only on VAE_RANK=0, returns None on other ranks)
-    t_vae = time.perf_counter()
-    video = pipeline.decode_latents(latents)
-    if video is not None:
+    # Concatenate all decoded video blocks
+    if all_videos:
+        video = torch.cat(all_videos, dim=1)[:, :num_frames]
         video = video * 0.5 + 0.5
-    if hasattr(torch, 'neuron'):
-        torch.neuron.synchronize()
-    timings["vae"] = time.perf_counter() - t_vae
+    else:
+        video = None
 
-    return video, latents, timings
+    return video, None, timings
 
 
 def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
-    """Print FPS benchmark results matching rolling-forcing format.
+    """Print streaming FPS benchmark results.
     
-    Reports:
-      - Compilation time (warmup run 1) — NEFF compilation overhead
-      - Post-compilation performance (benchmark runs) — steady-state FPS
-      - Time-to-first-frame
-      - Steady-state FPS (DiT-only, excluding first block)
+    True streaming: each block = DiT(5 steps) + VAE(1 frame).
+    Reports per-block streaming latency and FPS.
     """
     # Warmup/compilation timing (first warmup is compilation)
-    compile_time = warmup_timings[0]["t5_encode"] + sum(warmup_timings[0]["dit_stream"]) + warmup_timings[0]["vae"]
-
-    # Benchmark timings (post-compilation)
-    encode_times = [t["t5_encode"] for t in all_timings]
-    dit_stream_all = []
-    for t in all_timings:
-        dit_stream_all.extend(t["dit_stream"])
-    vae_times = [t["vae"] for t in all_timings]
-    total_times = [t["t5_encode"] + sum(t["dit_stream"]) + t["vae"] for t in all_timings]
+    w0 = warmup_timings[0]
+    compile_time = (w0["t5_encode"] + sum(w0["dit_stream"])
+                    + sum(w0["vae_stream"]))
 
     def avg(lst):
         return sum(lst) / len(lst) if lst else 0
 
-    avg_encode = avg(encode_times)
-    avg_dit_per_block = avg(dit_stream_all) if dit_stream_all else 0
-    avg_vae = avg(vae_times)
+    # Collect all per-block timings across benchmark runs
+    all_dit = []
+    all_vae = []
+    all_e2e = []
+    for t in all_timings:
+        all_dit.extend(t["dit_stream"])
+        all_vae.extend(t["vae_stream"][1:])  # skip anchor VAE
+        all_e2e.extend(t["block_e2e"])
+
+    avg_dit_per_block = avg(all_dit)
+    avg_vae_per_block = avg(all_vae)
+    avg_e2e_per_block = avg(all_e2e)
+
+    # Encode times (T5 + anchor)
+    avg_encode = avg([t["t5_encode"] for t in all_timings])
+
+    # Total time per run = T5+anchor + sum(block_e2e)
+    total_times = [t["t5_encode"] + sum(t["block_e2e"]) + t["vae_stream"][0]
+                   for t in all_timings]
     avg_total = avg(total_times)
 
-    # Steady-state: time for streaming blocks only (excludes anchor + T5 encode)
-    steady_state_time = avg(total_times) - avg_encode if avg_total > 0 else 0
-    num_stream_frames = num_frames - 1  # all except anchor
-    steady_fps = num_stream_frames / steady_state_time if steady_state_time > 0 else 0
+    # Streaming FPS: frames per second during steady-state streaming
+    # Each block produces 1 frame (num_frame_per_block=1)
+    stream_fps = 1.0 / avg_e2e_per_block if avg_e2e_per_block > 0 else 0
 
-    # Overall FPS (end-to-end including T5 encode)
+    # Overall FPS (including T5 encode + anchor)
     e2e_fps = num_frames / avg_total if avg_total > 0 else 0
 
-    # Time-to-first-frame (encode + anchor block)
-    ttff = avg_encode
+    # VAE-only FPS
+    vae_fps = 1.0 / avg_vae_per_block if avg_vae_per_block > 0 else 0
 
-    # VAE FPS
-    vae_fps = num_frames / avg_vae if avg_vae > 0 else 0
+    # Time-to-first-frame
+    ttff = avg_encode + avg([t["vae_stream"][0] for t in all_timings])
 
     print("\n┌─────────────────────────────────────────────────────────┐")
-    print("│  BENCHMARK RESULTS (post-compilation)                    │")
+    print("│  BENCHMARK RESULTS (post-compilation, streaming)         │")
     print("├─────────────────────────────────────────────────────────┤")
     print(f"│  Num frames:              {num_frames:>6}                      │")
     print(f"│  Benchmark runs:          {num_runs:>6}                      │")
     print(f"│  Compilation time:     {compile_time:>8.1f}s (warmup run 1)     │")
-    print(f"│  T5 encode time:       {avg_encode:>8.3f}s                    │")
-    print(f"│  DiT/block time:       {avg_dit_per_block:>8.3f}s                    │")
-    print(f"│  VAE decode time:      {avg_vae:>8.3f}s                    │")
+    print(f"│  T5+anchor time:       {avg_encode:>8.3f}s                    │")
+    print(f"│  DiT/block time:       {avg_dit_per_block:>8.3f}s (5 steps)       │")
+    print(f"│  VAE/block time:       {avg_vae_per_block:>8.3f}s (1 frame)       │")
+    print(f"│  Block E2E time:       {avg_e2e_per_block:>8.3f}s (DiT+VAE)       │")
     print(f"│  Total time:           {avg_total:>8.3f}s                    │")
     print(f"│  Time-to-first-frame:  {ttff:>8.3f}s                    │")
     print("├─────────────────────────────────────────────────────────┤")
     print(f"│  OVERALL FPS:            {e2e_fps:>8.2f} frames/sec         │")
-    print(f"│  STEADY-STATE FPS:       {steady_fps:>8.2f} frames/sec         │")
+    print(f"│  STREAMING FPS:          {stream_fps:>8.2f} frames/sec         │")
     print(f"│  VAE decode FPS:         {vae_fps:>8.2f} frames/sec         │")
     print(f"│  Real-time ratio:        {e2e_fps/16:>8.3f}x (vs 16fps)      │")
-    print(f"│  Steady real-time ratio: {steady_fps/16:>8.3f}x (vs 16fps)      │")
+    print(f"│  Stream real-time ratio: {stream_fps/16:>8.3f}x (vs 16fps)      │")
     print("└─────────────────────────────────────────────────────────┘\n")
 
 
@@ -279,7 +313,7 @@ def main():
             warmup_timings.append(timings)
             LOGGER.info(f"  warmup t5+anchor={timings['t5_encode']*1000:.0f}ms "
                         f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
-                        f"vae={timings['vae']*1000:.0f}ms")
+                        f"vae_stream={sum(timings['vae_stream'])*1000:.0f}ms")
 
         # Benchmark (post-compilation — steady-state performance)
         LOGGER.info("=== POST-COMPILATION BENCHMARK ===")
@@ -294,7 +328,8 @@ def main():
             all_timings.append(timings)
             LOGGER.info(f"  t5+anchor={timings['t5_encode']*1000:.0f}ms "
                         f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
-                        f"vae={timings['vae']*1000:.0f}ms")
+                        f"vae_stream={sum(timings['vae_stream'])*1000:.0f}ms "
+                        f"blocks={len(timings['block_e2e'])}")
 
         # Only rank 0 prints results (avoid 4× duplicate output)
         if dist.get_rank() == 0:
@@ -304,7 +339,7 @@ def main():
         video, latents, timings = run_inference(pipeline, args, config)
         LOGGER.info(f"T5+anchor: {timings['t5_encode']*1000:.0f}ms, "
                     f"DiT stream: {sum(timings['dit_stream'])*1000:.0f}ms, "
-                    f"VAE: {timings['vae']*1000:.0f}ms")
+                    f"VAE stream: {sum(timings['vae_stream'])*1000:.0f}ms")
 
         # Save (only rank 0 has decoded video)
         if video is not None:
