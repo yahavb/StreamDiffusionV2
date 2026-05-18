@@ -95,11 +95,15 @@ def save_video(video_tensor, output_path, fps=16):
             LOGGER.info(f"Saved frames: {frame_dir}")
 
 
+# Match rolling-forcing: accumulate 3 latent frames before VAE decode
+VAE_DECODE_BATCH = 3
+
+
 def run_inference(pipeline, args, config, verbose=False):
-    """Run TRUE streaming inference: DiT block → VAE decode per block.
+    """Run streaming inference: accumulate 3 DiT blocks → VAE decode batch.
     
-    Like rolling-forcing, each block is decoded immediately after DiT.
-    This gives real streaming latency (time from noise → pixels per block).
+    Same as rolling-forcing: accumulate num_frame_per_block=3 latent frames,
+    then decode them together through VAE. This gives a fair comparison.
     """
     device = pipeline.device
     dtype = pipeline.dtype
@@ -118,8 +122,8 @@ def run_inference(pipeline, args, config, verbose=False):
     timings = {
         "t5_encode": 0,      # T5 + anchor block time
         "dit_stream": [],     # per-block DiT time (5 denoising steps)
-        "vae_stream": [],     # per-block VAE decode time (1 frame)
-        "block_e2e": [],      # per-block end-to-end (DiT + VAE)
+        "vae_stream": [],     # per-batch VAE decode time (3 frames)
+        "block_e2e": [],      # per-batch end-to-end (3×DiT + VAE)
     }
 
     # Step 1: Encode prompt + anchor denoising (inside prepare)
@@ -136,19 +140,14 @@ def run_inference(pipeline, args, config, verbose=False):
         torch.neuron.synchronize()
     timings["t5_encode"] = time.perf_counter() - t0
 
-    # VAE decode anchor block immediately (streaming!)
-    t_vae = time.perf_counter()
-    anchor_video = pipeline.decode_latents(anchor_pred)
-    if hasattr(torch, 'neuron'):
-        torch.neuron.synchronize()
-    anchor_vae_time = time.perf_counter() - t_vae
-    timings["vae_stream"].append(anchor_vae_time)
-
-    all_videos = [anchor_video] if anchor_video is not None else []
-
-    # Step 2: Stream remaining frames — DiT + VAE per block
+    # Step 2: Stream remaining frames — accumulate VAE_DECODE_BATCH then decode
     num_remaining = num_frames - num_anchor_frames
     num_stream_blocks = (num_remaining + num_frame_per_block - 1) // num_frame_per_block
+
+    latent_buffer = [anchor_pred]  # start with anchor
+    all_videos = []
+    batch_dit_time = 0.0
+    t_batch_start = time.perf_counter()
 
     for block_idx in range(num_stream_blocks):
         current_frame = num_anchor_frames + block_idx * num_frame_per_block
@@ -159,8 +158,6 @@ def run_inference(pipeline, args, config, verbose=False):
             1, num_frame_per_block, 16,
             args.height // 8, args.width // 8,
             dtype=dtype, device=device)
-
-        t_block_start = time.perf_counter()
 
         # DiT: 5 denoising steps for this block
         t_dit = time.perf_counter()
@@ -174,25 +171,50 @@ def run_inference(pipeline, args, config, verbose=False):
             torch.neuron.synchronize()
         dit_time = time.perf_counter() - t_dit
         timings["dit_stream"].append(dit_time)
+        batch_dit_time += dit_time
 
-        # VAE: decode this block immediately (streaming!)
+        latent_buffer.append(pred)
+
+        # Decode when we have VAE_DECODE_BATCH frames accumulated
+        if len(latent_buffer) >= VAE_DECODE_BATCH:
+            batch_latents = torch.cat(latent_buffer, dim=1)
+            latent_buffer = []
+
+            t_vae = time.perf_counter()
+            batch_video = pipeline.decode_latents(batch_latents)
+            if hasattr(torch, 'neuron'):
+                torch.neuron.synchronize()
+            vae_time = time.perf_counter() - t_vae
+            timings["vae_stream"].append(vae_time)
+
+            block_e2e = time.perf_counter() - t_batch_start
+            timings["block_e2e"].append(block_e2e)
+
+            if batch_video is not None:
+                all_videos.append(batch_video)
+
+            if verbose and rank == 0 and len(timings["vae_stream"]) <= 3:
+                LOGGER.info(f"  Batch {len(timings['vae_stream'])}: "
+                            f"DiT={batch_dit_time*1000:.0f}ms "
+                            f"VAE={vae_time*1000:.0f}ms "
+                            f"E2E={block_e2e*1000:.0f}ms "
+                            f"({VAE_DECODE_BATCH} frames)")
+
+            batch_dit_time = 0.0
+            t_batch_start = time.perf_counter()
+
+    # Flush remaining latents
+    if latent_buffer:
+        batch_latents = torch.cat(latent_buffer, dim=1)
         t_vae = time.perf_counter()
-        block_video = pipeline.decode_latents(pred)
+        batch_video = pipeline.decode_latents(batch_latents)
         if hasattr(torch, 'neuron'):
             torch.neuron.synchronize()
         vae_time = time.perf_counter() - t_vae
         timings["vae_stream"].append(vae_time)
-
-        block_e2e = time.perf_counter() - t_block_start
-        timings["block_e2e"].append(block_e2e)
-
-        if block_video is not None:
-            all_videos.append(block_video)
-
-        if verbose and rank == 0 and block_idx < 5:
-            LOGGER.info(f"  Block {block_idx}: DiT={dit_time*1000:.0f}ms "
-                        f"VAE={vae_time*1000:.0f}ms "
-                        f"E2E={block_e2e*1000:.0f}ms")
+        timings["block_e2e"].append(time.perf_counter() - t_batch_start)
+        if batch_video is not None:
+            all_videos.append(batch_video)
 
     # Concatenate all decoded video blocks
     if all_videos:
@@ -240,14 +262,14 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
     avg_total = avg(total_times)
 
     # Streaming FPS: frames per second during steady-state streaming
-    # Each block produces 1 frame (num_frame_per_block=1)
-    stream_fps = 1.0 / avg_e2e_per_block if avg_e2e_per_block > 0 else 0
+    # Each batch produces VAE_DECODE_BATCH frames
+    stream_fps = VAE_DECODE_BATCH / avg_e2e_per_block if avg_e2e_per_block > 0 else 0
 
     # Overall FPS (including T5 encode + anchor)
     e2e_fps = num_frames / avg_total if avg_total > 0 else 0
 
-    # VAE-only FPS
-    vae_fps = 1.0 / avg_vae_per_block if avg_vae_per_block > 0 else 0
+    # VAE-only FPS (frames decoded per second)
+    vae_fps = VAE_DECODE_BATCH / avg_vae_per_block if avg_vae_per_block > 0 else 0
 
     # Time-to-first-frame
     ttff = avg_encode + avg([t["vae_stream"][0] for t in all_timings])
@@ -260,8 +282,8 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
     print(f"│  Compilation time:     {compile_time:>8.1f}s (warmup run 1)     │")
     print(f"│  T5+anchor time:       {avg_encode:>8.3f}s                    │")
     print(f"│  DiT/block time:       {avg_dit_per_block:>8.3f}s (5 steps)       │")
-    print(f"│  VAE/block time:       {avg_vae_per_block:>8.3f}s (1 frame)       │")
-    print(f"│  Block E2E time:       {avg_e2e_per_block:>8.3f}s (DiT+VAE)       │")
+    print(f"│  VAE/batch time:       {avg_vae_per_block:>8.3f}s ({VAE_DECODE_BATCH} frames)  │")
+    print(f"│  Batch E2E time:       {avg_e2e_per_block:>8.3f}s ({VAE_DECODE_BATCH}×DiT+VAE) │")
     print(f"│  Total time:           {avg_total:>8.3f}s                    │")
     print(f"│  Time-to-first-frame:  {ttff:>8.3f}s                    │")
     print("├─────────────────────────────────────────────────────────┤")
