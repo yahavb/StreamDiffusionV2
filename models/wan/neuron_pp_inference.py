@@ -316,14 +316,16 @@ class NeuronPPInferencePipeline(nn.Module):
         noisy = self.scheduler.add_noise(clean.flatten(0, 1), noise, t)
         return noisy.unflatten(0, clean.shape[:2])
 
-    def _send_latent(self, latent, dst):
-        """Send latent to next rank in pipeline."""
-        dist.send(latent.contiguous(), dst=dst)
-
-    def _recv_latent(self, src):
-        """Receive latent from previous rank."""
-        latent = torch.zeros(self.latent_shape, dtype=self.dtype, device=self.device)
-        dist.recv(latent, src=src)
+    def _broadcast_latent(self, latent, src_rank):
+        """Broadcast latent from src_rank to all ranks.
+        
+        Neuron backend supports broadcast but not P2P send/recv.
+        All ranks call this; only src_rank provides meaningful data.
+        """
+        if latent is None:
+            latent = torch.zeros(self.latent_shape, dtype=self.dtype, device=self.device)
+        latent = latent.contiguous()
+        dist.broadcast(latent, src=src_rank)
         return latent
 
     def prepare_anchor(self, text_prompts, noise, current_start=0, current_end=None):
@@ -359,46 +361,47 @@ class NeuronPPInferencePipeline(nn.Module):
         return current  # Clean anchor output
 
     def inference_pp_step(self, noise, current_start, current_end):
-        """Run one PP micro-step.
+        """Run one PP micro-step using broadcast for inter-rank communication.
         
         Each rank processes its assigned denoising step(s):
-        - Rank 0: receives new noise, does step 0, sends to rank 1
-        - Rank 1: receives from rank 0, does step 1, sends to rank 2
-        - Rank 2: receives from rank 1, does step 2, sends to rank 3
-        - Rank 3: receives from rank 2, does steps 3+4, outputs clean
+        - Rank 0: starts with noise, does step 0, broadcasts result
+        - Rank 1: receives broadcast from rank 0, does step 1, broadcasts
+        - Rank 2: receives broadcast from rank 1, does step 2, broadcasts
+        - Rank 3: receives broadcast from rank 2, does steps 3+4, outputs clean
         
+        All ranks participate in every broadcast (required by collective ops).
         Returns: clean latent on VAE_RANK, None on other ranks.
         """
         current_start_int = int(current_start)
         current_end_int = int(current_end)
 
-        if self.rank == 0:
-            # First rank: start with new noise
-            current = noise
-        else:
-            # Receive partially-denoised latent from previous rank
-            current = self._recv_latent(src=self.rank - 1)
+        # Sequential pipeline: each rank broadcasts its output to all
+        current = noise if self.rank == 0 else None
 
-        # Run my assigned denoising step(s)
-        for step_idx in self.my_step_indices:
-            ts = self.denoising_step_list[step_idx]
-            denoised = self._run_dit_forward(
-                current, ts, current_start_int, current_end_int)
+        for stage in range(self.pp_degree):
+            if stage > 0:
+                # All ranks receive the output from previous stage via broadcast
+                current = self._broadcast_latent(current, src_rank=stage - 1)
 
-            # If not the very last step overall, add noise for next step
-            if step_idx < self.num_denoising_steps - 1:
-                next_ts = self.denoising_step_list[step_idx + 1]
-                current = self._add_noise(denoised, next_ts)
-            else:
-                current = denoised  # Final clean output
+            if self.rank == stage:
+                # This rank runs its denoising step(s)
+                for step_idx in self.my_step_indices:
+                    ts = self.denoising_step_list[step_idx]
+                    denoised = self._run_dit_forward(
+                        current, ts, current_start_int, current_end_int)
 
-        # Send to next rank (or output if last rank)
-        if self.rank < self.pp_degree - 1:
-            self._send_latent(current, dst=self.rank + 1)
-            return None
-        else:
-            # Last rank: return clean output
+                    if step_idx < self.num_denoising_steps - 1:
+                        next_ts = self.denoising_step_list[step_idx + 1]
+                        current = self._add_noise(denoised, next_ts)
+                    else:
+                        current = denoised
+
+        # Final broadcast from last rank so all ranks have the clean output
+        current = self._broadcast_latent(current, src_rank=self.pp_degree - 1)
+
+        if self.rank == VAE_RANK:
             return current
+        return None
 
     def inference_pp_streaming(self, num_blocks, current_start_base):
         """Run PP streaming inference for multiple blocks.
