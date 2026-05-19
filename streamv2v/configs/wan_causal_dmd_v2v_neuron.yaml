@@ -16,10 +16,6 @@ use_ema: false
 
 denoising_step_list:
 - 1000
-- 800
-- 600
-- 400
-- 200
 
 num_train_timestep: 1000
 timestep_shift: 5.0
