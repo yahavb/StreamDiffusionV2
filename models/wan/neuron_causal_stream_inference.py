@@ -431,6 +431,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_int,
                 current_end=current_end_int,
+                updating_cache=True,
                 shared_buffers=self.shared_buffers,
             )
 

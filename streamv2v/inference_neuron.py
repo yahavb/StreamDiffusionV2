@@ -302,6 +302,16 @@ def main():
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
 
+    # Print effective config
+    print("=" * 60)
+    print("  STREAM-DIFFUSION CONFIG (effective)")
+    print("=" * 60)
+    for k in sorted(vars(args)):
+        if k.startswith('_'):
+            continue
+        print(f"  {k}: {getattr(args, k)}")
+    print("=" * 60)
+
     # Initialize distributed for TP-4
     init_distributed()
 
