@@ -122,8 +122,9 @@ def run_inference(pipeline, args, config, verbose=False):
     timings = {
         "t5_encode": 0,      # T5 + anchor block time
         "dit_stream": [],     # per-block DiT time (5 denoising steps)
-        "vae_stream": [],     # per-batch VAE decode time (3 frames)
-        "block_e2e": [],      # per-batch end-to-end (3×DiT + VAE)
+        "vae_stream": [],     # per-batch VAE decode time
+        "block_e2e": [],      # per-batch end-to-end (DiT + VAE)
+        "num_frame_per_block": num_frame_per_block,
     }
 
     # Step 1: Encode prompt + anchor denoising (inside prepare)
@@ -245,8 +246,8 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
                    for t in all_timings]
     avg_total = avg(total_times)
 
-    # num_frame_per_block from config (3 for both SD and RF)
-    nfpb = 3  # frames per DiT call / VAE decode
+    # num_frame_per_block from config
+    nfpb = all_timings[0].get("num_frame_per_block", 1)  # frames per DiT call / VAE decode
 
     # Streaming FPS: frames per second during steady-state streaming
     stream_fps = nfpb / avg_e2e_per_block if avg_e2e_per_block > 0 else 0
