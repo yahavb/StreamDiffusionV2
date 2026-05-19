@@ -11,11 +11,30 @@ generator_name: neuron_causal_wan
 model_type: T2V-1.3B
 model_path: wan_models/Wan2.1-T2V-1.3B
 vae_path: wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
-generator_ckpt: checkpoints/rolling_forcing_dmd.pt
+generator_ckpt: checkpoints/ode_init.pt
 use_ema: false
 
 denoising_step_list:
 - 1000
+- 950
+- 900
+- 850
+- 800
+- 750
+- 700
+- 650
+- 600
+- 550
+- 500
+- 450
+- 400
+- 350
+- 300
+- 250
+- 200
+- 150
+- 100
+- 50
 
 num_train_timestep: 1000
 timestep_shift: 5.0
