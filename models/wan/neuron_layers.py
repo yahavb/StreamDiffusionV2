@@ -19,54 +19,38 @@ def jit(fn=None, **kwargs):
     return fn
 
 
-# ── Kernel fusion via torch.compile ──────────────────────────────────────
-USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "false").lower() == "true"
-_COMPILE_BACKEND = os.environ.get("NEURON_COMPILE_BACKEND", "inductor")
+# ── Kernel fusion via torch.compile(backend='neuron') ────────────────────
+# The Neuron SDK provides 'neuron' as a torch.compile backend that fuses
+# sequences of PyTorch ops into single compiled NEFFs, eliminating per-op
+# kernel launch overhead (model_switch + DMA copyin/copyout).
+#
+# Reference: rolling-forcing/app/inference_neuron_tp.py uses:
+#   torch.compile(module, backend='neuron', dynamic=False)
+# for FFN, patch_embedding, text_embedding, time_embedding, head, VAE, T5.
 
-# Auto-detect best available backend
-_DETECTED_BACKEND = None
-if USE_TORCH_COMPILE:
-    import torch._dynamo as _dynamo
-    _available_backends = _dynamo.list_backends()
-    print(f"[neuron_compile] Available torch.compile backends: {_available_backends}")
-    
-    # Priority order: neuronx > openxla > inductor
-    for candidate in [_COMPILE_BACKEND, "neuronx", "openxla", "inductor"]:
-        if candidate in _available_backends:
-            _DETECTED_BACKEND = candidate
-            break
-    
-    if _DETECTED_BACKEND:
-        print(f"[neuron_compile] Using backend: {_DETECTED_BACKEND}")
-    else:
-        print(f"[neuron_compile] WARNING: No suitable backend found, disabling torch.compile")
-        USE_TORCH_COMPILE = False
+USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "false").lower() == "true"
+_COMPILE_BACKEND = os.environ.get("NEURON_COMPILE_BACKEND", "neuron")
 
 
 def neuron_compile(module_or_fn, **kwargs):
-    """Compile a module/function with torch.compile for op fusion.
+    """Compile a module with torch.compile(backend='neuron') for NEFF fusion.
     
-    Fuses sequences of small ops (linear, norm, activation, add) into
-    larger compiled graphs, reducing per-op dispatch overhead.
+    Fuses sequences of small ops (Linear→GELU→Linear, norm+scale+shift)
+    into single compiled NEFFs, dramatically reducing kernel launch overhead.
     
     Enable with USE_TORCH_COMPILE=true environment variable.
-    Set NEURON_COMPILE_BACKEND to override backend selection.
+    The 'neuron' backend is provided by torch_neuronx and compiles the graph
+    into optimized Neuron executables.
     """
-    if not USE_TORCH_COMPILE or _DETECTED_BACKEND is None:
+    if not USE_TORCH_COMPILE:
         return module_or_fn
     
-    compile_kwargs = {
-        "backend": _DETECTED_BACKEND,
-        "fullgraph": False,
-        "dynamic": False,
-    }
-    compile_kwargs.update(kwargs)
-    
     try:
-        compiled = torch.compile(module_or_fn, **compile_kwargs)
+        compiled = torch.compile(module_or_fn, backend=_COMPILE_BACKEND, dynamic=False)
         return compiled
     except Exception as e:
-        print(f"[neuron_compile] WARNING: torch.compile failed, falling back to eager: {e}")
+        print(f"[neuron_compile] WARNING: torch.compile(backend='{_COMPILE_BACKEND}') "
+              f"failed, falling back to eager: {e}")
         return module_or_fn
 
 # ── NKI kernel loading ──────────────────────────────────────────────────

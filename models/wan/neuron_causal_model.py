@@ -12,6 +12,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from models.wan.neuron_layers import (
     GELU, SiLU, WanPatchEmbed, CausalHead, CausalWanAttentionBlock,
     rope_params, sinusoidal_embedding_1d, unpatchify, jit, ATTN_SEQLEN_MULTIPLE,
+    neuron_compile,
 )
 
 
@@ -54,12 +55,14 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
-        self.patch_embedding = WanPatchEmbed(in_dim, dim, patch_size)
-        self.text_embedding = jit(nn.Sequential(
+        # Compile DiT submodules with torch.compile(backend='neuron')
+        # Reference: rolling-forcing/app/inference_neuron_tp.py lines 230-234
+        self.patch_embedding = neuron_compile(WanPatchEmbed(in_dim, dim, patch_size))
+        self.text_embedding = neuron_compile(nn.Sequential(
             nn.Linear(text_dim, dim), GELU(), nn.Linear(dim, dim)))
-        self.time_embedding = jit(nn.Sequential(
+        self.time_embedding = neuron_compile(nn.Sequential(
             nn.Linear(freq_dim, dim), SiLU(), nn.Linear(dim, dim)))
-        self.time_projection = jit(nn.Sequential(
+        self.time_projection = neuron_compile(nn.Sequential(
             SiLU(), nn.Linear(dim, dim * 6)))
 
         self.blocks = nn.ModuleList([
@@ -96,7 +99,8 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         assert x.shape[0] == 1
         assert not torch.is_grad_enabled()
 
-        device = self.patch_embedding.weight.device
+        # Access device from a raw parameter (compiled modules may not expose .weight)
+        device = next(self.parameters()).device
         if self.freqs_cos.device != device:
             self.freqs_cos = self.freqs_cos.to(device)
             self.freqs_sin = self.freqs_sin.to(device)
