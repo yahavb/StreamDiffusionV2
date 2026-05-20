@@ -432,4 +432,16 @@ def shard_model_tp(model, tp_rank: int, tp_degree: int):
           f"{heads_per_rank} heads/rank, "
           f"{total_params / 1e9:.2f}B params (local)")
 
+    # ── torch.compile submodules AFTER sharding ──────────────────────────
+    # Reference: rolling-forcing/app/inference_neuron_tp.py lines 230-237
+    # Must happen after TP sharding so isinstance checks see raw nn.Sequential.
+    from models.wan.neuron_layers import neuron_compile
+    model.patch_embedding = neuron_compile(model.patch_embedding)
+    model.text_embedding = neuron_compile(model.text_embedding)
+    model.time_embedding = neuron_compile(model.time_embedding)
+    model.time_projection = neuron_compile(model.time_projection)
+    for block in model.blocks:
+        block.ffn = neuron_compile(block.ffn)
+    print(f"[TP] torch.compile applied to DiT submodules (backend='neuron')")
+
     return model

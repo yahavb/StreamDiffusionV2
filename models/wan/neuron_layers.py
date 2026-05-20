@@ -613,15 +613,15 @@ class CausalWanAttentionBlock(nn.Module):
             layer_idx, frame_length)
         self.cross_attn = WanT2VCrossAttention(
             dim, num_heads, (-1, -1), qk_norm, eps, layer_idx=layer_idx)
-        # FFN: Linear→GELU→Linear fused into single NEFF via torch.compile
-        self.ffn = neuron_compile(nn.Sequential(
-            nn.Linear(dim, ffn_dim), GELU(), nn.Linear(ffn_dim, dim)))
+        # FFN: Linear→GELU→Linear (compiled AFTER TP sharding in tp_utils.py)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim), GELU(), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        # Modulation helpers compiled for fusion (norm+scale+shift → 1 NEFF)
-        self._modulation_chunk = neuron_compile(modulation_chunk)
-        self._modulated_norm_scale = neuron_compile(modulated_norm_scale)
-        self._modulated_norm_shift = neuron_compile(modulated_norm_shift)
-        self._modulated_residual = neuron_compile(modulated_residual)
+        # Modulation helpers (plain functions — compiled after sharding)
+        self._modulation_chunk = modulation_chunk
+        self._modulated_norm_scale = modulated_norm_scale
+        self._modulated_norm_shift = modulated_norm_shift
+        self._modulated_residual = modulated_residual
 
     def forward(self, x, e, grid_sizes, freqs_cos, freqs_sin, context,
                 context_lens, updating_cache=False, kv_cache=None,

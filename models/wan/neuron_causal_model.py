@@ -55,15 +55,14 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
-        # Compile DiT submodules with torch.compile(backend='neuron')
-        # Reference: rolling-forcing/app/inference_neuron_tp.py lines 230-234
-        self.patch_embedding = neuron_compile(WanPatchEmbed(in_dim, dim, patch_size))
-        self.text_embedding = neuron_compile(nn.Sequential(
-            nn.Linear(text_dim, dim), GELU(), nn.Linear(dim, dim)))
-        self.time_embedding = neuron_compile(nn.Sequential(
-            nn.Linear(freq_dim, dim), SiLU(), nn.Linear(dim, dim)))
-        self.time_projection = neuron_compile(nn.Sequential(
-            SiLU(), nn.Linear(dim, dim * 6)))
+        # DiT submodules (compiled AFTER TP sharding via tp_utils.py)
+        self.patch_embedding = WanPatchEmbed(in_dim, dim, patch_size)
+        self.text_embedding = nn.Sequential(
+            nn.Linear(text_dim, dim), GELU(), nn.Linear(dim, dim))
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, dim), SiLU(), nn.Linear(dim, dim))
+        self.time_projection = nn.Sequential(
+            SiLU(), nn.Linear(dim, dim * 6))
 
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(
