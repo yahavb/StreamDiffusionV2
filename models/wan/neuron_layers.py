@@ -18,6 +18,36 @@ def jit(fn=None, **kwargs):
         return lambda f: f
     return fn
 
+
+# ── torch.compile support for kernel fusion ─────────────────────────────
+USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "false").lower() == "true"
+_COMPILE_BACKEND = os.environ.get("NEURON_COMPILE_BACKEND", "neuronx")
+
+def neuron_compile(module_or_fn, **kwargs):
+    """Compile a module/function with torch.compile for Neuron kernel fusion.
+    
+    This fuses sequences of small ops (linear, norm, activation, add) into
+    larger NEFFs, dramatically reducing kernel launch overhead.
+    
+    Enable with USE_TORCH_COMPILE=true environment variable.
+    """
+    if not USE_TORCH_COMPILE:
+        return module_or_fn
+    
+    compile_kwargs = {
+        "backend": _COMPILE_BACKEND,
+        "fullgraph": False,  # Allow graph breaks at NKI kernel boundaries
+        "dynamic": False,    # Static shapes for best fusion
+    }
+    compile_kwargs.update(kwargs)
+    
+    try:
+        compiled = torch.compile(module_or_fn, **compile_kwargs)
+        return compiled
+    except Exception as e:
+        print(f"[neuron_compile] WARNING: torch.compile failed, falling back to eager: {e}")
+        return module_or_fn
+
 # ── NKI kernel loading ──────────────────────────────────────────────────
 USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "true").lower() == "true"
 
@@ -360,10 +390,10 @@ class CausalWanSelfAttention(nn.Module):
         self.block_length = 3 * frame_length
         self.kv_cache_logical_size = 24 * frame_length
 
-        self.q = jit(nn.Linear(dim, dim))
-        self.k = jit(nn.Linear(dim, dim))
-        self.v = jit(nn.Linear(dim, dim))
-        self.o = jit(nn.Linear(dim, dim))
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps)
         self.norm_k = WanRMSNorm(dim, eps=eps)
         self._rope_nki_available = ROPE_NKI_AVAILABLE
@@ -578,13 +608,15 @@ class CausalWanAttentionBlock(nn.Module):
             layer_idx, frame_length)
         self.cross_attn = WanT2VCrossAttention(
             dim, num_heads, (-1, -1), qk_norm, eps, layer_idx=layer_idx)
-        self.ffn = jit(nn.Sequential(
+        # FFN: Linear→GELU→Linear fused into single NEFF via torch.compile
+        self.ffn = neuron_compile(nn.Sequential(
             nn.Linear(dim, ffn_dim), GELU(), nn.Linear(ffn_dim, dim)))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        self._modulation_chunk = jit(modulation_chunk)
-        self._modulated_norm_scale = jit(modulated_norm_scale)
-        self._modulated_norm_shift = jit(modulated_norm_shift)
-        self._modulated_residual = jit(modulated_residual)
+        # Modulation helpers compiled for fusion (norm+scale+shift → 1 NEFF)
+        self._modulation_chunk = neuron_compile(modulation_chunk)
+        self._modulated_norm_scale = neuron_compile(modulated_norm_scale)
+        self._modulated_norm_shift = neuron_compile(modulated_norm_shift)
+        self._modulated_residual = neuron_compile(modulated_residual)
 
     def forward(self, x, e, grid_sizes, freqs_cos, freqs_sin, context,
                 context_lens, updating_cache=False, kv_cache=None,
