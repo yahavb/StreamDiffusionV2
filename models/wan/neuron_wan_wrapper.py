@@ -173,21 +173,49 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
             state_dict = load_file(base_weights)
             self.model.load_state_dict(state_dict, strict=False)
 
-        # Load fine-tuned checkpoint
-        if checkpoint_path and os.path.exists(checkpoint_path):
-            ckpt = torch.load(checkpoint_path, map_location='cpu')
-            if 'generator_ema' in ckpt and use_ema:
-                sd = ckpt['generator_ema']
-            elif 'generator' in ckpt:
-                sd = ckpt['generator']
-            else:
-                sd = ckpt
-            cleaned = OrderedDict()
-            for k, v in sd.items():
-                k = k.replace("_fsdp_wrapped_module.", "")
-                k = k.replace("model.", "", 1) if k.startswith("model.") else k
-                cleaned[k] = v
-            self.model.load_state_dict(cleaned, strict=False)
+        # Load fine-tuned (DMD-distilled) checkpoint. This is REQUIRED: the base Wan2.1
+        # weights are not causal/distilled, so without this the model outputs noise.
+        if not checkpoint_path:
+            raise ValueError(
+                "generator_ckpt is not set — the DMD checkpoint is required (base Wan "
+                "weights alone produce noise). Set generator_ckpt in the config.")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"generator_ckpt not found: {checkpoint_path}. Download the official "
+                "StreamDiffusionV2 checkpoint (jerryfeng/StreamDiffusionV2 -> "
+                "ckpts/wan_causal_dmd_v2v/model.pt) — do NOT substitute RollingForcing.")
+
+        ckpt = torch.load(checkpoint_path, map_location='cpu')
+        if use_ema and 'generator_ema' in ckpt:
+            sd = ckpt['generator_ema']
+        elif 'generator' in ckpt:
+            sd = ckpt['generator']
+        elif 'state_dict' in ckpt:
+            sd = ckpt['state_dict']
+        else:
+            sd = ckpt
+        cleaned = OrderedDict()
+        for k, v in sd.items():
+            k = k.replace("_fsdp_wrapped_module.", "")
+            k = k.replace("model.", "", 1) if k.startswith("model.") else k
+            cleaned[k] = v
+        # strict=False tolerates extra keys (e.g. logvar/scheduler buffers), but we MUST
+        # verify the DiT weights actually landed — a silent mismatch loads base weights
+        # and yields noise that looks like a "successful" run.
+        result = self.model.load_state_dict(cleaned, strict=False)
+        model_keys = set(self.model.state_dict().keys())
+        matched = len(model_keys) - len(set(result.missing_keys))
+        LOGGER.info(
+            "Loaded DMD checkpoint %s: matched %d/%d model params (missing=%d, unexpected=%d)",
+            checkpoint_path, matched, len(model_keys),
+            len(result.missing_keys), len(result.unexpected_keys))
+        if result.missing_keys:
+            LOGGER.warning("  first missing keys: %s", result.missing_keys[:8])
+        # Guard: if almost nothing matched, the checkpoint is wrong/incompatible.
+        if matched < 0.5 * len(model_keys):
+            raise RuntimeError(
+                f"DMD checkpoint matched only {matched}/{len(model_keys)} params — "
+                f"wrong checkpoint format or key naming ({checkpoint_path}).")
 
         # Apply TP-4 sharding BEFORE moving to device (shard on CPU, then move)
         if tp_degree > 1:

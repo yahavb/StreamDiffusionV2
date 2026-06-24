@@ -1,29 +1,46 @@
 # StreamDiffusionV2 config for Neuron/Trainium inference
 # Wan2.1-T2V-1.3B causal DMD on Trainium (trn2)
 #
+# PAPER-FAITHFUL BASELINE (arXiv 2511.07399v2, Sec 5.1 "Setup"):
+#   "The StreamDiffusionV2 model is built on Wan 2.1 and CausVid. ... training-free."
+#   DiT        : Wan2.1-T2V-1.3B made causal via CausVid/DMD distillation
+#   Text enc   : UMT5-XXL (models_t5_umt5-xxl-enc-bf16.pth)
+#   VAE        : Wan2.1 VAE (Wan2.1_VAE.pth, z_dim=16)
+#   Weights    : the OFFICIAL released checkpoint jerryfeng/StreamDiffusionV2
+#                -> ckpts/wan_causal_dmd_v2v/model.pt (dict with a "generator" key).
+#   Schedule   : MUST match the GPU configs/wan_causal_dmd_v2v.yaml the release ships,
+#                otherwise the DMD-distilled model outputs noise, not video.
+#
+# DO NOT use TencentARC/RollingForcing (checkpoints/rolling_forcing_dmd.pt). It is a
+# DIFFERENT model (also Wan2.1-1.3B causal DMD, so it loads without shape errors) and
+# was distilled for a different timestep schedule — using it produced noise.
+#
 # Usage:
-#   python streamv2v/inference_neuron.py \
-#     --config streamv2v/configs/wan_causal_dmd_v2v_neuron.yaml \
-#     --benchmark
+#   torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
+#     --config streamv2v/configs/wan_causal_dmd_v2v_neuron.yaml --benchmark
 
 model_name: wan
 generator_name: neuron_causal_wan
 model_type: T2V-1.3B
 model_path: wan_models/Wan2.1-T2V-1.3B
 vae_path: wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
-generator_ckpt: checkpoints/rolling_forcing_dmd.pt
+# Official StreamDiffusionV2 release checkpoint (folder ckpts/wan_causal_dmd_v2v/model.pt).
+generator_ckpt: ckpts/wan_causal_dmd_v2v/model.pt
 use_ema: false
 
+# Schedule copied verbatim from the GPU configs/wan_causal_dmd_v2v.yaml (the path that
+# produces real video). Previously [1000,800,600,400,200] / shift 5.0 / warp true — those
+# were RollingForcing values and produced noise on the StreamDiffusionV2 weights.
 denoising_step_list:
-- 1000
-- 800
-- 600
+- 700
+- 500
 - 400
 - 200
+- 0
 
 num_train_timestep: 1000
-timestep_shift: 5.0
-warp_denoising_step: true
+timestep_shift: 8.0
+warp_denoising_step: false
 t2v: true
 
 height: 240

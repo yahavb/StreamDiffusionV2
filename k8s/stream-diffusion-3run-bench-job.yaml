@@ -2,7 +2,7 @@
 #
 # Model under test (current Neuron implementation):
 #   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (30 layers, dim=1536, 12 heads, ffn=8960)
-#   - DiT ckpt : TencentARC/RollingForcing -> checkpoints/rolling_forcing_dmd.pt (5-step DMD)
+#   - DiT ckpt : jerryfeng/StreamDiffusionV2 -> ckpts/wan_causal_dmd_v2v/model.pt (official DMD)
 #   - Text enc : UMT5-XXL (umt5-xxl-enc-bf16), 512 tokens, torch.compile(backend='neuron')
 #   - VAE      : Wan2.1_VAE.pth (z_dim=16), bf16
 #   - Runtime  : TP-4, bf16, eager + NKI kernels, 240x416, 81 frames, num_frame_per_block=3
@@ -79,15 +79,18 @@ spec:
                 mkdir -p "$(dirname $WAN_1_3B_TAR)" && cp /tmp/Wan2.1-T2V-1.3B.tar "$WAN_1_3B_TAR" && rm -f /tmp/Wan2.1-T2V-1.3B.tar
               fi
 
-              RF_CKPT_CACHE="/var/mdl/checkpoints/rolling_forcing_dmd.pt"
-              mkdir -p checkpoints
-              if [[ -f "$RF_CKPT_CACHE" ]]; then
-                echo "Restoring RollingForcing DMD checkpoint from S3 cache..."
-                cp "$RF_CKPT_CACHE" checkpoints/rolling_forcing_dmd.pt
+              # OFFICIAL StreamDiffusionV2 release checkpoint (paper-faithful), NOT RollingForcing.
+              # jerryfeng/StreamDiffusionV2 -> wan_causal_dmd_v2v/ (contains model.pt).
+              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
+              mkdir -p ckpts/wan_causal_dmd_v2v
+              if [[ -f "$SDV2_CKPT_CACHE" ]]; then
+                echo "Restoring StreamDiffusionV2 DMD checkpoint from S3 cache..."
+                cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v/model.pt
               else
-                echo "Downloading TencentARC/RollingForcing DMD checkpoint..."
-                python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('TencentARC/RollingForcing', 'checkpoints/rolling_forcing_dmd.pt', local_dir='.')"
-                mkdir -p "$(dirname $RF_CKPT_CACHE)" && cp checkpoints/rolling_forcing_dmd.pt "$RF_CKPT_CACHE"
+                echo "Downloading jerryfeng/StreamDiffusionV2 (wan_causal_dmd_v2v) checkpoint..."
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v/*'], local_dir='ckpts')"
+                test -f ckpts/wan_causal_dmd_v2v/model.pt || { echo "ERROR: model.pt not found after download"; ls -R ckpts/wan_causal_dmd_v2v; exit 1; }
+                mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v/model.pt "$SDV2_CKPT_CACHE"
               fi
               echo "Model weights ready!"
 
@@ -139,8 +142,8 @@ spec:
               }
 
               echo "════════════ NEURON 3-RUN BENCHMARK (StreamDiffusionV2 baseline) ════════════"
-              echo "  model    : Wan2.1-T2V-1.3B + RollingForcing-DMD, TP-4, bf16, 240x416x81"
-              echo "  reference: rolling-forcing trn2 (same Wan2.1-1.3B DMD) — see TRAINIUM_PORT_SUMMARY.md"
+              echo "  model    : Wan2.1-T2V-1.3B + StreamDiffusionV2 official DMD ckpt, TP-4, bf16, 240x416x81"
+              echo "  reference: paper arXiv 2511.07399v2 (Wan2.1-T2V-1.3B causal DMD, training-free)"
               echo "============================================================================="
 
               echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
