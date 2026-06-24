@@ -13,20 +13,20 @@
 #   [3/3] profiled run + run_explorer   -> per-NEFF engine shares + dominant-NEFF metrics
 #
 # Launch:
-#   kubectl delete job stream-diffusion-3run-bench --ignore-not-found
-#   kubectl apply -f k8s/stream-diffusion-3run-bench-job.yaml
-#   kubectl logs -f job/stream-diffusion-3run-bench
+#   kubectl delete job sd --ignore-not-found
+#   kubectl apply -f sd-job.yaml
+#   kubectl logs -f job/sd
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: stream-diffusion-3run-bench
+  name: sd
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: stream-diffusion-3run-bench
+        app: sd
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -170,7 +170,7 @@ spec:
               echo "  (compare engine SHARES from run 3, not absolute µs)"
 
               # ─── persist results (single tar.gz to the PVC; never many files) ───
-              ARCHIVE="/tmp/stream-diffusion-3run-bench_results.tar.gz"
+              ARCHIVE="/tmp/sd_results.tar.gz"
               tar -czf "$ARCHIVE" -C "$(dirname "$LOCAL_RESULTS")" "$(basename "$LOCAL_RESULTS")" 2>/dev/null || true
               cp "$ARCHIVE" "/var/mdl/" 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
           resources:
