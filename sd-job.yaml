@@ -32,11 +32,11 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: s-lnc2-trn2
-          resourceClaimTemplateName: s-lnc2-trn2
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
       containers:
         - name: bench
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-d1c940d:latest
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -175,7 +175,7 @@ spec:
               cp "$ARCHIVE" "/var/mdl/" 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
           resources:
             claims:
-              - name: s-lnc2-trn2
+              - name: s-lnc1-trn2
             requests:
               cpu: 22
               memory: 220Gi
