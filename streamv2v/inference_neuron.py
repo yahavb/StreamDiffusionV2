@@ -63,6 +63,10 @@ def parse_args():
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark mode")
     parser.add_argument("--warmup_runs", type=int, default=2, help="Warmup iterations")
     parser.add_argument("--benchmark_runs", type=int, default=5, help="Benchmark iterations")
+    # Aliases for the neuron-3run-benchmark harness, which appends `--warmup N --iters M`.
+    # When given, they override --warmup_runs / --benchmark_runs respectively.
+    parser.add_argument("--warmup", type=int, default=None, help="Alias for --warmup_runs (3run harness)")
+    parser.add_argument("--iters", type=int, default=None, help="Alias for --benchmark_runs (3run harness)")
     parser.add_argument("--device", type=str, default="neuron")
     parser.add_argument("--save_frames", action="store_true")
     parser.add_argument("--fps", type=int, default=16)
@@ -284,6 +288,13 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
 
 def main():
     args = parse_args()
+
+    # Map neuron-3run-benchmark harness aliases onto the native arg names.
+    if args.warmup is not None:
+        args.warmup_runs = args.warmup
+    if args.iters is not None:
+        args.benchmark_runs = args.iters
+
     config = OmegaConf.load(args.config)
 
     # Merge config into args
@@ -325,18 +336,25 @@ def main():
         for i in range(args.warmup_runs):
             LOGGER.info(f"Warmup run {i+1}/{args.warmup_runs} "
                         f"{'(NEFF compilation)' if i == 0 else '(cache warm)'}")
+            t_warm = time.perf_counter()
             pipeline.kv_cache1 = None
             pipeline.crossattn_cache = None
             pipeline.shared_buffers = None
             video, _, timings = run_inference(pipeline, args, config)
             warmup_timings.append(timings)
+            warm_wall = time.perf_counter() - t_warm
             LOGGER.info(f"  warmup t5+anchor={timings['t5_encode']*1000:.0f}ms "
                         f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
                         f"vae_stream={sum(timings['vae_stream'])*1000:.0f}ms")
+            # Marker parsed by the neuron-3run-benchmark harness: warmup run 1 wall
+            # time is the build/compile cost (cache hit => small; cold => hundreds of s).
+            if i == 0 and dist.get_rank() == 0:
+                print(f"built={warm_wall:.1f}s", flush=True)
 
         # Benchmark (post-compilation — steady-state performance)
         LOGGER.info("=== POST-COMPILATION BENCHMARK ===")
         all_timings = []
+        total_times = []
         for i in range(args.benchmark_runs):
             LOGGER.info(f"Benchmark run {i+1}/{args.benchmark_runs}")
             pipeline.kv_cache1 = None
@@ -345,6 +363,8 @@ def main():
             video, _, timings = run_inference(pipeline, args, config,
                                              verbose=(i == 0))  # detail on first run
             all_timings.append(timings)
+            total_times.append(
+                timings["t5_encode"] + sum(timings["block_e2e"]) + timings["vae_stream"][0])
             LOGGER.info(f"  t5+anchor={timings['t5_encode']*1000:.0f}ms "
                         f"dit_stream={sum(timings['dit_stream'])*1000:.0f}ms "
                         f"vae_stream={sum(timings['vae_stream'])*1000:.0f}ms "
@@ -359,8 +379,14 @@ def main():
             LOGGER.info(f"Video saved to {video_path}")
 
         # Only rank 0 prints results (avoid 4× duplicate output)
-        if dist.get_rank() == 0:
+        if dist.get_rank() == 0 and all_timings:
             print_benchmark_results(all_timings, warmup_timings, args.num_frames, args.benchmark_runs)
+            # Markers parsed by the neuron-3run-benchmark harness/gen_report.py.
+            # median = full-clip wall time (real latency); throughput = clip frames/s.
+            median_total = sorted(total_times)[len(total_times) // 2]
+            throughput = args.num_frames / median_total if median_total > 0 else 0.0
+            print(f"median={median_total * 1000:.1f}ms throughput={throughput:.3f} frame/s",
+                  flush=True)
     else:
         LOGGER.info("Running inference...")
         video, latents, timings = run_inference(pipeline, args, config)
