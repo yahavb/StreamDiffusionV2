@@ -13,19 +13,12 @@ __all__ = [
     'WanVAE',
 ]
 
-# ─── NKI Kernel Loading for Neuron ─────────────────────────────────────
-# Gated behind USE_NKI_VAE (default OFF). The NKI VAE conv2d_k3 path builds 9
-# shifted copies of the full-resolution (pixel-space) activation and cat's them;
-# at 240x416 that compiles to a 27-tensor cat that FAILS on this SDK image
-# (ConnectToService errno=2 -> COMPILATION FAILED). RF's production 8-fps VAE
-# decode does NOT use these kernels either — it uses TP-sharded conv3d. So keep
-# the NKI VAE path opt-in and off by default; the DiT NKI kernels (self/cross/
-# rope, gated by USE_NKI_KERNELS) are the actual FPS lever and load separately.
-_USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "false").lower() in ("1", "true")
+# ─── NKI VAE Kernel Loading for Neuron ─────────────────────────────────
+_USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "1") == "1"
 _nki_conv2d_k1 = None
 _nki_conv2d_k3 = None
 _nki_self_attn = None
-_NKI_AVAILABLE = False
+_NKI_VAE_AVAILABLE = False
 
 if _USE_NKI_VAE:
     try:
@@ -35,12 +28,12 @@ if _USE_NKI_VAE:
         _nki_conv2d_k1 = wrap_nki(vae_conv2d_k1)
         _nki_conv2d_k3 = wrap_nki(vae_conv2d_k3_shifted)
         _nki_self_attn = wrap_nki(vae_self_attention)
-        _NKI_AVAILABLE = True
-        logging.info("[vae] NKI VAE kernels: LOADED")
+        _NKI_VAE_AVAILABLE = True
+        print("[vae.py] NKI VAE kernels: ✓ LOADED (conv2d_k1, conv2d_k3, self_attn)")
     except Exception as e:
-        logging.warning(f"[vae] NKI VAE kernels: not available ({e})")
+        print(f"[vae.py] NKI VAE kernels: ✗ FAILED ({e}) — using PyTorch fallback")
 else:
-    logging.info("[vae] NKI VAE kernels: SKIPPED (USE_NKI_VAE not set) — using PyTorch decode")
+    print("[vae.py] NKI VAE kernels: — SKIPPED (USE_NKI_VAE=0)")
 
 
 def _is_neuron_tensor(x):
@@ -86,13 +79,12 @@ def _nki_conv2d_forward(weight, bias, x_2d, kernel_size, C_in, C_out, H, W, padd
             C_in_p = ((C_in + P - 1) // P) * P
             C_out_p = ((C_out + P - 1) // P) * P
 
-            # Build shifted inputs
             frame_3d = frame.reshape(C_in, H, W)
-            x_padded_spatial = F.pad(frame_3d.float(), (padding, padding, padding, padding))
+            x_padded = F.pad(frame_3d.float(), (padding, padding, padding, padding))
             shifts = []
             for kh in range(3):
                 for kw in range(3):
-                    window = x_padded_spatial[:, kh:kh + H, kw:kw + W]
+                    window = x_padded[:, kh:kh + H, kw:kw + W]
                     shifts.append(window.reshape(C_in, HW))
             shifted = torch.stack(shifts, dim=0).reshape(9 * C_in, HW).to(torch.bfloat16)
 
@@ -155,10 +147,9 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.
 
     def forward(self, x):
-        # Explicit normalize for Neuron compatibility (F.normalize creates non-contiguous tensors)
-        dim = 1 if self.channel_first else -1
-        norm = torch.sqrt(torch.sum(x * x, dim=dim, keepdim=True).clamp(min=1e-12))
-        return ((x / norm).contiguous() * self.scale * self.gamma + self.bias).contiguous()
+        return F.normalize(
+            x.contiguous(), dim=(1 if self.channel_first else
+                    -1)) * self.scale * self.gamma + self.bias
 
 
 class Upsample(nn.Upsample):
@@ -182,11 +173,11 @@ class Resample(nn.Module):
         # layers
         if mode == 'upsample2d':
             self.resample = nn.Sequential(
-                Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
+                Upsample(scale_factor=(2., 2.), mode='nearest'),
                 nn.Conv2d(dim, dim // 2, 3, padding=1))
         elif mode == 'upsample3d':
             self.resample = nn.Sequential(
-                Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
+                Upsample(scale_factor=(2., 2.), mode='nearest'),
                 nn.Conv2d(dim, dim // 2, 3, padding=1))
             self.time_conv = CausalConv3d(
                 dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
@@ -216,7 +207,7 @@ class Resample(nn.Module):
                 else:
 
                     cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                    if cache_x.shape[2] < CACHE_T and feat_cache[
+                    if cache_x.shape[2] < 2 and feat_cache[
                             idx] is not None and feat_cache[idx] != 'Rep':
                         # cache last frame of last two chunk
                         cache_x = torch.cat([
@@ -224,7 +215,7 @@ class Resample(nn.Module):
                                 cache_x.device), cache_x
                         ],
                             dim=2)
-                    if cache_x.shape[2] < CACHE_T and feat_cache[
+                    if cache_x.shape[2] < 2 and feat_cache[
                             idx] is not None and feat_cache[idx] == 'Rep':
                         cache_x = torch.cat([
                             torch.zeros_like(cache_x).to(cache_x.device),
@@ -243,9 +234,9 @@ class Resample(nn.Module):
                                     3)
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
-        x = rearrange(x, 'b c t h w -> (b t) c h w').contiguous()
+        x = rearrange(x, 'b c t h w -> (b t) c h w')
         x = self.resample(x)
-        x = rearrange(x, '(b t) c h w -> b c t h w', t=t).contiguous()
+        x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
         if self.mode == 'downsample3d':
             if feat_cache is not None:
@@ -256,7 +247,7 @@ class Resample(nn.Module):
                 else:
 
                     cache_x = x[:, :, -1:, :, :].clone()
-                    # if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None and feat_cache[idx]!='Rep':
+                    # if cache_x.shape[2] < 2 and feat_cache[idx] is not None and feat_cache[idx]!='Rep':
                     #     # cache last frame of last two chunk
                     #     cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
 
@@ -312,7 +303,7 @@ class ResidualBlock(nn.Module):
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat([
                         feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
@@ -330,6 +321,7 @@ class ResidualBlock(nn.Module):
 class AttentionBlock(nn.Module):
     """
     Causal self-attention with a single head.
+    Uses standard PyTorch ops (Conv2d + SDPA) which work in Neuron eager mode.
     """
 
     def __init__(self, dim):
@@ -347,11 +339,12 @@ class AttentionBlock(nn.Module):
     def forward(self, x):
         identity = x
         b, c, t, h, w = x.size()
-        x = rearrange(x, 'b c t h w -> (b t) c h w').contiguous()
+        x = rearrange(x, 'b c t h w -> (b t) c h w')
         x = self.norm(x)
 
         # Use NKI kernels if available and on Neuron
-        if _NKI_AVAILABLE and _is_neuron_tensor(x):
+        if _NKI_VAE_AVAILABLE and _is_neuron_tensor(x):
+            # NKI path: use vae_conv2d_k1 for QKV/proj, vae_self_attention for SDPA
             P = 128
             CHUNK = 512
             seq = h * w
@@ -466,7 +459,7 @@ class Encoder3d(nn.Module):
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 # cache last frame of last two chunk
                 cache_x = torch.cat([
                     feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
@@ -498,7 +491,7 @@ class Encoder3d(nn.Module):
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat([
                         feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
@@ -572,7 +565,7 @@ class Decoder3d(nn.Module):
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 # cache last frame of last two chunk
                 cache_x = torch.cat([
                     feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
@@ -604,7 +597,7 @@ class Decoder3d(nn.Module):
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat([
                         feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
@@ -653,8 +646,7 @@ class WanVAE_(nn.Module):
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
         self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_upsample, dropout)
-        self.first_encode = True
-        self.first_decode = True
+        self.clear_cache()
 
     def forward(self, x):
         mu, log_var = self.encode(x)
@@ -690,55 +682,14 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return mu
 
-    def stream_encode(self, x, scale):
-        # cache
-        t = x.shape[2]
-        if self.first_encode:
-            self.first_encode = False
-            self.clear_cache_encode()
-            self._enc_conv_idx = [0]
-            out = self.encoder(
-                x[:, :, :1, :, :],
-                feat_cache=self._enc_feat_map,
-                feat_idx=self._enc_conv_idx,
-                )
-            self._enc_conv_idx = [0]
-            out_ = self.encoder(
-                x[:, :, 1:, :, :],
-                feat_cache=self._enc_feat_map,
-                feat_idx=self._enc_conv_idx,
-                )
-            out = torch.cat([out, out_], 2)
-        else:
-            out=[]
-            for i in range(t//4):
-                self._enc_conv_idx = [0]
-                out.append(self.encoder(
-                    x[:, :, i*4:(i+1)*4, :, :],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx,
-                    ))
-            out = torch.cat(out, 2)
-        mu, log_var = self.conv1(out).chunk(2, dim=1)
-        if scale is not None:
-            if isinstance(scale[0], torch.Tensor):
-                mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
-                    1, self.z_dim, 1, 1, 1)
-            else:
-                mu = (mu - scale[0]) * scale[1]
-        # self.clear_cache()
-        return mu
-
     def decode(self, z, scale):
         self.clear_cache()
         # z: [b,c,t,h,w]
         if isinstance(scale[0], torch.Tensor):
-            z = (z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
-                1, self.z_dim, 1, 1, 1)).contiguous()
+            z = z.contiguous() / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
         else:
-            z = (z / scale[1] + scale[0]).contiguous()
-        # Cast back to model dtype after scale division (avoids float32 vs bf16 mismatch)
-        z = z.to(self.conv2.weight.dtype)
+            z = z.contiguous() / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
         for i in range(iter_):
@@ -757,51 +708,29 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return out
 
-    def stream_decode(self, z, scale):
+    def cached_decode(self, z, scale):
         # z: [b,c,t,h,w]
-        t=z.shape[2]
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
                 1, self.z_dim, 1, 1, 1)
         else:
             z = z / scale[1] + scale[0]
-        # Cast back to model dtype after scale division (avoids float32 vs bf16 mismatch)
-        z = z.to(self.conv2.weight.dtype)
+        iter_ = z.shape[2]
         x = self.conv2(z)
-        if self.first_decode:
-            self.first_decode = False
-            self.clear_cache_decode()
-            self.first_batch = False
+        for i in range(iter_):
             self._conv_idx = [0]
-            out = self.decoder(
-                x[:, :, :1, :, :],
-                feat_cache=self._feat_map,
-                feat_idx=self._conv_idx,
-                )
-            self._conv_idx = [0]
-            out_ = self.decoder(
-                x[:, :, 1:, :, :],
-                feat_cache=self._feat_map,
-                feat_idx=self._conv_idx,
-                )
-            out = torch.cat([out, out_], 2)
-        else:
-            out = []
-            for i in range(t):
-                self._conv_idx = [0]
-                out.append(self.decoder(
-                    x[:, :, i:(i+1), :, :],
+            if i == 0:
+                out = self.decoder(
+                    x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                    ))
-            out = torch.cat(out, 2)
-        # self.clear_cache()
+                    feat_idx=self._conv_idx)
+            else:
+                out_ = self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx)
+                out = torch.cat([out, out_], 2)
         return out
-
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return eps * std + mu
 
     def sample(self, imgs, deterministic=False):
         mu, log_var = self.encode(imgs)
@@ -818,17 +747,6 @@ class WanVAE_(nn.Module):
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
-
-    def clear_cache_decode(self):
-        self._conv_num = count_conv3d(self.decoder)
-        self._conv_idx = [0]
-        self._feat_map = [None] * self._conv_num
-    
-    def clear_cache_encode(self):
-        self._enc_conv_num = count_conv3d(self.encoder)
-        self._enc_conv_idx = [0]
-        self._enc_feat_map = [None] * self._enc_conv_num
-    
 
 
 def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
