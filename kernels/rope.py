@@ -31,9 +31,9 @@ Key substitutions from kernel_builder:
     - nb.range → nl.sequential_range (outer) / nl.affine_range (inner)
     - tensor_tensor_arith(dst=,...) → return-style nisa.tensor_tensor()
 """
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
+import nki
+import nki.language as nl
+import nki.isa as nisa
 
 
 @nki.jit
@@ -45,7 +45,6 @@ def causal_rope_rotation(x, cos_sin, num_heads=12, head_dim=128):
 
     assert seq_len % P == 0
     num_tiles = seq_len // P
-
     out = nl.ndarray((seq_len, N, D), dtype=x.dtype, buffer=nl.shared_hbm)
 
     for tile_i in nl.sequential_range(num_tiles):
@@ -58,14 +57,14 @@ def causal_rope_rotation(x, cos_sin, num_heads=12, head_dim=128):
         out_sb = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
         for n in nl.affine_range(N):
             xh = x_sb[:, n, :]
-            x_cos = nisa.tensor_tensor(xh, cos_tile, nl.multiply)
+            x_cos = nl.multiply(xh, cos_tile)
 
             x_swap = nl.ndarray((P, D), dtype=xh.dtype, buffer=nl.sbuf)
             x_swap[:, 0::2] = xh[:, 1::2]
             x_swap[:, 1::2] = xh[:, 0::2]
 
-            x_sin = nisa.tensor_tensor(x_swap, sin_tile, nl.multiply)
-            out_sb[:, n, :] = nisa.tensor_tensor(x_cos, x_sin, nl.add)
+            x_sin = nl.multiply(x_swap, sin_tile)
+            out_sb[:, n, :] = nl.add(x_cos, x_sin)
 
         nl.store(out[nl.ds(ts, P), :, :], out_sb)
 

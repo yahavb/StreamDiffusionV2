@@ -65,27 +65,35 @@ wan_flash_self_attn_nki = None
 ATTN_SEQLEN_MULTIPLE = 8192
 
 if USE_NKI_KERNELS:
+    # NOTE: do NOT swallow these errors. A silent `except: pass` here is what
+    # caused the kernels to fall back to eager for the whole baseline run
+    # (self_nki=False rope_nki=False) with no diagnostic. Log every failure.
+    import logging as _logging
+    _klog = _logging.getLogger(__name__)
     try:
         from torch_neuronx.nki_hop import wrap_nki
         from kernels.cross_attention import wan_cross_attn as _wan_cross_attn
         wan_cross_attn = wrap_nki(_wan_cross_attn)
         NKI_AVAILABLE = True
-    except Exception:
-        pass
+        _klog.info("[nki] cross_attention: LOADED")
+    except Exception as e:
+        _klog.warning("[nki] cross_attention: FAILED to load: %r", e)
     try:
         from torch_neuronx.nki_hop import wrap_nki as _wrap_rope
         from kernels.rope import causal_rope_rotation as _causal_rope_rotation
         causal_rope_rotation_nki = _wrap_rope(_causal_rope_rotation)
         ROPE_NKI_AVAILABLE = True
-    except Exception:
-        pass
+        _klog.info("[nki] rope: LOADED")
+    except Exception as e:
+        _klog.warning("[nki] rope: FAILED to load: %r", e)
     try:
         from torch_neuronx.nki_hop import wrap_nki as _wrap_sa
         from kernels.self_attention import wan_flash_self_attn as _wan_flash_self_attn
         wan_flash_self_attn_nki = _wrap_sa(_wan_flash_self_attn)
         SELF_ATTN_NKI_AVAILABLE = True
-    except Exception:
-        pass
+        _klog.info("[nki] self_attention: LOADED")
+    except Exception as e:
+        _klog.warning("[nki] self_attention: FAILED to load: %r", e)
 
 
 # ── Activations (explicit math for Neuron tracing) ─────────────────────
