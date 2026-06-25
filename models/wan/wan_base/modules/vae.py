@@ -14,22 +14,33 @@ __all__ = [
 ]
 
 # ─── NKI Kernel Loading for Neuron ─────────────────────────────────────
+# Gated behind USE_NKI_VAE (default OFF). The NKI VAE conv2d_k3 path builds 9
+# shifted copies of the full-resolution (pixel-space) activation and cat's them;
+# at 240x416 that compiles to a 27-tensor cat that FAILS on this SDK image
+# (ConnectToService errno=2 -> COMPILATION FAILED). RF's production 8-fps VAE
+# decode does NOT use these kernels either — it uses TP-sharded conv3d. So keep
+# the NKI VAE path opt-in and off by default; the DiT NKI kernels (self/cross/
+# rope, gated by USE_NKI_KERNELS) are the actual FPS lever and load separately.
+_USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "false").lower() in ("1", "true")
 _nki_conv2d_k1 = None
 _nki_conv2d_k3 = None
 _nki_self_attn = None
 _NKI_AVAILABLE = False
 
-try:
-    from torch_neuronx.nki_hop import wrap_nki
-    from models.wan.kernels.vae_conv2d import vae_conv2d_k1, vae_conv2d_k3_shifted
-    from models.wan.kernels.vae_attention import vae_self_attention
-    _nki_conv2d_k1 = wrap_nki(vae_conv2d_k1)
-    _nki_conv2d_k3 = wrap_nki(vae_conv2d_k3_shifted)
-    _nki_self_attn = wrap_nki(vae_self_attention)
-    _NKI_AVAILABLE = True
-    logging.info("[vae] NKI VAE kernels: LOADED")
-except Exception as e:
-    logging.warning(f"[vae] NKI VAE kernels: not available ({e})")
+if _USE_NKI_VAE:
+    try:
+        from torch_neuronx.nki_hop import wrap_nki
+        from models.wan.kernels.vae_conv2d import vae_conv2d_k1, vae_conv2d_k3_shifted
+        from models.wan.kernels.vae_attention import vae_self_attention
+        _nki_conv2d_k1 = wrap_nki(vae_conv2d_k1)
+        _nki_conv2d_k3 = wrap_nki(vae_conv2d_k3_shifted)
+        _nki_self_attn = wrap_nki(vae_self_attention)
+        _NKI_AVAILABLE = True
+        logging.info("[vae] NKI VAE kernels: LOADED")
+    except Exception as e:
+        logging.warning(f"[vae] NKI VAE kernels: not available ({e})")
+else:
+    logging.info("[vae] NKI VAE kernels: SKIPPED (USE_NKI_VAE not set) — using PyTorch decode")
 
 
 def _is_neuron_tensor(x):
