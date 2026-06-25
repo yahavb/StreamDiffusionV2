@@ -139,6 +139,15 @@ spec:
                 BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache | head -1)
                 BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" 2>/dev/null | head -1)
                 neff_hotspots "$BIGNEFF" "$POUT/${BIGHASH}.ntff" "$LOCAL_RESULTS/hotspots_${BIGHASH}.txt"
+                # Preserve the top-N heavy NEFF+NTFF pairs for step [5] (instruction-level
+                # DMA analysis names the op behind the 308MB copy). summary-text can't.
+                mkdir -p "$LOCAL_RESULTS/ntff_pairs"
+                for h in $(python3 scripts/neuron/top_neffs.py "$POUT" 5 2>/dev/null); do
+                  local src; src=$(find /tmp/neff_cache -name "${h}.neff" 2>/dev/null | head -1)
+                  [ -n "$src" ] && cp "$src" "$LOCAL_RESULTS/ntff_pairs/${h}.neff" 2>/dev/null || true
+                  [ -f "$POUT/${h}.ntff" ] && cp "$POUT/${h}.ntff" "$LOCAL_RESULTS/ntff_pairs/${h}.ntff" 2>/dev/null || true
+                done
+                echo "preserved pairs: $(ls "$LOCAL_RESULTS/ntff_pairs"/*.neff 2>/dev/null | wc -l)"
               }
 
               echo "════════════ NEURON 3-RUN BENCHMARK (StreamDiffusionV2 baseline) ════════════"
@@ -163,6 +172,15 @@ spec:
 
               echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics (neuron-profile CLI) ==="
               run_explorer
+
+              # ─── [5] INSTRUCTION-LEVEL DMA + SHAPE ANALYSIS (names the op) ───
+              # Ingest the preserved heavy NEFF+NTFF pairs to parquet (neuron-explorer
+              # --output-format parquet, LOCAL /tmp) and run duckdb queries that name
+              # the HLO op + bir_debug source line + tensor geometry behind each NEFF.
+              # This is what tells us EXACTLY what the 308MB static-copy NEFF is.
+              echo "=== [5] instruction-level DMA analysis (top NEFFs) ==="
+              bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
+                2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA ANALYSIS FAILED"
 
               echo "=== PROFILER-OVERHEAD COMPARISON ==="
               echo "  clean    (no profiler, REAL latency) : ${T_CLEAN:-N/A}"
