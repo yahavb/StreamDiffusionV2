@@ -187,6 +187,30 @@ spec:
               echo "  profiled (profiler on)               : ${T_PROF:-N/A}"
               echo "  (compare engine SHARES from run 3, not absolute µs)"
 
+              # ─── [6] NEURON PROFILER 2.0 SYSTEM-TRACE BUNDLE (uploadable) ───
+              # The RUNTIME writes the uploadable bundle (trace_info.pb + .pb/.ntff/.neff)
+              # per rank ONLY when these inspect env vars point at an output dir — NOT
+              # neuron-profile capture / neuron-explorer (those emit .ntff/parquet only,
+              # never trace_info.pb). Format matches https://neuron-explorer.harmony.a2z.com/:
+              #   NEURON_RT_INSPECT_ENABLE=1         -> system profile (trace_info.pb, REQUIRED)
+              #   NEURON_RT_INSPECT_SYSTEM_PROFILE=1 -> system trace events
+              #   NEURON_RT_INSPECT_DEVICE_PROFILE=1 -> ALSO emit .ntff + .neff (may be empty on async torchrun)
+              # Produces per-rank dirs i-<instance>_pid_<pid>/ under $SYSTRACE.
+              echo "=== [6] system-trace bundle (Neuron Profiler 2.0 -> trace_info.pb) ==="
+              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+              NEURON_RT_INSPECT_ENABLE=1 \
+              NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
+              NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+                $BENCH_CMD --warmup 1 --iters 2 2>&1 | grep -iE "median=|throughput=|FAILED" || echo "SYSTRACE RUN done"
+              echo "--- bundle contents ($SYSTRACE) ---"
+              find "$SYSTRACE" -maxdepth 2 -type f | sed 's|^|  |' | head -60
+              echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
+              echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' | wc -l)"
+              tar -czf /tmp/sd_systrace_bundle.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
+              cp /tmp/sd_systrace_bundle.tar.gz "/var/mdl/sd_systrace_bundle.tar.gz" 2>/dev/null \
+                && echo "systrace bundle saved: /var/mdl/sd_systrace_bundle.tar.gz" || echo "systrace save skipped"
+
               # ─── persist results (single tar.gz to the PVC; never many files) ───
               ARCHIVE="/tmp/sd_results.tar.gz"
               tar -czf "$ARCHIVE" -C "$(dirname "$LOCAL_RESULTS")" "$(basename "$LOCAL_RESULTS")" 2>/dev/null || true
