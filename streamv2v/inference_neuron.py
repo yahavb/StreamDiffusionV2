@@ -104,111 +104,94 @@ def save_video(video_tensor, output_path, fps=16):
 
 
 def run_inference(pipeline, args, config, verbose=False):
-    """Run streaming inference: accumulate 3 DiT blocks → VAE decode batch.
-    
-    Same as rolling-forcing: accumulate num_frame_per_block=3 latent frames,
-    then decode them together through VAE. This gives a fair comparison.
+    """Run rolling-forcing windowed streaming inference.
+
+    Ported from rolling-forcing: encode prompt once, then drive the rolling
+    window loop (inference_rolling_forcing_streaming) which yields finalized
+    3-frame blocks. Each block is decoded through VAE immediately. The window
+    loop does ONE windowed denoise + ONE 3-frame cache-update per window
+    (~num_blocks + nds - 1 windows), amortizing the nds denoise steps across
+    the rolling window — replacing the old per-block nds-step sequential loop.
+
+    Per-block timing here measures DiT(window-attributed) + VAE so the existing
+    benchmark aggregation (median steady-state fps) keeps working.
     """
     device = pipeline.device
     dtype = pipeline.dtype
     num_frames = args.num_frames
     num_frame_per_block = pipeline.num_frame_per_block
-    frame_seq_length = pipeline.frame_seq_length
     rank = pipeline.rank
 
-    # Generate initial noise for anchor block
-    num_anchor_frames = num_frame_per_block
+    # Full-clip noise: the window loop consumes one nfpb-block of fresh noise
+    # per window (RF assembles padded_input from this).
     noise = torch.randn(
-        1, num_anchor_frames, 16,
+        1, num_frames, 16,
         args.height // 8, args.width // 8,
         dtype=dtype, device=device)
 
     timings = {
-        "t5_encode": 0,      # T5 + anchor block time
-        "dit_stream": [],     # per-block DiT time (5 denoising steps)
-        "vae_stream": [],     # per-batch VAE decode time
-        "block_e2e": [],      # per-batch end-to-end (DiT + VAE)
+        "t5_encode": 0,       # T5 encode (prompt only — no anchor denoise now)
+        "dit_stream": [],     # per-yielded-block DiT(window) time
+        "vae_stream": [],     # per-block VAE decode time
+        "block_e2e": [],      # per-block end-to-end (DiT-window + VAE)
         "num_frame_per_block": num_frame_per_block,
     }
 
-    # Step 1: Encode prompt + anchor denoising (inside prepare)
+    # Step 1: Encode prompt only (no anchor denoising — the window loop owns the
+    # caches and handles block 0 via the ramp-up patterns, exactly like RF).
     t0 = time.perf_counter()
-    anchor_pred = pipeline.prepare(
-        text_prompts=[args.prompt],
-        device=device, dtype=dtype,
-        noise=noise,
-        current_start=0,
-        current_end=frame_seq_length * num_anchor_frames,
-        batch_denoise=False,
-    )
+    pipeline.prepare_prompt_only(
+        text_prompts=[args.prompt], device=device, dtype=dtype, batch_size=1)
     if hasattr(torch, 'neuron'):
         torch.neuron.synchronize()
     timings["t5_encode"] = time.perf_counter() - t0
 
-    # VAE decode anchor immediately
-    t_vae = time.perf_counter()
-    anchor_video = pipeline.decode_latents(anchor_pred)
-    if hasattr(torch, 'neuron'):
-        torch.neuron.synchronize()
-    anchor_vae_time = time.perf_counter() - t_vae
-    timings["vae_stream"].append(anchor_vae_time)
+    # vae_stream[0] is the anchor slot consumed by the benchmark printer
+    # (time-to-first-frame). With the window loop there is no separate anchor;
+    # record the first yielded block's VAE time there instead.
+    timings["vae_stream"].append(0.0)
 
-    all_videos = [anchor_video] if anchor_video is not None else []
+    all_videos = []
+    block_idx = 0
+    last_yield = time.perf_counter()
 
-    # Step 2: Stream remaining frames — 1 DiT call (3 frames) + 1 VAE decode per block
-    num_remaining = num_frames - num_anchor_frames
-    num_stream_blocks = (num_remaining + num_frame_per_block - 1) // num_frame_per_block
-
-    for block_idx in range(num_stream_blocks):
-        t_block_start = time.perf_counter()
-
-        current_frame = num_anchor_frames + block_idx * num_frame_per_block
-        current_start = current_frame * frame_seq_length
-        current_end = current_start + frame_seq_length * num_frame_per_block
-
-        block_noise = torch.randn(
-            1, num_frame_per_block, 16,
-            args.height // 8, args.width // 8,
-            dtype=dtype, device=device)
-
-        # DiT: 5 denoising steps for this block (3 frames)
-        t_dit = time.perf_counter()
-        pred = pipeline.inference_wo_batch(
-            noise=block_noise,
-            current_start=current_start,
-            current_end=current_end,
-            current_step=pipeline.denoising_step_list[0].item(),
-        )
+    # Step 2: Rolling-forcing windowed streaming — yields finalized 3-frame blocks.
+    for start_frame, latent_block in pipeline.inference_rolling_forcing_streaming(
+        noise, num_output_frames=num_frames
+    ):
         if hasattr(torch, 'neuron'):
             torch.neuron.synchronize()
-        dit_time = time.perf_counter() - t_dit
+        dit_time = time.perf_counter() - last_yield
         timings["dit_stream"].append(dit_time)
 
-        # VAE decode immediately (3 frames per call, same as rolling-forcing)
         t_vae = time.perf_counter()
-        block_video = pipeline.decode_latents(pred)
+        block_video = pipeline.decode_latents(latent_block.to(device))
         if hasattr(torch, 'neuron'):
             torch.neuron.synchronize()
         vae_time = time.perf_counter() - t_vae
-        timings["vae_stream"].append(vae_time)
 
-        block_e2e = time.perf_counter() - t_block_start
+        if block_idx == 0:
+            timings["vae_stream"][0] = vae_time
+        else:
+            timings["vae_stream"].append(vae_time)
+
+        block_e2e = dit_time + vae_time
         timings["block_e2e"].append(block_e2e)
 
         if block_video is not None:
             all_videos.append(block_video)
 
-        # Log EVERY block (rank 0) so per-block spread + compile contamination is
-        # visible in the log — this is how RF exposes its 8.09 fps steady-state vs
-        # the compile-dragged early blocks. block_fps uses block_e2e (DiT+VAE).
         if rank == 0:
             block_fps = num_frame_per_block / block_e2e if block_e2e > 0 else 0
-            LOGGER.info(f"  Block {block_idx}: "
+            LOGGER.info(f"  Block {block_idx} (frames {start_frame}+): "
                         f"DiT={dit_time*1000:.0f}ms "
                         f"VAE={vae_time*1000:.0f}ms "
                         f"E2E={block_e2e*1000:.0f}ms "
                         f"= {block_fps:.2f} fps "
                         f"({num_frame_per_block} frames)")
+
+        block_idx += 1
+        last_yield = time.perf_counter()
 
     # Concatenate all decoded video blocks
     if all_videos:

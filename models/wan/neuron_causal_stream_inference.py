@@ -34,6 +34,21 @@ T5_RANK = int(os.environ.get("T5_RANK", "2"))
 VAE_RANK = int(os.environ.get("VAE_RANK", "0"))
 
 
+def add_noise(original_samples, noise, sigma):
+    """Diffusion forward process: mix clean samples with noise.
+
+    Ported from rolling-forcing causal_inference_pipeline.add_noise. Replaces
+    FlowMatchScheduler.add_noise()'s argmin lookup with a precomputed sigma.
+
+    Args:
+        original_samples: [B*F, C, H, W] clean latents
+        noise:            [B*F, C, H, W] random noise
+        sigma:            [B*F, 1, 1, 1] precomputed sigma values
+    Returns: [B*F, C, H, W] noisy samples, same dtype as noise
+    """
+    return ((1 - sigma) * original_samples + sigma * noise).type_as(noise)
+
+
 class _ContiguousWrapper(nn.Module):
     """Wraps a compiled module to ensure all tensor inputs are contiguous.
     
@@ -227,6 +242,16 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         self.denoising_steps = len(self.denoising_step_list)
 
+        # Rolling-forcing pattern machinery (ported from RF
+        # CausalInferencePipeline). context_noise/context_sigma drive the
+        # dedicated 3-frame cache-update call; timestep/sigma_patterns drive the
+        # per-window padded denoise input.
+        self.context_noise = float(getattr(args, "context_noise", 0.0))
+        self.timestep_patterns = self._build_timestep_patterns()
+        self.sigma_patterns = self._build_sigma_patterns()
+        self.context_sigma = self._timestep_to_sigma(self.context_noise)
+        self._add_noise = add_noise
+
         # State
         self.conditional_dict = None
         self.kv_cache1 = None
@@ -390,6 +415,37 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         return denoised_pred
 
+    def prepare_prompt_only(self, text_prompts: List[str], device=None,
+                            dtype=None, batch_size=1):
+        """Encode the prompt and set conditional_dict — no anchor denoising.
+
+        The rolling-forcing window loop manages its own caches and handles the
+        first block through the ramp-up patterns, so (unlike prepare()) it must
+        NOT have an anchor block pre-denoised into the KV cache. This mirrors RF,
+        where conditional_dict is built by encode_prompt_distributed() and the
+        window loop starts from empty caches.
+        """
+        if device is None:
+            device = self.device
+        if dtype is None:
+            dtype = self.dtype
+
+        ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
+        ids = ids.to(device)
+        mask = mask.to(device)
+
+        if self.rank == T5_RANK:
+            enc_result = self.text_encoder(text_prompts)
+            prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype).contiguous()
+        else:
+            prompt_embeds = torch.zeros(batch_size, 512, 4096, dtype=dtype, device=device)
+
+        if dist.is_initialized():
+            dist.broadcast(prompt_embeds, src=T5_RANK)
+
+        self.conditional_dict = {'prompt_embeds': prompt_embeds}
+        return self.conditional_dict
+
     def inference_stream(self, noise, current_start, current_end,
                          current_step=None):
         """Run one streaming inference step (single frame block)."""
@@ -468,6 +524,425 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 ).unflatten(0, denoised_pred.shape[:2])
 
         return denoised_pred
+
+    # ── Rolling-forcing pattern machinery (ported from RF) ────────────────
+
+    def _build_timestep_patterns(self):
+        """Build unique timestep patterns for all window types (CPU, float32).
+
+        Ported verbatim from RF CausalInferencePipeline._build_timestep_patterns.
+        Returns a [2*nds-1, max_frames] tensor where:
+          - Pattern 0: steady-state (full window)
+          - Patterns 1..nds-1: ramp-up (window growing from start)
+          - Patterns nds..2*nds-2: ramp-down (window shrinking from end)
+        """
+        nds = len(self.denoising_step_list)
+        nfpb = self.num_frame_per_block
+        max_frames = nds * nfpb
+
+        steady = []
+        for ts in reversed(self.denoising_step_list):
+            steady.extend([ts.item()] * nfpb)
+
+        patterns = [steady]
+        for i in range(1, nds):
+            cnf = i * nfpb
+            patterns.append(steady[-cnf:] + [0.0] * (max_frames - cnf))
+        for i in range(1, nds):
+            cnf = i * nfpb
+            patterns.append(steady[:cnf] + [0.0] * (max_frames - cnf))
+
+        return torch.tensor(patterns, dtype=torch.float32)
+
+    def _timestep_to_sigma(self, timestep_val):
+        """Map a single timestep value to its corresponding sigma.
+
+        Ported from RF; uses argmin against the scheduler timestep grid.
+        """
+        timesteps = self.scheduler.timesteps.to("cpu")
+        sigmas = self.scheduler.sigmas.to("cpu")
+        idx = torch.argmin((timesteps - timestep_val).abs())
+        return sigmas[idx].item()
+
+    def _build_sigma_patterns(self):
+        """Precompute sigma values for each timestep pattern (RF layout)."""
+        sigma_patterns = torch.zeros_like(self.timestep_patterns)
+        for i, pattern in enumerate(self.timestep_patterns):
+            for j, t in enumerate(pattern):
+                sigma_patterns[i, j] = self._timestep_to_sigma(t.item())
+        return sigma_patterns
+
+    @torch.no_grad()
+    def inference_rolling_forcing(self, noise, num_output_frames=None):
+        """Rolling-forcing windowed denoise loop (ported from RF).
+
+        Replaces the per-block 5-step sequential loop. One windowed denoise
+        forward + one 3-frame cache-update per window, amortizing the denoise
+        steps across the rolling window.
+
+        Args:
+            noise: [B, F, C, H, W] full-clip input noise (on device).
+            num_output_frames: number of frames to return (defaults to F).
+        Returns:
+            [B, num_output_frames, C, H, W] denoised latents.
+        """
+        device = noise.device
+        dtype = noise.dtype
+        batch_size, num_frames, num_channels, height, width = noise.shape
+
+        nfpb = self.num_frame_per_block
+        requested_frames = num_frames if num_output_frames is None else num_output_frames
+
+        # Round up to next multiple of nfpb
+        if num_frames % nfpb != 0:
+            padded_total = ((num_frames // nfpb) + 1) * nfpb
+            pad_count = padded_total - num_frames
+            pad_noise = torch.randn(
+                batch_size, pad_count, num_channels, height, width,
+                dtype=dtype, device=device)
+            noise = torch.cat([noise, pad_noise], dim=1)
+            num_frames = padded_total
+
+        num_blocks = num_frames // nfpb
+        num_output_frames = requested_frames
+
+        # Caches: initialize or reset
+        if self.kv_cache1 is None:
+            self._initialize_kv_cache(batch_size, dtype, device)
+            self._initialize_crossattn_cache(batch_size, dtype, device)
+            self._initialize_shared_buffers(batch_size, dtype, device)
+        else:
+            for block_index in range(self.num_transformer_blocks):
+                self.crossattn_cache[block_index]["is_init"] = False
+            for block_index in range(len(self.kv_cache1)):
+                self.kv_cache1[block_index]["global_end_index"] = 0
+                self.kv_cache1[block_index]["local_end_index"] = 0
+
+        # Construct rolling-forcing windows (RF index bookkeeping verbatim)
+        nds = len(self.denoising_step_list)
+        rolling_window_length_blocks = nds
+        window_start_blocks = []
+        window_end_blocks = []
+        pattern_indices = []
+        window_num = num_blocks + rolling_window_length_blocks - 1
+
+        for window_index in range(window_num):
+            start_block = max(0, window_index - rolling_window_length_blocks + 1)
+            end_block = min(num_blocks - 1, window_index)
+            window_start_blocks.append(start_block)
+            window_end_blocks.append(end_block)
+            num_blks = end_block - start_block + 1
+            if num_blks == nds:
+                pattern_indices.append(0)                  # steady-state
+            elif start_block == 0:
+                pattern_indices.append(num_blks)            # ramp-up
+            else:
+                pattern_indices.append(nds - 1 + num_blks)  # ramp-down
+
+        max_frames = rolling_window_length_blocks * nfpb
+
+        output = torch.zeros(
+            [batch_size, num_output_frames + max_frames - nfpb,
+             num_channels, height, width], device=device, dtype=dtype)
+        noisy_cache = torch.zeros(
+            [batch_size, num_output_frames + max_frames,
+             num_channels, height, width], device=device, dtype=dtype)
+
+        if self.timestep_patterns.device != device:
+            self.timestep_patterns = self.timestep_patterns.to(device)
+            self.sigma_patterns = self.sigma_patterns.to(device)
+
+        padded_input = torch.zeros(
+            [batch_size, max_frames, num_channels, height, width],
+            device=device, dtype=dtype)
+        padded_timestep = torch.zeros(
+            [batch_size, max_frames], device=device, dtype=torch.float32)
+        padded_sigma = torch.zeros(
+            [batch_size, max_frames], device=device, dtype=torch.float32)
+
+        # 3-frame buffers for the dedicated cache-update call (constant t/sigma)
+        cache_input = torch.zeros(
+            [batch_size, nfpb, num_channels, height, width],
+            device=device, dtype=dtype)
+        cache_timestep = torch.full(
+            [batch_size, nfpb], self.context_noise, device=device, dtype=torch.float32)
+        cache_sigma = torch.full(
+            [batch_size, nfpb], self.context_sigma, device=device, dtype=torch.float32)
+
+        block_sigma_list = []
+        for step in self.denoising_step_list:
+            sigma_val = self._timestep_to_sigma(step.item())
+            block_sigma_list.append(
+                sigma_val * torch.ones(
+                    [batch_size * nfpb, 1, 1, 1], dtype=torch.float32, device=device))
+
+        for window_index in range(window_num):
+            start_block = window_start_blocks[window_index]
+            end_block = window_end_blocks[window_index]
+
+            current_start_frame = start_block * nfpb
+            current_end_frame = (end_block + 1) * nfpb
+            current_num_frames = current_end_frame - current_start_frame
+
+            padded_input.copy_(
+                noisy_cache[:, current_start_frame:current_start_frame + max_frames])
+
+            if current_num_frames == max_frames or current_start_frame == 0:
+                noise_offset = current_num_frames - nfpb
+                padded_input[:, noise_offset:noise_offset + nfpb].copy_(
+                    noise[:, current_end_frame - nfpb:current_end_frame])
+
+            padded_timestep[:] = self.timestep_patterns[pattern_indices[window_index]]
+            padded_sigma[:] = self.sigma_patterns[pattern_indices[window_index]]
+
+            num_valid_frames = current_num_frames
+
+            # Windowed denoise call — sigma-driven, tuple return.
+            # current_start passed exactly as RF: start_frame * frame_seq_length.
+            _, denoised_pred = self.generator(
+                noisy_image_or_video=padded_input,
+                conditional_dict=self.conditional_dict,
+                timestep=padded_timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                num_valid_frames=num_valid_frames,
+                shared_buffers=self.shared_buffers,
+                sigma=padded_sigma,
+            )
+
+            copy_end = min(current_start_frame + max_frames, output.shape[1])
+            copy_len = copy_end - current_start_frame
+            output[:, current_start_frame:copy_end].copy_(denoised_pred[:, :copy_len])
+
+            # Re-noising loop (RF verbatim)
+            num_blks = end_block - start_block + 1
+            step_base = (num_blks - 1) if (
+                start_block == 0 and num_blks < nds) else (nds - 1)
+
+            for block_idx in range(start_block, end_block + 1):
+                local_offset = block_idx - start_block
+                step_index = step_base - local_offset
+                if step_index == nds - 1:
+                    continue
+
+                full_noise = torch.randn(
+                    batch_size * num_valid_frames, *denoised_pred.shape[2:],
+                    dtype=denoised_pred.dtype).to(device)
+                block_pred = denoised_pred[
+                    :, local_offset * nfpb:(local_offset + 1) * nfpb].flatten(0, 1)
+                block_noise = full_noise.unflatten(
+                    0, (batch_size, num_valid_frames)
+                )[:, local_offset * nfpb:(local_offset + 1) * nfpb].flatten(0, 1)
+                block_sigma = block_sigma_list[step_index + 1]
+
+                noisy_cache[:, block_idx * nfpb:(block_idx + 1) * nfpb] = \
+                    self._add_noise(block_pred, block_noise, block_sigma) \
+                    .unflatten(0, (batch_size, nfpb))
+
+            # Dedicated 3-frame cache-update call (updating_cache=True).
+            cache_input.copy_(denoised_pred[:, :nfpb])
+            self.generator(
+                noisy_image_or_video=cache_input,
+                conditional_dict=self.conditional_dict,
+                timestep=cache_timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                updating_cache=True,
+                num_valid_frames=nfpb,
+                shared_buffers=self.shared_buffers,
+                sigma=cache_sigma,
+            )
+
+        return output[:, :num_output_frames]
+
+    @torch.no_grad()
+    def inference_rolling_forcing_streaming(self, noise, num_output_frames=None):
+        """Generator version of inference_rolling_forcing (ported from RF).
+
+        Same computation, but yields finalized blocks as they complete all nds
+        denoising steps, enabling true streaming overlap with VAE decode.
+
+        Yields:
+            (start_frame_index, latent_block [B, nfpb, C, H, W] on CPU)
+        """
+        device = noise.device
+        dtype = noise.dtype
+        batch_size, num_frames, num_channels, height, width = noise.shape
+
+        nfpb = self.num_frame_per_block
+        requested_frames = num_frames if num_output_frames is None else num_output_frames
+
+        if num_frames % nfpb != 0:
+            padded_total = ((num_frames // nfpb) + 1) * nfpb
+            pad_count = padded_total - num_frames
+            pad_noise = torch.randn(
+                batch_size, pad_count, num_channels, height, width,
+                dtype=dtype, device=device)
+            noise = torch.cat([noise, pad_noise], dim=1)
+            num_frames = padded_total
+
+        num_blocks = num_frames // nfpb
+
+        if self.kv_cache1 is None:
+            self._initialize_kv_cache(batch_size, dtype, device)
+            self._initialize_crossattn_cache(batch_size, dtype, device)
+            self._initialize_shared_buffers(batch_size, dtype, device)
+        else:
+            for block_index in range(self.num_transformer_blocks):
+                self.crossattn_cache[block_index]["is_init"] = False
+            for block_index in range(len(self.kv_cache1)):
+                self.kv_cache1[block_index]["global_end_index"] = 0
+                self.kv_cache1[block_index]["local_end_index"] = 0
+
+        nds = len(self.denoising_step_list)
+        max_frames = nds * nfpb
+        window_num = num_blocks + nds - 1
+
+        output = torch.zeros(
+            [batch_size, num_frames + max_frames - nfpb,
+             num_channels, height, width], device=device, dtype=dtype)
+        noisy_cache = torch.zeros(
+            [batch_size, num_frames + max_frames,
+             num_channels, height, width], device=device, dtype=dtype)
+
+        if self.timestep_patterns.device != device:
+            self.timestep_patterns = self.timestep_patterns.to(device)
+            self.sigma_patterns = self.sigma_patterns.to(device)
+
+        padded_input = torch.zeros(
+            [batch_size, max_frames, num_channels, height, width],
+            device=device, dtype=dtype)
+        padded_timestep = torch.zeros(
+            [batch_size, max_frames], device=device, dtype=torch.float32)
+        padded_sigma = torch.zeros(
+            [batch_size, max_frames], device=device, dtype=torch.float32)
+
+        cache_input = torch.zeros(
+            [batch_size, nfpb, num_channels, height, width],
+            device=device, dtype=dtype)
+        cache_timestep = torch.full(
+            [batch_size, nfpb], self.context_noise, device=device, dtype=torch.float32)
+        cache_sigma = torch.full(
+            [batch_size, nfpb], self.context_sigma, device=device, dtype=torch.float32)
+
+        block_sigma_list = []
+        for step in self.denoising_step_list:
+            sigma_val = self._timestep_to_sigma(step.item())
+            block_sigma_list.append(
+                sigma_val * torch.ones(
+                    [batch_size * nfpb, 1, 1, 1], dtype=torch.float32, device=device))
+
+        window_start_blocks = []
+        window_end_blocks = []
+        pattern_indices = []
+        for window_index in range(window_num):
+            start_block = max(0, window_index - nds + 1)
+            end_block = min(num_blocks - 1, window_index)
+            window_start_blocks.append(start_block)
+            window_end_blocks.append(end_block)
+            num_blks = end_block - start_block + 1
+            if num_blks == nds:
+                pattern_indices.append(0)
+            elif start_block == 0:
+                pattern_indices.append(num_blks)
+            else:
+                pattern_indices.append(nds - 1 + num_blks)
+
+        last_finalized_block = -1
+
+        for window_index in range(window_num):
+            start_block = window_start_blocks[window_index]
+            end_block = window_end_blocks[window_index]
+
+            current_start_frame = start_block * nfpb
+            current_end_frame = (end_block + 1) * nfpb
+            current_num_frames = current_end_frame - current_start_frame
+
+            padded_input.copy_(
+                noisy_cache[:, current_start_frame:current_start_frame + max_frames])
+
+            if current_num_frames == max_frames or current_start_frame == 0:
+                noise_offset = current_num_frames - nfpb
+                padded_input[:, noise_offset:noise_offset + nfpb].copy_(
+                    noise[:, current_end_frame - nfpb:current_end_frame])
+
+            padded_timestep[:] = self.timestep_patterns[pattern_indices[window_index]]
+            padded_sigma[:] = self.sigma_patterns[pattern_indices[window_index]]
+
+            num_valid_frames = current_num_frames
+
+            _, denoised_pred = self.generator(
+                noisy_image_or_video=padded_input,
+                conditional_dict=self.conditional_dict,
+                timestep=padded_timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                num_valid_frames=num_valid_frames,
+                shared_buffers=self.shared_buffers,
+                sigma=padded_sigma,
+            )
+
+            output[:, current_start_frame:current_start_frame + max_frames].copy_(
+                denoised_pred)
+
+            num_blks = end_block - start_block + 1
+            step_base = (num_blks - 1) if (
+                start_block == 0 and num_blks < nds) else (nds - 1)
+
+            for block_idx in range(start_block, end_block + 1):
+                local_offset = block_idx - start_block
+                step_index = step_base - local_offset
+                if step_index == nds - 1:
+                    continue
+
+                full_noise = torch.randn(
+                    batch_size * num_valid_frames, *denoised_pred.shape[2:],
+                    dtype=denoised_pred.dtype).to(device)
+                block_pred = denoised_pred[
+                    :, local_offset * nfpb:(local_offset + 1) * nfpb].flatten(0, 1)
+                block_noise = full_noise.unflatten(
+                    0, (batch_size, num_valid_frames)
+                )[:, local_offset * nfpb:(local_offset + 1) * nfpb].flatten(0, 1)
+                block_sigma = block_sigma_list[step_index + 1]
+
+                noisy_cache[:, block_idx * nfpb:(block_idx + 1) * nfpb] = \
+                    self._add_noise(block_pred, block_noise, block_sigma) \
+                    .unflatten(0, (batch_size, nfpb))
+
+            cache_input.copy_(denoised_pred[:, :nfpb])
+            self.generator(
+                noisy_image_or_video=cache_input,
+                conditional_dict=self.conditional_dict,
+                timestep=cache_timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                updating_cache=True,
+                num_valid_frames=nfpb,
+                shared_buffers=self.shared_buffers,
+                sigma=cache_sigma,
+            )
+
+            # Yield finalized blocks (passed all nds denoising steps).
+            finalized_block = window_index - nds + 1
+            if finalized_block > last_finalized_block and finalized_block >= 0:
+                for blk in range(last_finalized_block + 1, finalized_block + 1):
+                    if blk < num_blocks:
+                        sf = blk * nfpb
+                        ef = min((blk + 1) * nfpb, requested_frames)
+                        if sf < requested_frames:
+                            yield (sf, output[:, sf:ef].clone().cpu())
+                last_finalized_block = finalized_block
+
+        # Ramp-down: yield remaining blocks.
+        for blk in range(last_finalized_block + 1, num_blocks):
+            sf = blk * nfpb
+            ef = min((blk + 1) * nfpb, requested_frames)
+            if sf < requested_frames:
+                yield (sf, output[:, sf:ef].clone().cpu())
 
     def decode_latents(self, latents):
         """Decode latents to pixel space using VAE (only on VAE_RANK).

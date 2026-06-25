@@ -239,7 +239,12 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         self.post_init()
 
     def _convert_flow_pred_to_x0(self, flow_pred, xt, timestep):
-        """Convert flow prediction to x0: x0 = xt - sigma_t * flow_pred."""
+        """Convert flow prediction to x0: x0 = xt - sigma_t * flow_pred.
+
+        Timestep-driven path (looks up sigma from timestep via argmin). Used by
+        the anchor denoising in prepare() where a per-frame sigma is not
+        precomputed. The window loop uses the sigma-driven path below.
+        """
         original_dtype = flow_pred.dtype
         flow_pred, xt, sigmas, timesteps = map(
             lambda x: x.float().to(flow_pred.device),
@@ -250,11 +255,40 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         x0_pred = xt - sigma_t * flow_pred
         return x0_pred.to(original_dtype)
 
+    def _convert_flow_pred_to_x0_sigma(self, flow_pred, xt, sigma_t):
+        """Convert flow prediction to x0 driven by a precomputed sigma.
+
+        Ported from rolling-forcing layers.convert_flow_pred_to_x0: the window
+        loop precomputes a per-frame sigma (sigma_patterns) so no argmin lookup
+        is needed. x0 = xt - sigma_t * flow_pred, computed in fp32.
+
+        Args:
+            flow_pred: [B*F, C, H, W] model velocity prediction
+            xt:        [B*F, C, H, W] noisy input
+            sigma_t:   [B*F] precomputed per-frame sigma
+        """
+        dtype = flow_pred.dtype
+        flow_pred = flow_pred.float()
+        xt = xt.float()
+        sigma_t = sigma_t.float().reshape(-1, 1, 1, 1)
+        x0_pred = xt - sigma_t * flow_pred
+        return x0_pred.to(dtype)
+
     def forward(self, noisy_image_or_video, conditional_dict, timestep,
                 kv_cache=None, crossattn_cache=None,
                 current_start=None, current_end=None,
                 updating_cache=False, cache_start=None,
-                num_valid_frames=None, shared_buffers=None):
+                num_valid_frames=None, shared_buffers=None,
+                sigma=None):
+        """DiT forward.
+
+        Two return contracts (kept for the two callers):
+          - sigma is None  -> anchor / inference_wo_batch path: returns a single
+            tensor pred_x0 (timestep-driven x0 conversion), as before.
+          - sigma is given  -> rolling-forcing window path: returns the tuple
+            (flow_pred, pred_x0) with sigma-driven x0 conversion, matching RF's
+            WanDiffusionWrapper.forward.
+        """
         context = conditional_dict["prompt_embeds"]
         x = noisy_image_or_video
         t = timestep
@@ -272,7 +306,16 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
             shared_buffers=shared_buffers,
         ).permute(0, 2, 1, 3, 4)  # back to [B, F, C, H, W]
 
-        # Convert flow prediction to x0
+        if sigma is not None:
+            # Rolling-forcing window path: sigma-driven x0, tuple return.
+            pred_x0 = self._convert_flow_pred_to_x0_sigma(
+                flow_pred=model_out.flatten(0, 1),
+                xt=x.flatten(0, 1),
+                sigma_t=sigma.flatten(0, 1),
+            ).unflatten(0, model_out.shape[:2])
+            return model_out, pred_x0
+
+        # Legacy path (anchor / inference_wo_batch): single-tensor return.
         pred_x0 = self._convert_flow_pred_to_x0(
             flow_pred=model_out.flatten(0, 1),
             xt=x.flatten(0, 1),
