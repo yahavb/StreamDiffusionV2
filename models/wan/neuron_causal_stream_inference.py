@@ -433,11 +433,19 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         current_end_int = int(current_end)
 
         self.denoising_step_list[0] = current_step
+        num_steps = len(self.denoising_step_list)
         for index, current_timestep in enumerate(self.denoising_step_list):
             timestep = torch.ones(
                 [batch_size, noise.shape[1]], device=noise.device,
                 dtype=torch.int64) * current_timestep
 
+            # MATCH rolling-forcing pipeline: the expensive KV-cache assembly
+            # (pad/concat to max_attention_size=8190 — the 35ms+26ms copy NEFFs)
+            # is gated by updating_cache. RF runs the denoise steps WITHOUT it
+            # (cheap windowed read) and updates the cache ONCE at the end. SD was
+            # passing updating_cache=True on ALL 5 steps -> the big assembly ran
+            # 5x/block, the dominant per-block cost. Only update on the last step.
+            is_last_step = (index == num_steps - 1)
             denoised_pred = self.generator(
                 noisy_image_or_video=noise,
                 conditional_dict=self.conditional_dict,
@@ -446,7 +454,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_int,
                 current_end=current_end_int,
-                updating_cache=True,
+                updating_cache=is_last_step,
                 shared_buffers=self.shared_buffers,
             )
 
