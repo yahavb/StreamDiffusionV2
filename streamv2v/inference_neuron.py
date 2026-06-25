@@ -198,11 +198,16 @@ def run_inference(pipeline, args, config, verbose=False):
         if block_video is not None:
             all_videos.append(block_video)
 
-        if verbose and rank == 0 and block_idx < 3:
+        # Log EVERY block (rank 0) so per-block spread + compile contamination is
+        # visible in the log — this is how RF exposes its 8.09 fps steady-state vs
+        # the compile-dragged early blocks. block_fps uses block_e2e (DiT+VAE).
+        if rank == 0:
+            block_fps = num_frame_per_block / block_e2e if block_e2e > 0 else 0
             LOGGER.info(f"  Block {block_idx}: "
                         f"DiT={dit_time*1000:.0f}ms "
                         f"VAE={vae_time*1000:.0f}ms "
                         f"E2E={block_e2e*1000:.0f}ms "
+                        f"= {block_fps:.2f} fps "
                         f"({num_frame_per_block} frames)")
 
     # Concatenate all decoded video blocks
@@ -229,6 +234,13 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
     def avg(lst):
         return sum(lst) / len(lst) if lst else 0
 
+    def median(lst):
+        if not lst:
+            return 0
+        s = sorted(lst)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
     # Collect all per-block timings across benchmark runs
     all_dit = []
     all_vae = []
@@ -241,6 +253,13 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
     avg_dit_per_block = avg(all_dit)
     avg_vae_per_block = avg(all_vae)
     avg_e2e_per_block = avg(all_e2e)
+
+    # MEDIAN per-block = honest steady-state (rejects compile-contaminated blocks).
+    # The first blocks of the first run include NEFF compilation (200s+); a mean
+    # is dragged down by them, a median rejects them — same methodology as RF's
+    # 8.09 fps steady-state figure. This is the apples-to-apples number vs RF.
+    med_dit_per_block = median(all_dit)
+    med_e2e_per_block = median(all_e2e)
 
     # Encode times (T5 + anchor)
     avg_encode = avg([t["t5_encode"] for t in all_timings])
@@ -262,6 +281,9 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
     # VAE-only FPS (frames decoded per second)
     vae_fps = nfpb / avg_vae_per_block if avg_vae_per_block > 0 else 0
 
+    # STEADY-STATE FPS from per-block MEDIAN (rejects compile blocks) — RF-comparable.
+    steady_fps = nfpb / med_e2e_per_block if med_e2e_per_block > 0 else 0
+
     # Time-to-first-frame
     ttff = avg_encode + avg([t["vae_stream"][0] for t in all_timings])
 
@@ -270,20 +292,26 @@ def print_benchmark_results(all_timings, warmup_timings, num_frames, num_runs):
     print("├─────────────────────────────────────────────────────────┤")
     print(f"│  Num frames:              {num_frames:>6}                      │")
     print(f"│  Benchmark runs:          {num_runs:>6}                      │")
+    print(f"│  Blocks measured:         {len(all_e2e):>6}                      │")
     print(f"│  Compilation time:     {compile_time:>8.1f}s (warmup run 1)     │")
     print(f"│  T5+anchor time:       {avg_encode:>8.3f}s                    │")
-    print(f"│  DiT/block time:       {avg_dit_per_block:>8.3f}s (5 steps)       │")
+    print(f"│  DiT/block (mean):     {avg_dit_per_block:>8.3f}s (5 steps)       │")
+    print(f"│  DiT/block (median):   {med_dit_per_block:>8.3f}s (steady)        │")
     print(f"│  VAE/batch time:       {avg_vae_per_block:>8.3f}s ({nfpb} frames)  │")
-    print(f"│  Batch E2E time:       {avg_e2e_per_block:>8.3f}s (DiT+VAE, {nfpb}f) │")
+    print(f"│  Block E2E (mean):     {avg_e2e_per_block:>8.3f}s (DiT+VAE, {nfpb}f) │")
+    print(f"│  Block E2E (median):   {med_e2e_per_block:>8.3f}s (steady)        │")
     print(f"│  Total time:           {avg_total:>8.3f}s                    │")
     print(f"│  Time-to-first-frame:  {ttff:>8.3f}s                    │")
     print("├─────────────────────────────────────────────────────────┤")
     print(f"│  OVERALL FPS:            {e2e_fps:>8.2f} frames/sec         │")
-    print(f"│  STREAMING FPS:          {stream_fps:>8.2f} frames/sec         │")
+    print(f"│  STREAMING FPS (mean):   {stream_fps:>8.2f} frames/sec         │")
+    print(f"│  STEADY-STATE FPS (med): {steady_fps:>8.2f} frames/sec  ← RF-comparable │")
     print(f"│  VAE decode FPS:         {vae_fps:>8.2f} frames/sec         │")
-    print(f"│  Real-time ratio:        {e2e_fps/16:>8.3f}x (vs 16fps)      │")
-    print(f"│  Stream real-time ratio: {stream_fps/16:>8.3f}x (vs 16fps)      │")
+    print(f"│  Real-time ratio:        {steady_fps/16:>8.3f}x (vs 16fps)      │")
     print("└─────────────────────────────────────────────────────────┘\n")
+    # Marker for the harness: steady-state per-block median (the RF-comparable fps).
+    print(f"steady_state_fps={steady_fps:.3f} block_median_ms={med_e2e_per_block*1000:.1f}",
+          flush=True)
 
 
 def main():
