@@ -182,11 +182,26 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         dit_model.time_embedding = _contiguous_compile(dit_model.time_embedding)
         dit_model.time_projection = _contiguous_compile(dit_model.time_projection)
         dit_model.head = _contiguous_compile(dit_model.head)
-        # Compile FFN in each block (pure: Linear→GELU→Linear)
+        # Fine-grained submodule compilation — MATCH rolling-forcing (8.09 fps).
+        # RF compiles q/k/v/o (self+cross), ffn, AND norm1/2/3 per block; NKI
+        # kernels (attn/rope) stay eager BETWEEN compiled ops. SD previously
+        # compiled ONLY ffn, leaving the 8 attention Linears + 3 norms in eager
+        # op-by-op dispatch — the dominant per-block DiT cost (4.3s vs RF 1.1s).
         for block in dit_model.blocks:
+            block.self_attn.q = _contiguous_compile(block.self_attn.q)
+            block.self_attn.k = _contiguous_compile(block.self_attn.k)
+            block.self_attn.v = _contiguous_compile(block.self_attn.v)
+            block.self_attn.o = _contiguous_compile(block.self_attn.o)
+            block.cross_attn.q = _contiguous_compile(block.cross_attn.q)
+            block.cross_attn.k = _contiguous_compile(block.cross_attn.k)
+            block.cross_attn.v = _contiguous_compile(block.cross_attn.v)
+            block.cross_attn.o = _contiguous_compile(block.cross_attn.o)
             block.ffn = _contiguous_compile(block.ffn)
-        LOGGER.info(f"DiT compiled: patch_embed, text_embed, time_embed, "
-                    f"time_proj, head, FFN×{len(dit_model.blocks)}")
+            block.norm1 = _contiguous_compile(block.norm1)
+            block.norm2 = _contiguous_compile(block.norm2)
+            block.norm3 = _contiguous_compile(block.norm3)
+        LOGGER.info(f"DiT compiled: patch/text/time/head + per-block "
+                    f"q/k/v/o(self+cross)+ffn+norm1/2/3 × {len(dit_model.blocks)}")
 
         # Scheduler
         self.scheduler = self.generator.scheduler
