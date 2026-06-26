@@ -126,12 +126,22 @@ def run_inference(pipeline, args, config, verbose=False):
     video_latents = None
     noise_scale = float(getattr(args, "noise_scale", 0.8))
     if getattr(args, "video_path", None):
-        from streamv2v.inference_common import load_mp4_as_tensor
+        # imageio-based loader (container has imageio/imageio-ffmpeg; avoids torchvision
+        # which isn't installed and would risk clobbering the Neuron torch build).
+        def _load_video_imageio(path, H, W):
+            import imageio.v3 as iio
+            import numpy as np
+            frames = iio.imread(path, plugin="pyav")  # [T, h, w, C] uint8
+            t = torch.from_numpy(np.asarray(frames)).float()        # [T,h,w,C]
+            t = t.permute(0, 3, 1, 2)                                # [T,C,h,w]
+            t = torch.nn.functional.interpolate(t, size=(H, W), mode="bilinear", align_corners=False)
+            t = t / 127.5 - 1.0                                      # -> [-1,1]
+            return t                                                 # [T,C,H,W]
         # VAE_RANK loads the pixels; encode_video_latents broadcasts latents to all ranks.
         vid = None
         if rank == 0:
-            v = load_mp4_as_tensor(args.video_path, resize_hw=(args.height, args.width))  # [C,T,H,W] in [-1,1]
-            vid = v.permute(1, 0, 2, 3).unsqueeze(0).to(dtype=dtype, device=device)        # [1,T,C,H,W]
+            v = _load_video_imageio(args.video_path, args.height, args.width)  # [T,C,H,W] in [-1,1]
+            vid = v.unsqueeze(0).to(dtype=dtype, device=device)               # [1,T,C,H,W]
         # encode needs the latent frame count up front for the zero-buffer on non-VAE ranks;
         # compute it from pixel frames via the VAE's temporal rule (causal 4x: (T-1)//4 + 1).
         if rank == 0:
