@@ -33,8 +33,8 @@ spec:
         node-type: trn2
         kubernetes.io/hostname: ip-192-168-119-96.ap-southeast-4.compute.internal
       resourceClaims:
-        - name: s-lnc1-trn2
-          resourceClaimTemplateName: s-lnc1-trn2
+        - name: m-trn2
+          resourceClaimTemplateName: m-trn2
       containers:
         - name: sd
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -93,7 +93,7 @@ spec:
 
               BENCH_CMD="torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
                 --config streamv2v/configs/wan_causal_dmd_v2v_neuron.yaml \
-                --num_frames 81 --height 480 --width 832 --device neuron"
+                --num_frames 81 --height 240 --width 416 --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
               # $3 (optional) = input video path -> v2v restyle. Omit -> t2v from noise.
@@ -171,7 +171,7 @@ spec:
               ls -lhR "$FINAL_DIR" | head -80
           resources:
             claims:
-              - name: s-lnc1-trn2
+              - name: m-trn2
             requests:
               cpu: 22
               memory: 220Gi
