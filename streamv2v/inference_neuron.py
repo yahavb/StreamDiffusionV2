@@ -70,6 +70,9 @@ def parse_args():
     parser.add_argument("--device", type=str, default="neuron")
     parser.add_argument("--save_frames", action="store_true")
     parser.add_argument("--fps", type=int, default=16)
+    # v2v: input video to restyle (the paper's actual mode). If unset -> t2v from noise.
+    parser.add_argument("--video_path", type=str, default=None)
+    parser.add_argument("--noise_scale", type=float, default=0.8)
     return parser.parse_args()
 
 
@@ -116,12 +119,50 @@ def run_inference(pipeline, args, config, verbose=False):
     frame_seq_length = pipeline.frame_seq_length
     rank = pipeline.rank
 
-    # Generate initial noise for anchor block
+    # ── v2v: encode an input video to latents (the mode the paper actually uses) ──
+    # The Wan VAE compresses time, so we do NOT assume a frame count — we read the
+    # actual latent frame count from the encoder and drive the block loop from it.
+    # latent layout matches the noise tensor: [1, T_lat, 16, H/8, W/8].
+    video_latents = None
+    noise_scale = float(getattr(args, "noise_scale", 0.8))
+    if getattr(args, "video_path", None):
+        from streamv2v.inference_common import load_mp4_as_tensor
+        # VAE_RANK loads the pixels; encode_video_latents broadcasts latents to all ranks.
+        vid = None
+        if rank == 0:
+            v = load_mp4_as_tensor(args.video_path, resize_hw=(args.height, args.width))  # [C,T,H,W] in [-1,1]
+            vid = v.permute(1, 0, 2, 3).unsqueeze(0).to(dtype=dtype, device=device)        # [1,T,C,H,W]
+        # encode needs the latent frame count up front for the zero-buffer on non-VAE ranks;
+        # compute it from pixel frames via the VAE's temporal rule (causal 4x: (T-1)//4 + 1).
+        if rank == 0:
+            t_pix = vid.shape[1]
+        else:
+            t_pix = int(num_frames)
+        t_pix_t = torch.tensor([t_pix], device=device)
+        if dist.is_initialized():
+            dist.broadcast(t_pix_t, src=0)
+        t_pix = int(t_pix_t.item())
+        t_lat = (t_pix - 1) // 4 + 1
+        # round down to a whole number of blocks so the streaming loop is exact
+        t_lat = (t_lat // num_frame_per_block) * num_frame_per_block
+        video_latents = pipeline.encode_video_latents(vid, t_lat, args.height, args.width)
+        num_frames = t_lat
+        LOGGER.info(f"[v2v] input={args.video_path} pixel_frames={t_pix} -> latent_frames={t_lat} "
+                    f"({num_frames // num_frame_per_block} blocks), noise_scale={noise_scale}")
+
+    def block_input(start_lat, n_lat):
+        """Per-block model input: noised input latents (v2v) or pure noise (t2v)."""
+        rand = torch.randn(1, n_lat, 16, args.height // 8, args.width // 8,
+                           dtype=dtype, device=device)
+        if video_latents is None:
+            return rand
+        chunk = video_latents[:, start_lat:start_lat + n_lat]
+        # mix input-video latents with noise (StreamDiffusionV2 v2v: noise*s + latent*(1-s))
+        return rand * noise_scale + chunk * (1.0 - noise_scale)
+
+    # Generate initial input for anchor block (v2v latents or t2v noise)
     num_anchor_frames = num_frame_per_block
-    noise = torch.randn(
-        1, num_anchor_frames, 16,
-        args.height // 8, args.width // 8,
-        dtype=dtype, device=device)
+    noise = block_input(0, num_anchor_frames)
 
     timings = {
         "t5_encode": 0,      # T5 + anchor block time
@@ -166,10 +207,8 @@ def run_inference(pipeline, args, config, verbose=False):
         current_start = current_frame * frame_seq_length
         current_end = current_start + frame_seq_length * num_frame_per_block
 
-        block_noise = torch.randn(
-            1, num_frame_per_block, 16,
-            args.height // 8, args.width // 8,
-            dtype=dtype, device=device)
+        # v2v: noised input-video latents for this block; t2v: pure noise
+        block_noise = block_input(current_frame, num_frame_per_block)
 
         # DiT: 5 denoising steps for this block (3 frames)
         t_dit = time.perf_counter()

@@ -125,6 +125,23 @@ class NeuronWanVAEWrapper(VAEInterface):
         video = rearrange(video, 'b c t h w -> b t c h w')
         return video
 
+    def encode_to_latent(self, video: torch.Tensor) -> torch.Tensor:
+        """Encode pixel video -> latent (v2v input path). Mirrors decode_to_pixel.
+
+        Args:  video [B, T, C, H, W] in [-1, 1] (pixel space, bf16)
+        Returns: latent [B, T_lat, z_dim, H/8, W/8]  (matches the noise/denoise layout)
+        The VAE encode uses scale=[mean, std] (NOT 1/std) — encode normalizes by
+        (mu - mean) * std, the inverse of decode's z/std + mean.
+        """
+        self._ensure_model()
+        device = video.device
+        scale = [self._mean.to(device), self._std.to(device)]
+        video = rearrange(video, 'b t c h w -> b c t h w').contiguous()
+        with torch.no_grad():
+            latent = self._model.encode(video, scale)
+        latent = rearrange(latent, 'b c t h w -> b t c h w')
+        return latent
+
 
 # ── DiT Wrapper ─────────────────────────────────────────────────────────
 

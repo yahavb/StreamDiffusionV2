@@ -471,7 +471,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
     def decode_latents(self, latents):
         """Decode latents to pixel space using VAE (only on VAE_RANK).
-        
+
         Returns decoded video on VAE_RANK, None on other ranks.
         """
         if self.rank == VAE_RANK:
@@ -479,3 +479,21 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         else:
             # Other ranks don't have VAE loaded — return None
             return None
+
+    def encode_video_latents(self, video, num_lat_frames, height, width):
+        """v2v: encode pixel video -> latent on VAE_RANK, broadcast to all TP ranks.
+
+        VAE lives only on VAE_RANK, but the DiT (all ranks) needs the latents.
+        Mirror the T5 prompt-embed broadcast pattern. `video` is [B,T,C,H,W] in
+        [-1,1] on VAE_RANK (None elsewhere). Returns latent [B,num_lat_frames,16,H/8,W/8]
+        on every rank.
+        """
+        lat_shape = (1, num_lat_frames, 16, height // 8, width // 8)
+        if self.rank == VAE_RANK and video is not None:
+            latent = self.vae.encode_to_latent(video).to(dtype=self.dtype, device=self.device)
+            latent = latent.contiguous()
+        else:
+            latent = torch.zeros(lat_shape, dtype=self.dtype, device=self.device)
+        if dist.is_initialized():
+            dist.broadcast(latent, src=VAE_RANK)
+        return latent
