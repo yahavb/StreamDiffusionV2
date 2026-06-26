@@ -111,9 +111,7 @@ spec:
                   echo "[$NAME] NO frames in $FRAMES_DIR — mp4 not written"
                 fi
               }
-              # v2v experiment: restyle the provided input video with a matching cat prompt.
-              render cat "A cat walking on the beach at sunset, cinematic lighting, high quality"
-              render dog "A dog running in a grassy field, sunny day, realistic, high quality"
+              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds."
 
               # ════════════════ PART B: PROFILER (general + per-NEFF), all into PROF_DIR ════════════════
               # B1: general/model-level engine breakdown — capture+view every cached NEFF, aggregate.
