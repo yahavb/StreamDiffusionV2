@@ -207,6 +207,15 @@ spec:
               value: "ERROR"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
+            # RF runs the IDENTICAL VAE decode at 480x832 without the aten::cat
+            # compile crash — and sets these two. LNC=2 (logical NeuronCore config,
+            # matches m-trn2) changes core grouping the compile service uses; the
+            # RDH buffer bump (128MB) enlarges the runtime channel buffer. We were
+            # missing both — most likely why our 480p decode hit ConnectToService.
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "2"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: USE_NKI_KERNELS
