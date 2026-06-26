@@ -1,17 +1,17 @@
-# StreamDiffusionV2 — Neuron 3-run benchmark (BASELINE)
+# StreamDiffusionV2 — Neuron job. Renders cat + dog (mp4 + frames) AND runs the full
+# profiler (general engine breakdown + system-trace bundle + per-NEFF DMA analysis).
+# EVERYTHING for one run lives under ONE timestamped folder — never scattered at root.
 #
-# Model under test (current Neuron implementation):
-#   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (30 layers, dim=1536, 12 heads, ffn=8960)
-#   - DiT ckpt : jerryfeng/StreamDiffusionV2 -> ckpts/wan_causal_dmd_v2v/model.pt (official DMD)
-#   - Text enc : UMT5-XXL (umt5-xxl-enc-bf16), 512 tokens, torch.compile(backend='neuron')
-#   - VAE      : Wan2.1_VAE.pth (z_dim=16), bf16
-#   - Runtime  : TP-4, bf16, eager + NKI kernels, 240x416, 81 frames, num_frame_per_block=3
+# Output:
+#   /var/mdl/stream_diffusion/runs/<YYYYMMDDHHMM>/   (America/Los_Angeles)
+#       cat.mp4   cat_frames/      dog.mp4   dog_frames/
+#       run.log
+#       profile/perneff_breakdown.txt      (general/model-level engine breakdown)
+#       profile/dma_analysis.txt           (per-NEFF instruction-level: names the op)
+#       profile/hotspots_<hash>.txt        (dominant-NEFF summary-text)
+#       profile/systrace_bundle.tar.gz     (Neuron Profiler 2.0, uploadable: trace_info.pb)
 #
-# Mandatory 3-run methodology (ONE pod):
-#   [1/3] build/load NEFFs (not timed)  -> built=<N>s
-#   [2/3] CLEAN run, NO profiler        -> median=<N>ms  (THE real latency)
-#   [3/3] profiled run + run_explorer   -> per-NEFF engine shares + dominant-NEFF metrics
-#
+# Code branch is the BRANCH env var (default master = good-quality baseline).
 # Launch:
 #   kubectl delete job sd --ignore-not-found
 #   kubectl apply -f sd-job.yaml
@@ -31,11 +31,12 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn2
+        kubernetes.io/hostname: ip-192-168-119-96.ap-southeast-4.compute.internal
       resourceClaims:
         - name: s-lnc1-trn2
           resourceClaimTemplateName: s-lnc1-trn2
       containers:
-        - name: bench
+        - name: sd
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
           imagePullPolicy: IfNotPresent
           command:
@@ -48,173 +49,128 @@ spec:
               cd /tmp
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/StreamDiffusionV2.git REPO
               cd REPO
-
-              # ── PROVENANCE part 1: which code (no deps needed; right after clone) ──
-              GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-              echo "┌── PROVENANCE ──"
-              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
-              echo "│ commit : $GIT_SHA"
-              echo "│ subject: $(git log -1 --pretty=%s)"
-              echo "└────────────────"
+              echo "branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-parse HEAD)"
 
               export RF_DEVICE_BACKEND=neuron
               uv pip install -r requirements-neuron.txt || pip install -r requirements-neuron.txt
               uv pip install "setuptools<81" || pip install "setuptools<81"
+              python3 -c "import duckdb" 2>/dev/null || pip install duckdb 2>/dev/null || true
 
-              # ── PROVENANCE part 2: feature flags (AFTER dep install — needs torch) ──
-              PROBE='import models.wan.neuron_layers as a; print("nki="+str(a.USE_NKI_KERNELS), "self_nki="+str(a.SELF_ATTN_NKI_AVAILABLE), "rope_nki="+str(a.ROPE_NKI_AVAILABLE), "compile="+str(a.USE_TORCH_COMPILE), "ATTN_MULT="+str(a.ATTN_SEQLEN_MULTIPLE))'
-              echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tr '\n' ' ')"
-
-              # ─── model weights: /var/mdl is S3-backed; single tar avoids per-file S3 overhead ───
+              # ─── model weights + checkpoint (S3-backed cache) ───
               WAN_1_3B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
               mkdir -p wan_models
               if [[ -f "$WAN_1_3B_TAR" ]]; then
-                echo "Restoring Wan 1.3B tar from S3 cache..."
-                cp "$WAN_1_3B_TAR" /tmp/Wan2.1-T2V-1.3B.tar
-                tar xf /tmp/Wan2.1-T2V-1.3B.tar -C wan_models/ && rm -f /tmp/Wan2.1-T2V-1.3B.tar
+                cp "$WAN_1_3B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
               else
-                echo "Downloading Wan-AI/Wan2.1-T2V-1.3B from HuggingFace..."
                 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
-                tar cf /tmp/Wan2.1-T2V-1.3B.tar -C wan_models Wan2.1-T2V-1.3B
-                mkdir -p "$(dirname $WAN_1_3B_TAR)" && cp /tmp/Wan2.1-T2V-1.3B.tar "$WAN_1_3B_TAR" && rm -f /tmp/Wan2.1-T2V-1.3B.tar
+                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN_1_3B_TAR)" && cp /tmp/w.tar "$WAN_1_3B_TAR" && rm -f /tmp/w.tar
               fi
-
-              # OFFICIAL StreamDiffusionV2 release checkpoint (paper-faithful), NOT RollingForcing.
-              # jerryfeng/StreamDiffusionV2 -> wan_causal_dmd_v2v/ (contains model.pt).
               SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
               mkdir -p ckpts/wan_causal_dmd_v2v
               if [[ -f "$SDV2_CKPT_CACHE" ]]; then
-                echo "Restoring StreamDiffusionV2 DMD checkpoint from S3 cache..."
                 cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v/model.pt
               else
-                echo "Downloading jerryfeng/StreamDiffusionV2 (wan_causal_dmd_v2v) checkpoint..."
                 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v/*'], local_dir='ckpts')"
-                test -f ckpts/wan_causal_dmd_v2v/model.pt || { echo "ERROR: model.pt not found after download"; ls -R ckpts/wan_causal_dmd_v2v; exit 1; }
                 mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v/model.pt "$SDV2_CKPT_CACHE"
               fi
               echo "Model weights ready!"
 
-              LOCAL_RESULTS="/tmp/results"; mkdir -p "$LOCAL_RESULTS"
+              # ─── ONE timestamped folder for this whole run ───
+              # WORK ON LOCAL DISK (/tmp) — /var/mdl is S3-backed: slow on the critical
+              # path AND ffmpeg can't write mp4 trailers there (Invalid argument). Copy
+              # the whole run folder to /var/mdl ONCE at the very end, off critical path.
+              TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
+              RUN_DIR="/tmp/run/$TS"
+              FINAL_DIR="/var/mdl/stream_diffusion/runs/$TS"
+              PROF_DIR="$RUN_DIR/profile"
+              mkdir -p "$PROF_DIR"
+              echo "RUN_DIR=$RUN_DIR  (final -> $FINAL_DIR)"
+              exec > >(tee "$RUN_DIR/run.log") 2>&1
 
-              # BENCH_CMD: TP-4 entrypoint. WITHOUT --warmup/--iters — the harness appends them.
-              # inference_neuron.py emits built=…s (warmup 1) and median=…ms throughput=… (rank 0).
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              mkdir -p /tmp/neff_cache
+
               BENCH_CMD="torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
                 --config streamv2v/configs/wan_causal_dmd_v2v_neuron.yaml \
-                --benchmark --num_frames 81 --height 240 --width 416 --device neuron"
+                --num_frames 81 --height 240 --width 416 --device neuron"
 
-              # ─── dominant-NEFF detail via neuron-profile view summary-text ($1=neff $2=ntff) ───
-              # NO explorer server / DuckDB / curl (hang on big DMA NEFFs) and NO
-              # --output-format json (returns EMPTY — not a valid format on-image).
-              neff_hotspots() {
-                local NEFF="$1" NTFF="$2" HOTS="$3"
-                [ -n "$NEFF" ] && [ -f "$NTFF" ] || { echo "no NEFF/NTFF — skip detail"; return; }
-                echo "═══ dominant NEFF detail (summary-text) ═══" | tee "$HOTS"
-                timeout 180 neuron-profile view -n "$NEFF" -s "$NTFF" \
-                  --output-format summary-text 2>/dev/null | tee -a "$HOTS" || echo "  view failed"
-                echo "  (name the hot op from: gpsimd_engine_active_time_percent,"
-                echo "   software_dynamic_dma_packet_percent + _count, hardware_dynamic_dma_packet_percent,"
-                echo "   dma_transfer_average_bytes, matmul_instruction_count, transpose_flops)"
+              # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
+              # $3 (optional) = input video path -> v2v restyle. Omit -> t2v from noise.
+              render() {
+                local NAME="$1" PROMPT="$2" VIDEO="${3:-}"
+                echo "=== rendering [$NAME]: $PROMPT  (video=${VIDEO:-none}) ==="
+                local FRAMES_DIR="$RUN_DIR/${NAME}_frames"
+                local VID_ARG=""
+                [ -n "$VIDEO" ] && VID_ARG="--video_path $VIDEO --noise_scale 0.7"
+                $BENCH_CMD --prompt "$PROMPT" --fps 16 $VID_ARG \
+                  --output_path "$RUN_DIR/${NAME}.mp4" || echo "[$NAME] render FAILED"
+                if ls "$FRAMES_DIR"/frame_*.png >/dev/null 2>&1; then
+                  python3 -c "import imageio,glob; fr=sorted(glob.glob('$FRAMES_DIR/frame_*.png')); w=imageio.get_writer('$RUN_DIR/${NAME}.mp4', fps=16); [w.append_data(imageio.imread(f)) for f in fr]; w.close(); print('[$NAME] wrote $RUN_DIR/${NAME}.mp4 with', len(fr), 'frames')"
+                else
+                  echo "[$NAME] NO frames in $FRAMES_DIR — mp4 not written"
+                fi
               }
+              # v2v experiment: restyle the provided input video with a matching cat prompt.
+              IN_VIDEO="/var/mdl/stream_diffusion/wan2_i2v_output.mp4"
+              render cat_v2v "A white cat wearing sunglasses sits on a surfboard at a summer beach, crystal-clear water, blue sky, cinematic, high quality" "$IN_VIDEO"
+              # also a different restyle prompt on the same input, to see prompt control
+              render dog_v2v "A golden retriever dog wearing sunglasses on a surfboard at a summer beach, crystal-clear water, blue sky, cinematic, high quality" "$IN_VIDEO"
 
-              # ─── run_explorer: PROVEN method. neuron-profile CLI ONLY. ───
-              # For EACH cached NEFF: capture --single-io -> view summary-json -> aggregate.
-              # Then summary-text on the dominant NEFF. NO neuron-explorer server / SQL / parquet.
-              run_explorer() {
-                local POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
-                mapfile -t NEFFS < <(find /tmp/neff_cache -name "*.neff" 2>/dev/null | sort)
-                echo "NEFFs in cache: ${#NEFFS[@]}"
-                local OK=0
-                for neff in "${NEFFS[@]}"; do
-                  local hash; hash=$(basename "$neff" .neff)
-                  local ntff="$POUT/${hash}.ntff" json="$POUT/${hash}.json"
-                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 180 \
-                    neuron-profile capture --single-io -n "$neff" -s "$ntff" >/dev/null 2>&1 || continue
-                  [ -f "$ntff" ] || continue
-                  timeout 120 neuron-profile view -n "$neff" -s "$ntff" --output-format summary-json > "$json" 2>/dev/null || true
-                  [ -s "$json" ] && OK=$((OK+1))
-                done
-                echo "captured+viewed OK: $OK / ${#NEFFS[@]}"
-                python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$LOCAL_RESULTS/perneff_breakdown.txt" || echo "aggregation failed"
-                local BIGHASH BIGNEFF
-                BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache | head -1)
-                BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" 2>/dev/null | head -1)
-                neff_hotspots "$BIGNEFF" "$POUT/${BIGHASH}.ntff" "$LOCAL_RESULTS/hotspots_${BIGHASH}.txt"
-                # Preserve the top-N heavy NEFF+NTFF pairs for step [5] (instruction-level
-                # DMA analysis names the op behind the 308MB copy). summary-text can't.
-                mkdir -p "$LOCAL_RESULTS/ntff_pairs"
-                for h in $(python3 scripts/neuron/top_neffs.py "$POUT" 5 2>/dev/null); do
-                  local src; src=$(find /tmp/neff_cache -name "${h}.neff" 2>/dev/null | head -1)
-                  [ -n "$src" ] && cp "$src" "$LOCAL_RESULTS/ntff_pairs/${h}.neff" 2>/dev/null || true
-                  [ -f "$POUT/${h}.ntff" ] && cp "$POUT/${h}.ntff" "$LOCAL_RESULTS/ntff_pairs/${h}.ntff" 2>/dev/null || true
-                done
-                echo "preserved pairs: $(ls "$LOCAL_RESULTS/ntff_pairs"/*.neff 2>/dev/null | wc -l)"
-              }
+              # ════════════════ PART B: PROFILER (general + per-NEFF), all into PROF_DIR ════════════════
+              # B1: general/model-level engine breakdown — capture+view every cached NEFF, aggregate.
+              echo "=== [profiler] per-NEFF capture -> general engine breakdown ==="
+              POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
+              mapfile -t NEFFS < <(find /tmp/neff_cache -name "*.neff" 2>/dev/null | sort)
+              echo "NEFFs in cache: ${#NEFFS[@]}"
+              OK=0
+              for neff in "${NEFFS[@]}"; do
+                hash=$(basename "$neff" .neff); ntff="$POUT/${hash}.ntff"; json="$POUT/${hash}.json"
+                NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 180 \
+                  neuron-profile capture --single-io -n "$neff" -s "$ntff" >/dev/null 2>&1 || continue
+                [ -f "$ntff" ] || continue
+                timeout 120 neuron-profile view -n "$neff" -s "$ntff" --output-format summary-json > "$json" 2>/dev/null || true
+                [ -s "$json" ] && OK=$((OK+1))
+              done
+              echo "captured+viewed OK: $OK / ${#NEFFS[@]}"
+              python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$PROF_DIR/perneff_breakdown.txt" || echo "aggregation failed"
 
-              echo "════════════ NEURON 3-RUN BENCHMARK (StreamDiffusionV2 baseline) ════════════"
-              echo "  model    : Wan2.1-T2V-1.3B + StreamDiffusionV2 official DMD ckpt, TP-4, bf16, 240x416x81"
-              echo "  reference: paper arXiv 2511.07399v2 (Wan2.1-T2V-1.3B causal DMD, training-free)"
-              echo "============================================================================="
+              # dominant-NEFF detail + preserve top-5 heavy NEFF+NTFF pairs for per-NEFF DMA analysis
+              BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache | head -1)
+              BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" 2>/dev/null | head -1)
+              if [ -n "$BIGNEFF" ] && [ -f "$POUT/${BIGHASH}.ntff" ]; then
+                timeout 180 neuron-profile view -n "$BIGNEFF" -s "$POUT/${BIGHASH}.ntff" \
+                  --output-format summary-text 2>/dev/null | tee "$PROF_DIR/hotspots_${BIGHASH}.txt" || echo "view failed"
+              fi
+              mkdir -p "$PROF_DIR/ntff_pairs"
+              for h in $(python3 scripts/neuron/top_neffs.py "$POUT" 5 2>/dev/null); do
+                src=$(find /tmp/neff_cache -name "${h}.neff" 2>/dev/null | head -1)
+                [ -n "$src" ] && cp "$src" "$PROF_DIR/ntff_pairs/${h}.neff" 2>/dev/null || true
+                [ -f "$POUT/${h}.ntff" ] && cp "$POUT/${h}.ntff" "$PROF_DIR/ntff_pairs/${h}.ntff" 2>/dev/null || true
+              done
 
-              echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
-              $BENCH_CMD --warmup 1 --iters 0 \
-                2>&1 | tee "$LOCAL_RESULTS/warmup.txt" | grep -iE "built=|warmup|FAILED|PROVENANCE" || echo "WARMUP FAILED"
+              # B2: per-NEFF INSTRUCTION-LEVEL DMA analysis (names the HLO op + source line)
+              echo "=== [profiler] per-NEFF instruction-level DMA analysis ==="
+              bash scripts/neuron/run_dma_analysis.sh "$PROF_DIR/ntff_pairs" \
+                2>&1 | tee "$PROF_DIR/dma_analysis.txt" || echo "DMA ANALYSIS FAILED"
 
-              echo "=== [2/3] CLEAN RUN (NO profiler) — median of 5 = REAL LATENCY ==="
-              env -u NEURON_RT_INSPECT_ENABLE -u NEURON_RT_INSPECT_OUTPUT_DIR -u NEURON_RT_INSPECT_DEVICE_PROFILE \
-                $BENCH_CMD --warmup 1 --iters 5 \
-                2>&1 | tee "$LOCAL_RESULTS/clean.txt" | grep -iE "built=|median|throughput|FAILED" || echo "CLEAN RUN FAILED"
-              T_CLEAN=$(grep -oE "median=[0-9.]+ms" "$LOCAL_RESULTS/clean.txt" | head -1)
-
-              echo "=== [3/3] PROFILED RUN (NEURON_RT_INSPECT_ENABLE=1, system only — overhead delta) ==="
-              NEURON_RT_INSPECT_ENABLE=1 $BENCH_CMD --warmup 1 --iters 5 \
-                2>&1 | tee "$LOCAL_RESULTS/profiled.txt" | grep -iE "built=|median|throughput|FAILED" || echo "PROFILED RUN FAILED"
-              T_PROF=$(grep -oE "median=[0-9.]+ms" "$LOCAL_RESULTS/profiled.txt" | head -1)
-
-              echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics (neuron-profile CLI) ==="
-              run_explorer
-
-              # ─── [5] INSTRUCTION-LEVEL DMA + SHAPE ANALYSIS (names the op) ───
-              # Ingest the preserved heavy NEFF+NTFF pairs to parquet (neuron-explorer
-              # --output-format parquet, LOCAL /tmp) and run duckdb queries that name
-              # the HLO op + bir_debug source line + tensor geometry behind each NEFF.
-              # This is what tells us EXACTLY what the 308MB static-copy NEFF is.
-              echo "=== [5] instruction-level DMA analysis (top NEFFs) ==="
-              bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
-                2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA ANALYSIS FAILED"
-
-              echo "=== PROFILER-OVERHEAD COMPARISON ==="
-              echo "  clean    (no profiler, REAL latency) : ${T_CLEAN:-N/A}"
-              echo "  profiled (profiler on)               : ${T_PROF:-N/A}"
-              echo "  (compare engine SHARES from run 3, not absolute µs)"
-
-              # ─── [6] NEURON PROFILER 2.0 SYSTEM-TRACE BUNDLE (uploadable) ───
-              # The RUNTIME writes the uploadable bundle (trace_info.pb + .pb/.ntff/.neff)
-              # per rank ONLY when these inspect env vars point at an output dir — NOT
-              # neuron-profile capture / neuron-explorer (those emit .ntff/parquet only,
-              # never trace_info.pb). Format matches https://neuron-explorer.harmony.a2z.com/:
-              #   NEURON_RT_INSPECT_ENABLE=1         -> system profile (trace_info.pb, REQUIRED)
-              #   NEURON_RT_INSPECT_SYSTEM_PROFILE=1 -> system trace events
-              #   NEURON_RT_INSPECT_DEVICE_PROFILE=1 -> ALSO emit .ntff + .neff (may be empty on async torchrun)
-              # Produces per-rank dirs i-<instance>_pid_<pid>/ under $SYSTRACE.
-              echo "=== [6] system-trace bundle (Neuron Profiler 2.0 -> trace_info.pb) ==="
+              # B3: Neuron Profiler 2.0 system-trace bundle (uploadable: trace_info.pb)
+              echo "=== [profiler] system-trace bundle ==="
               SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
-              NEURON_RT_INSPECT_ENABLE=1 \
-              NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
-              NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
-              NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
-                $BENCH_CMD --warmup 1 --iters 2 2>&1 | grep -iE "median=|throughput=|FAILED" || echo "SYSTRACE RUN done"
-              echo "--- bundle contents ($SYSTRACE) ---"
-              find "$SYSTRACE" -maxdepth 2 -type f | sed 's|^|  |' | head -60
+              NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+                $BENCH_CMD --prompt "A cat walking on the beach at sunset" --fps 16 \
+                --output_path /tmp/trace_cat.mp4 2>&1 | grep -iE "Block |median|FAILED" || echo "systrace run done"
               echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
-              echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' | wc -l)"
-              tar -czf /tmp/sd_systrace_bundle.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
-              cp /tmp/sd_systrace_bundle.tar.gz "/var/mdl/sd_systrace_bundle.tar.gz" 2>/dev/null \
-                && echo "systrace bundle saved: /var/mdl/sd_systrace_bundle.tar.gz" || echo "systrace save skipped"
+              tar -czf "$PROF_DIR/systrace_bundle.tar.gz" -C "$SYSTRACE" . 2>/dev/null \
+                && echo "systrace bundle: $PROF_DIR/systrace_bundle.tar.gz" || echo "systrace save skipped"
 
-              # ─── persist results (single tar.gz to the PVC; never many files) ───
-              ARCHIVE="/tmp/sd_results.tar.gz"
-              tar -czf "$ARCHIVE" -C "$(dirname "$LOCAL_RESULTS")" "$(basename "$LOCAL_RESULTS")" 2>/dev/null || true
-              cp "$ARCHIVE" "/var/mdl/" 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
+              # ─── copy the WHOLE local run folder to /var/mdl ONCE, off critical path ───
+              echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
+              mkdir -p "$FINAL_DIR"
+              cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy to /var/mdl failed"
+              echo "=== DONE. contents of $FINAL_DIR ==="
+              ls -lhR "$FINAL_DIR" | head -80
           resources:
             claims:
               - name: s-lnc1-trn2
@@ -233,22 +189,23 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "master"
+              value: "exp/v2v-input"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
               value: "ERROR"
             - name: TORCH_NEURONX_LOG_LEVEL
               value: "ERROR"
-            - name: RF_DEVICE_BACKEND
-              value: "neuron"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
-            # NEFF cache dir — restored/compiled here, then enumerated by run_explorer.
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: USE_NKI_KERNELS
               value: "true"
+            # NKI VAE conv2d_k3 (9 full-res shifted copies -> 27-tensor aten::cat) fails
+            # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
+            - name: USE_NKI_VAE
+              value: "0"
             - name: USE_TORCH_COMPILE
               value: "true"
             - name: NEURON_COMPILE_BACKEND
