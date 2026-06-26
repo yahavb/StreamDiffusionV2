@@ -49,12 +49,25 @@ spec:
               cd /tmp
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/StreamDiffusionV2.git REPO
               cd REPO
-              echo "branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-parse HEAD)"
+
+              # ── PROVENANCE part 1: which code (no deps needed; right after clone) ──
+              GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+              echo "┌── PROVENANCE ──"
+              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
 
               export RF_DEVICE_BACKEND=neuron
               uv pip install -r requirements-neuron.txt || pip install -r requirements-neuron.txt
               uv pip install "setuptools<81" || pip install "setuptools<81"
               python3 -c "import duckdb" 2>/dev/null || pip install duckdb 2>/dev/null || true
+
+              # ── PROVENANCE part 2: feature flags (AFTER dep install — needs torch) ──
+              # Confirms WHICH variant actually ran: NKI DiT kernels, VAE NKI on/off,
+              # and (env) VAE compile / NKI VAE — the flags distinguishing this config.
+              PROBE='import models.wan.neuron_layers as a; print("nki="+str(a.USE_NKI_KERNELS), "self_nki="+str(a.SELF_ATTN_NKI_AVAILABLE), "rope_nki="+str(a.ROPE_NKI_AVAILABLE), "ATTN_MULT="+str(a.ATTN_SEQLEN_MULTIPLE))'
+              echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tr '\n' ' ')  USE_NKI_VAE=${USE_NKI_VAE:-unset} USE_VAE_COMPILE=${USE_VAE_COMPILE:-unset}"
 
               # ─── model weights + checkpoint (S3-backed cache) ───
               WAN_1_3B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
