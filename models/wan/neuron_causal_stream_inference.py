@@ -164,11 +164,18 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             LOGGER.info(f"Loading VAE decoder on rank {VAE_RANK}...")
             self.vae = NeuronWanVAEWrapper(
                 vae_pth=vae_path, device=device)
-            # Compile VAE for fast decode
+            # Compile VAE for fast decode — gated by USE_VAE_COMPILE (default on).
+            # At 480p, torch.compile fuses the decoder's temporal upsample into a
+            # giant aten::cat (27x [1,9,3,480,832]) that the Neuron compile service
+            # fails to compile (ConnectToService errno=2). Setting USE_VAE_COMPILE=0
+            # runs the VAE EAGER (per-op NEFFs) -> avoids the fused cat -> 480p works.
             self.vae._ensure_model()
-            self.vae._model = torch.compile(
-                self.vae._model, backend='neuron', dynamic=False)
-            LOGGER.info("VAE compiled with torch.compile(backend='neuron')")
+            if os.environ.get("USE_VAE_COMPILE", "true").lower() in ("1", "true"):
+                self.vae._model = torch.compile(
+                    self.vae._model, backend='neuron', dynamic=False)
+                LOGGER.info("VAE compiled with torch.compile(backend='neuron')")
+            else:
+                LOGGER.info("VAE running EAGER (USE_VAE_COMPILE=0) — avoids 480p fused-cat crash")
         else:
             self.vae = None
 

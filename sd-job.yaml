@@ -202,6 +202,10 @@ spec:
             # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
             - name: USE_NKI_VAE
               value: "0"
+            # 480p: run VAE eager (not torch.compiled) so the decoder's temporal
+            # upsample doesn't fuse into the giant aten::cat that crashes the compiler.
+            - name: USE_VAE_COMPILE
+              value: "0"
             - name: USE_TORCH_COMPILE
               value: "true"
             - name: NEURON_COMPILE_BACKEND
