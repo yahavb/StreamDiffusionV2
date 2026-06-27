@@ -169,12 +169,27 @@ class NeuronWanVAEWrapper(VAEInterface):
         The VAE encode uses scale=[mean, std] (NOT 1/std) — encode normalizes by
         (mu - mean) * std, the inverse of decode's z/std + mean.
         """
-        self._ensure_model()
+        # The RF VAE (_use_rf_vae) is DECODER-ONLY (encoder weights stripped), so it
+        # has no .encode. Lazily build the ORIGINAL full VAE just for encoding; decode
+        # still uses the fast RF decoder. Non-RF path uses self._model directly.
         device = video.device
         scale = [self._mean.to(device), self._std.to(device)]
         video = rearrange(video, 'b t c h w -> b c t h w').contiguous()
+        if self._use_rf_vae:
+            if getattr(self, "_enc_model", None) is None:
+                wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
+                if wan_base not in sys.path:
+                    sys.path.insert(0, wan_base)
+                from modules.vae import _video_vae
+                self._enc_model = _video_vae(
+                    pretrained_path=self.vae_pth, z_dim=self.z_dim
+                ).eval().requires_grad_(False).to(dtype=torch.bfloat16, device=self.target_device)
+            enc = self._enc_model
+        else:
+            self._ensure_model()
+            enc = self._model
         with torch.no_grad():
-            latent = self._model.encode(video, scale)
+            latent = enc.encode(video, scale)
         latent = rearrange(latent, 'b c t h w -> b t c h w')
         return latent
 
