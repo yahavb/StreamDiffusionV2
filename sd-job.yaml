@@ -198,7 +198,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "master"
+              value: "exp/vae-rf"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
@@ -224,6 +224,9 @@ spec:
             # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
             - name: USE_NKI_VAE
               value: "0"
+            # Step0: use the ported rolling_forcing per-frame cached VAE decoder (fixes 480p).
+            - name: USE_RF_VAE
+              value: "1"
             # 480p REQUIRES VAE eager: USE_VAE_COMPILE=1 reintroduced the aten::cat
             # ConnectToService crash AND gave no speedup (VAE still ~4.4s/block).
             # Tested in step1 (sd-21) — keep eager.
