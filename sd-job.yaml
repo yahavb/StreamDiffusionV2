@@ -224,11 +224,11 @@ spec:
             # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
             - name: USE_NKI_VAE
               value: "0"
-            # Step 1: with NEURON_LOGICAL_NC_CONFIG=2 set (which fixed the 480p VAE
-            # compile crash), try VAE COMPILED again to reclaim the ~4.4s/block eager
-            # tax. If this reintroduces the aten::cat crash, set back to "0".
+            # 480p REQUIRES VAE eager: USE_VAE_COMPILE=1 reintroduced the aten::cat
+            # ConnectToService crash AND gave no speedup (VAE still ~4.4s/block).
+            # Tested in step1 (sd-21) — keep eager.
             - name: USE_VAE_COMPILE
-              value: "1"
+              value: "0"
             - name: USE_TORCH_COMPILE
               value: "true"
             - name: NEURON_COMPILE_BACKEND
