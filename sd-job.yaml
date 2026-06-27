@@ -164,12 +164,15 @@ spec:
               echo "captured+viewed OK: $OK / ${#NEFFS[@]}"
               python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$PROF_DIR/perneff_breakdown.txt" || echo "aggregation failed"
 
-              # ─── copy the WHOLE local run folder to /var/mdl ONCE, off critical path ───
-              echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
-              mkdir -p "$FINAL_DIR"
-              cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy to /var/mdl failed"
-              echo "=== DONE. contents of $FINAL_DIR ==="
-              ls -lhR "$FINAL_DIR" | head -80
+              # ─── S3 DOWN: output stays in $RUN_DIR (/tmp). No /var/mdl copy. ───
+              echo "=== DONE. output in $RUN_DIR (local /tmp — kubectl cp from here) ==="
+              ls -lhR "$RUN_DIR" | head -80
+
+              # ─── HANG so the pod stays alive for `kubectl cp` (S3 down). ───
+              # kubectl cp <pod>:$RUN_DIR/cat.mp4 ./cat.mp4
+              echo "=== HOLDING pod open for kubectl cp. RUN_DIR=$RUN_DIR ==="
+              echo "    kubectl cp <pod>:$RUN_DIR ./out"
+              while true; do sleep 3600; done
           resources:
             claims:
               - name: m-trn2
