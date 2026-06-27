@@ -149,8 +149,13 @@ class NeuronWanVAEWrapper(VAEInterface):
             # decode_latents loop.
             idx = getattr(self, "_decode_chunk_idx", 0)
             with torch.no_grad():
+                # batch_frames=False -> always per-frame decode ([decoder(x[:,:,i:i+1])...]).
+                # The batched chunk_idx>0 path decodes all N frames at once (e.g. [6,384,
+                # 120,208]) — a cold shape that floods/crashes the compile service
+                # (errno=111). Per-frame keeps every decode tensor at 1 frame (a shape
+                # that already compiles); cache/chunk_idx still streams continuity.
                 out = self._model.decode_to_pixel(
-                    latent, use_cache=True, chunk_idx=idx)
+                    latent, use_cache=True, chunk_idx=idx, batch_frames=False)
             self._decode_chunk_idx = idx + 1
             return out
         device = latent.device
