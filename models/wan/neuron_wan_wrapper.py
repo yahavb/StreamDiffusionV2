@@ -96,6 +96,12 @@ class NeuronWanVAEWrapper(VAEInterface):
         self.vae_pth = vae_pth
         self.target_device = device
         self._model = None
+        # USE_RF_VAE (default off): when on, _ensure_model() builds the ported
+        # rolling_forcing per-frame cached decoder (vae_rf.WanVAEWrapper) which
+        # decodes one latent frame at a time and avoids the giant aten::cat that
+        # crashes the monolithic decode at 480p. When off, the original
+        # modules.vae._video_vae path is used unchanged.
+        self._use_rf_vae = os.environ.get("USE_RF_VAE", "").lower() in ("1", "true")
 
         mean = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
                 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921]
@@ -110,13 +116,30 @@ class NeuronWanVAEWrapper(VAEInterface):
         wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
         if wan_base not in sys.path:
             sys.path.insert(0, wan_base)
-        from modules.vae import _video_vae
-        self._model = _video_vae(
-            pretrained_path=self.vae_pth, z_dim=self.z_dim
-        ).eval().requires_grad_(False).to(dtype=torch.bfloat16, device=self.target_device)
+        if self._use_rf_vae:
+            # Ported single-rank rolling_forcing per-frame cached decoder.
+            from modules.vae_rf import build_vae
+            LOGGER.info("Building RF VAE decoder (USE_RF_VAE=1, per-frame cached decode)")
+            self._model = build_vae(
+                vae_pth=self.vae_pth, dtype=torch.bfloat16,
+                device=self.target_device)
+        else:
+            from modules.vae import _video_vae
+            self._model = _video_vae(
+                pretrained_path=self.vae_pth, z_dim=self.z_dim
+            ).eval().requires_grad_(False).to(dtype=torch.bfloat16, device=self.target_device)
 
     def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
         self._ensure_model()
+        if self._use_rf_vae:
+            # The RF wrapper takes latent in [B, T, C, H, W] (same as our caller),
+            # applies its own mean/std scaling internally, runs per-frame cached
+            # decode, and returns [B, T, C, H, W] — same layout the original path
+            # produces — so no extra rearrange/scale here. clear_cache before
+            # each full decode for clean temporal state.
+            self._model.clear_cache()
+            with torch.no_grad():
+                return self._model.decode_to_pixel(latent)
         device = latent.device
         scale = [self._mean.to(device), (1.0 / self._std).to(device)]
         latent = rearrange(latent, 'b t c h w -> b c t h w').contiguous()
