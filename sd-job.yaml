@@ -70,7 +70,7 @@ spec:
               echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tr '\n' ' ')  USE_NKI_VAE=${USE_NKI_VAE:-unset} USE_VAE_COMPILE=${USE_VAE_COMPILE:-unset}"
 
               # ─── model weights + checkpoint (S3-backed cache) ───
-              WAN_1_3B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
+              WAN_1_3B_TAR="/tmp/cache/Wan2.1-T2V-1.3B.tar"
               mkdir -p wan_models
               if [[ -f "$WAN_1_3B_TAR" ]]; then
                 cp "$WAN_1_3B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
@@ -79,7 +79,7 @@ spec:
                 tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-1.3B
                 mkdir -p "$(dirname $WAN_1_3B_TAR)" && cp /tmp/w.tar "$WAN_1_3B_TAR" && rm -f /tmp/w.tar
               fi
-              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
+              SDV2_CKPT_CACHE="/tmp/cache/wan_causal_dmd_v2v/model.pt"
               mkdir -p ckpts/wan_causal_dmd_v2v
               if [[ -f "$SDV2_CKPT_CACHE" ]]; then
                 cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v/model.pt
@@ -95,7 +95,7 @@ spec:
               # the whole run folder to /var/mdl ONCE at the very end, off critical path.
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
               RUN_DIR="/tmp/run/$TS"
-              FINAL_DIR="/var/mdl/stream_diffusion/runs/$TS"
+              FINAL_DIR="/tmp/run/$TS"  # S3 down: keep local, no /var/mdl copy
               PROF_DIR="$RUN_DIR/profile"
               mkdir -p "$PROF_DIR"
               echo "RUN_DIR=$RUN_DIR  (final -> $FINAL_DIR)"
@@ -191,7 +191,7 @@ spec:
               value: "exp/vae-rf"
             # v2v input video on the PVC — staged to /tmp at job start (off critical path).
             - name: INPUT_VIDEO_SRC
-              value: "/var/mdl/stream_diffusion/wan2_i2v_output.mp4"
+              value: ""  # S3 down: no input video -> t2v fallback
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
