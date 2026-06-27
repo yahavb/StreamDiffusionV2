@@ -140,7 +140,10 @@ spec:
               }
               # v2v: restyle the provided input video (paper's actual recipe). The cat
               # prompt matches the input (white cat on surfboard). noise_scale set in render().
-              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds." "$IN_VIDEO"
+              # v2v restyle TEST: prompt deliberately DIFFERENT from the input (white
+              # beach cat). If the output shows glass/cyberpunk/night, the prompt is
+              # driving; if it's still a daylight beach cat, the prompt isn't working.
+              render cat "A cat sculpted from translucent glowing blue glass riding a surfboard, neon cyberpunk city at night, electric pink and cyan reflections on water, dramatic dark sky" "$IN_VIDEO"
 
               # ════════════════ PART B: HIGH-LEVEL profiler ONLY (no neuron-profiler/systrace) ═══════
               # The per-block "Block N: DiT=.. VAE=.. fps" timing in the render above IS the
