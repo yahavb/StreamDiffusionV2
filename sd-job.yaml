@@ -104,6 +104,20 @@ spec:
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
               mkdir -p /tmp/neff_cache
 
+              # ─── stage the v2v input video from S3 (INPUT_VIDEO_SRC) to LOCAL /tmp ───
+              # NEVER read the input from /var/mdl on the critical path (S3-backed, slow,
+              # and torchvision/imageio seeks fail). Copy ONCE here, then render from /tmp.
+              IN_VIDEO=""
+              if [ -n "${INPUT_VIDEO_SRC:-}" ]; then
+                if [ -f "$INPUT_VIDEO_SRC" ]; then
+                  IN_VIDEO="/tmp/$(basename "$INPUT_VIDEO_SRC")"
+                  cp "$INPUT_VIDEO_SRC" "$IN_VIDEO"
+                  echo "Staged input video: $INPUT_VIDEO_SRC -> $IN_VIDEO ($(du -h "$IN_VIDEO" | cut -f1))"
+                else
+                  echo "ERROR: INPUT_VIDEO_SRC set but not found: $INPUT_VIDEO_SRC"; ls -la "$(dirname "$INPUT_VIDEO_SRC")" 2>/dev/null | head; exit 1
+                fi
+              fi
+
               BENCH_CMD="torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
                 --config streamv2v/configs/wan_causal_dmd_v2v_neuron.yaml \
                 --num_frames 81 --height 480 --width 832 --device neuron"
@@ -126,7 +140,7 @@ spec:
               }
               # v2v: restyle the provided input video (paper's actual recipe). The cat
               # prompt matches the input (white cat on surfboard). noise_scale set in render().
-              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds." "/var/mdl/stream_diffusion/wan2_i2v_output.mp4"
+              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds." "$IN_VIDEO"
 
               # ════════════════ PART B: HIGH-LEVEL profiler ONLY (no neuron-profiler/systrace) ═══════
               # The per-block "Block N: DiT=.. VAE=.. fps" timing in the render above IS the
@@ -175,6 +189,9 @@ spec:
               value: "1"
             - name: BRANCH
               value: "exp/vae-rf"
+            # v2v input video on the PVC — staged to /tmp at job start (off critical path).
+            - name: INPUT_VIDEO_SRC
+              value: "/var/mdl/stream_diffusion/wan2_i2v_output.mp4"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
