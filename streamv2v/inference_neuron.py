@@ -224,13 +224,22 @@ def run_inference(pipeline, args, config, verbose=False):
         # v2v: noised input-video latents for this block; t2v: pure noise
         block_noise = block_input(current_frame, num_frame_per_block)
 
-        # DiT: 5 denoising steps for this block (3 frames)
+        # Start-step must MATCH the noise level. v2v only adds noise_scale worth of
+        # noise to the input latent, so start denoising from the matching timestep
+        # (GPU ref: current_step = int(1000*noise_scale)-100), NOT from full noise —
+        # starting at full noise over-denoises and washes out the input video.
+        if video_latents is not None:
+            start_step = max(0, int(1000 * noise_scale) - 100)
+        else:
+            start_step = int(pipeline.denoising_step_list[0].item())
+
+        # DiT: denoising steps for this block
         t_dit = time.perf_counter()
         pred = pipeline.inference_wo_batch(
             noise=block_noise,
             current_start=current_start,
             current_end=current_end,
-            current_step=pipeline.denoising_step_list[0].item(),
+            current_step=start_step,
         )
         if hasattr(torch, 'neuron'):
             torch.neuron.synchronize()

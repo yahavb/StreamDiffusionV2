@@ -124,11 +124,17 @@ spec:
                   echo "[$NAME] NO frames in $FRAMES_DIR — mp4 not written"
                 fi
               }
-              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds."
+              # v2v: restyle the provided input video (paper's actual recipe). The cat
+              # prompt matches the input (white cat on surfboard). noise_scale set in render().
+              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds." "/var/mdl/stream_diffusion/wan2_i2v_output.mp4"
 
-              # ════════════════ PART B: PROFILER (general + per-NEFF), all into PROF_DIR ════════════════
-              # B1: general/model-level engine breakdown — capture+view every cached NEFF, aggregate.
-              echo "=== [profiler] per-NEFF capture -> general engine breakdown ==="
+              # ════════════════ PART B: HIGH-LEVEL profiler ONLY (no neuron-profiler/systrace) ═══════
+              # The per-block "Block N: DiT=.. VAE=.. fps" timing in the render above IS the
+              # high-level hotspot signal (DiT vs VAE split). We additionally do the LIGHT
+              # per-NEFF engine breakdown (capture --single-io -> profile_all_neffs aggregate),
+              # but SKIP step5 DMA-parquet and step6 systrace — those stack a 2nd full inference
+              # under inspect instrumentation and OOM'd a core (878MB on NC4) last run.
+              echo "=== [profiler] LIGHT per-NEFF engine breakdown (no DMA/systrace) ==="
               POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
               mapfile -t NEFFS < <(find /tmp/neff_cache -name "*.neff" 2>/dev/null | sort)
               echo "NEFFs in cache: ${#NEFFS[@]}"
@@ -143,36 +149,6 @@ spec:
               done
               echo "captured+viewed OK: $OK / ${#NEFFS[@]}"
               python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$PROF_DIR/perneff_breakdown.txt" || echo "aggregation failed"
-
-              # dominant-NEFF detail + preserve top-5 heavy NEFF+NTFF pairs for per-NEFF DMA analysis
-              BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache | head -1)
-              BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" 2>/dev/null | head -1)
-              if [ -n "$BIGNEFF" ] && [ -f "$POUT/${BIGHASH}.ntff" ]; then
-                timeout 180 neuron-profile view -n "$BIGNEFF" -s "$POUT/${BIGHASH}.ntff" \
-                  --output-format summary-text 2>/dev/null | tee "$PROF_DIR/hotspots_${BIGHASH}.txt" || echo "view failed"
-              fi
-              mkdir -p "$PROF_DIR/ntff_pairs"
-              for h in $(python3 scripts/neuron/top_neffs.py "$POUT" 5 2>/dev/null); do
-                src=$(find /tmp/neff_cache -name "${h}.neff" 2>/dev/null | head -1)
-                [ -n "$src" ] && cp "$src" "$PROF_DIR/ntff_pairs/${h}.neff" 2>/dev/null || true
-                [ -f "$POUT/${h}.ntff" ] && cp "$POUT/${h}.ntff" "$PROF_DIR/ntff_pairs/${h}.ntff" 2>/dev/null || true
-              done
-
-              # B2: per-NEFF INSTRUCTION-LEVEL DMA analysis (names the HLO op + source line)
-              echo "=== [profiler] per-NEFF instruction-level DMA analysis ==="
-              bash scripts/neuron/run_dma_analysis.sh "$PROF_DIR/ntff_pairs" \
-                2>&1 | tee "$PROF_DIR/dma_analysis.txt" || echo "DMA ANALYSIS FAILED"
-
-              # B3: Neuron Profiler 2.0 system-trace bundle (uploadable: trace_info.pb)
-              echo "=== [profiler] system-trace bundle ==="
-              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
-              NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
-              NEURON_RT_INSPECT_DEVICE_PROFILE=1 NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
-                $BENCH_CMD --prompt "A cat walking on the beach at sunset" --fps 16 \
-                --output_path /tmp/trace_cat.mp4 2>&1 | grep -iE "Block |median|FAILED" || echo "systrace run done"
-              echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
-              tar -czf "$PROF_DIR/systrace_bundle.tar.gz" -C "$SYSTRACE" . 2>/dev/null \
-                && echo "systrace bundle: $PROF_DIR/systrace_bundle.tar.gz" || echo "systrace save skipped"
 
               # ─── copy the WHOLE local run folder to /var/mdl ONCE, off critical path ───
               echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
