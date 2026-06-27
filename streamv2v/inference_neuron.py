@@ -196,6 +196,10 @@ def run_inference(pipeline, args, config, verbose=False):
         torch.neuron.synchronize()
     timings["t5_encode"] = time.perf_counter() - t0
 
+    # New clip: reset the VAE temporal-cache stream so the RF VAE carries cache
+    # across blocks (clear once here, NOT per block — per-block clearing softens output).
+    pipeline.reset_decode_stream()
+
     # VAE decode anchor immediately
     t_vae = time.perf_counter()
     anchor_video = pipeline.decode_latents(anchor_pred)

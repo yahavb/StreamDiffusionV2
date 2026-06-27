@@ -487,6 +487,12 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             # Other ranks don't have VAE loaded — return None
             return None
 
+    def reset_decode_stream(self):
+        """Reset the VAE temporal-cache stream — call ONCE per clip before the
+        first (anchor) decode so the RF VAE streams its cache across blocks."""
+        if self.rank == VAE_RANK and self.vae is not None and hasattr(self.vae, "reset_decode_stream"):
+            self.vae.reset_decode_stream()
+
     def encode_video_latents(self, video, num_lat_frames, height, width):
         """v2v: encode pixel video -> latent on VAE_RANK, broadcast to all TP ranks.
 

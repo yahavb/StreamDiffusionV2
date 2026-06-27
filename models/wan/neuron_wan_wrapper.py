@@ -102,6 +102,7 @@ class NeuronWanVAEWrapper(VAEInterface):
         # crashes the monolithic decode at 480p. When off, the original
         # modules.vae._video_vae path is used unchanged.
         self._use_rf_vae = os.environ.get("USE_RF_VAE", "").lower() in ("1", "true")
+        self._decode_chunk_idx = 0  # RF VAE streaming: incremented per decode block
 
         mean = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
                 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921]
@@ -129,17 +130,29 @@ class NeuronWanVAEWrapper(VAEInterface):
                 pretrained_path=self.vae_pth, z_dim=self.z_dim
             ).eval().requires_grad_(False).to(dtype=torch.bfloat16, device=self.target_device)
 
+    def reset_decode_stream(self):
+        """Start a new clip: clear VAE temporal cache and reset chunk counter.
+        Call ONCE per video, before the per-block decode loop. (RF streams the
+        cache across chunks via chunk_idx; clearing per-block destroys temporal
+        continuity and softens output — that was the quality regression.)"""
+        self._decode_chunk_idx = 0
+        if self._use_rf_vae and self._model is not None:
+            self._model.clear_cache()
+
     def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
         self._ensure_model()
         if self._use_rf_vae:
-            # The RF wrapper takes latent in [B, T, C, H, W] (same as our caller),
-            # applies its own mean/std scaling internally, runs per-frame cached
-            # decode, and returns [B, T, C, H, W] — same layout the original path
-            # produces — so no extra rearrange/scale here. clear_cache before
-            # each full decode for clean temporal state.
-            self._model.clear_cache()
+            # Stream the cache across blocks: clear ONLY at chunk 0 (via
+            # reset_decode_stream), then pass an incrementing chunk_idx so the
+            # CausalConv3d cache + Resample.first_video_frame carry temporal
+            # context block-to-block (chunk_idx>0 reuses cache). Matches RF's
+            # decode_latents loop.
+            idx = getattr(self, "_decode_chunk_idx", 0)
             with torch.no_grad():
-                return self._model.decode_to_pixel(latent)
+                out = self._model.decode_to_pixel(
+                    latent, use_cache=True, chunk_idx=idx)
+            self._decode_chunk_idx = idx + 1
+            return out
         device = latent.device
         scale = [self._mean.to(device), (1.0 / self._std).to(device)]
         latent = rearrange(latent, 'b t c h w -> b c t h w').contiguous()
