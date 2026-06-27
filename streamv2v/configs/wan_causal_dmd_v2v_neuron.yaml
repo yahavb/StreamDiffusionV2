@@ -31,12 +31,12 @@ use_ema: false
 # Schedule copied verbatim from the GPU configs/wan_causal_dmd_v2v.yaml (the path that
 # produces real video). Previously [1000,800,600,400,200] / shift 5.0 / warp true — those
 # were RollingForcing values and produced noise on the StreamDiffusionV2 weights.
+# v2v + 1-step = the paper's actual recipe. In v2v the input video carries the
+# content, so a single denoise pass restyles it (paper measures v2v FPS at 1-step).
+# The per-block loop overwrites this[0] with the v2v start-step int(1000*noise_scale)-100.
+# (t2v needs the 5-step list [700,500,400,200,0] for quality — restore if running t2v.)
 denoising_step_list:
-- 700
-- 500
-- 400
-- 200
-- 0
+- 1000
 
 num_train_timestep: 1000
 timestep_shift: 8.0
