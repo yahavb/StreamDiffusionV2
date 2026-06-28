@@ -160,19 +160,37 @@ def run_inference(pipeline, args, config, verbose=False):
         LOGGER.info(f"[v2v] input={args.video_path} pixel_frames={t_pix} -> latent_frames={t_lat} "
                     f"({num_frames // num_frame_per_block} blocks), noise_scale={noise_scale}")
 
-    def block_input(start_lat, n_lat):
-        """Per-block model input: noised input latents (v2v) or pure noise (t2v)."""
+    init_noise_scale = noise_scale
+
+    def adaptive_noise_scale_and_step(start_lat, n_lat):
+        """Port of upstream compute_noise_scale_and_step (motion-aware), in LATENT
+        space. Returns (block_noise_scale, current_step). For the FIRST block
+        (start_lat==0) current_step=None -> caller runs the FULL denoise schedule
+        (matches upstream chunk.start_idx==0). Otherwise adapt by inter-frame motion
+        and start denoise at int(1000*ns)-100, with the SAME ns used for the mix."""
+        if video_latents is None or start_lat == 0:
+            return noise_scale, None
+        cur = video_latents[:, start_lat:start_lat + n_lat]
+        prev = video_latents[:, start_lat - 1:start_lat - 1 + n_lat]
+        l2 = ((cur - prev) ** 2)
+        l2 = (torch.sqrt(l2.float().mean(dim=(0, 2, 3, 4))).max() / 0.2).clamp(0, 1)
+        ns = (init_noise_scale - 0.1 * l2.item()) * 0.9 + noise_scale * 0.1
+        return ns, max(0, int(1000 * ns) - 100)
+
+    def block_input(start_lat, n_lat, ns):
+        """Per-block model input: noised input latents (v2v) or pure noise (t2v),
+        using the per-block noise_scale ns (consistent with its current_step)."""
         rand = torch.randn(1, n_lat, 16, args.height // 8, args.width // 8,
                            dtype=dtype, device=device)
         if video_latents is None:
             return rand
         chunk = video_latents[:, start_lat:start_lat + n_lat]
-        # mix input-video latents with noise (StreamDiffusionV2 v2v: noise*s + latent*(1-s))
-        return rand * noise_scale + chunk * (1.0 - noise_scale)
+        return rand * ns + chunk * (1.0 - ns)
 
-    # Generate initial input for anchor block (v2v latents or t2v noise)
+    # Generate initial input for anchor block (v2v latents or t2v noise).
+    # Anchor = first chunk -> full schedule (ns=init, current_step=None).
     num_anchor_frames = num_frame_per_block
-    noise = block_input(0, num_anchor_frames)
+    noise = block_input(0, num_anchor_frames, init_noise_scale)
 
     timings = {
         "t5_encode": 0,      # T5 + anchor block time
@@ -221,17 +239,15 @@ def run_inference(pipeline, args, config, verbose=False):
         current_start = current_frame * frame_seq_length
         current_end = current_start + frame_seq_length * num_frame_per_block
 
-        # v2v: noised input-video latents for this block; t2v: pure noise
-        block_noise = block_input(current_frame, num_frame_per_block)
-
-        # Start-step must MATCH the noise level. v2v only adds noise_scale worth of
-        # noise to the input latent, so start denoising from the matching timestep
-        # (GPU ref: current_step = int(1000*noise_scale)-100), NOT from full noise —
-        # starting at full noise over-denoises and washes out the input video.
-        if video_latents is not None:
-            start_step = max(0, int(1000 * noise_scale) - 100)
+        # Per-chunk adaptive noise_scale + current_step (upstream-faithful). ns and
+        # the start step are computed together so the noised-latent mix and the
+        # denoise start timestep stay consistent.
+        ns, adaptive_step = adaptive_noise_scale_and_step(current_frame, num_frame_per_block)
+        block_noise = block_input(current_frame, num_frame_per_block, ns)
+        if video_latents is not None and adaptive_step is not None:
+            start_step = adaptive_step                       # v2v chunks 1+
         else:
-            start_step = int(pipeline.denoising_step_list[0].item())
+            start_step = int(pipeline.denoising_step_list[0].item())  # t2v / first chunk: full schedule
 
         # DiT: denoising steps for this block
         t_dit = time.perf_counter()
