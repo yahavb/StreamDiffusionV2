@@ -1,0 +1,54 @@
+# StreamDiffusionV2 config for Neuron/Trainium inference — 14B model.
+# Same pipeline/schedule as the 1.3B neuron config, bigger weights (the paper's
+# higher-fidelity model). Code handles model_type=T2V-14B (dim=5120, 40 layers, 40 heads).
+#
+#   DiT     : Wan2.1-T2V-14B made causal via CausVid/DMD
+#   Weights : jerryfeng/StreamDiffusionV2 -> ckpts/wan_causal_dmd_v2v_14b/model.pt
+#   Base    : Wan-AI/Wan2.1-T2V-14B (UMT5-XXL + Wan2.1 VAE live under this path too)
+#   Schedule: same [700,500,400,200,0] shift 8.0 as the 1.3B release.
+#
+# RISK: 14B (~10x 1.3B params) — HBM pressure at TP-4 on m-trn2 (2 devices) may OOM at
+# load; fresh 5120-dim compiles may stress the compile service. Untested on Neuron.
+
+model_name: wan
+generator_name: neuron_causal_wan
+model_type: T2V-14B
+model_path: wan_models/Wan2.1-T2V-14B
+vae_path: wan_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth
+generator_ckpt: ckpts/wan_causal_dmd_v2v_14b/model.pt
+use_ema: false
+
+denoising_step_list:
+- 700
+- 500
+- 400
+- 200
+- 0
+
+num_train_timestep: 1000
+timestep_shift: 8.0
+warp_denoising_step: false
+t2v: true
+
+height: 240
+width: 416
+num_frames: 81
+
+num_frame_per_block: 3
+num_kv_cache: 6
+num_sink_tokens: 3
+adapt_sink_threshold: 0.2
+
+tp_degree: 4
+seed: 0
+
+# latent dims for 240x416, 81 frames (30x52 latent) — same as 1.3B (resolution-driven,
+# not model-size-driven).
+image_or_video_shape:
+- 1
+- 81
+- 16
+- 30
+- 52
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
