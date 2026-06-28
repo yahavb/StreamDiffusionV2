@@ -137,12 +137,13 @@ spec:
                   echo "[$NAME] NO frames in $FRAMES_DIR — mp4 not written"
                 fi
               }
-              # v2v: restyle the provided input video (paper's actual recipe). The cat
-              # prompt matches the input (white cat on surfboard). noise_scale set in render().
-              # v2v restyle TEST: prompt deliberately DIFFERENT from the input (white
-              # beach cat). If the output shows glass/cyberpunk/night, the prompt is
-              # driving; if it's still a daylight beach cat, the prompt isn't working.
-              render bird "A highly detailed futuristic cybernetic bird, blending avian elegance with advanced robotics. Its feathers are metallic plates with iridescent reflections of blue and purple neon lights, each joint covered by intricate mechanical gears and wires. The eyes glow with a pulsating red core, scanning the environment like a high-tech sensor. The wings expand with layered steel feathers, partially transparent with holographic circuits flowing through them. The bird is perched on a glowing cyberpunk rooftop railing, with a vast futuristic city in the background filled with holographic billboards, flying drones, and neon-lit skyscrapers. The atmosphere is cinematic, ultra-realistic, and science-fiction inspired, combining photorealism with a high-tech futuristic style." "$IN_VIDEO"
+              # v2v restyle TEST (subject-matched): input is a golden puppy running in
+              # grass; the prompt restyles it into a CYBERNETIC DOG. Matching the prompt
+              # subject (dog) to the input subject (dog) keeps the puppy's shape + motion
+              # and tests RESTYLE quality — the fair v2v test (vs the bird prompt, which
+              # fought the dog-shaped input). Judge: does it keep dog form + gain cyber
+              # texture, and is it sharp/realistic (not cartoon)? noise_scale set in render().
+              render dog "A highly detailed futuristic cybernetic dog running through a glowing neon field, blending canine grace with advanced robotics. Its fur is metallic plates with iridescent reflections of blue and purple neon light, each joint covered by intricate mechanical gears and wires. The eyes glow with a pulsating core, scanning ahead like high-tech sensors. The body is layered brushed steel, partially transparent with holographic circuits flowing through it. Behind it a vast futuristic landscape with holographic billboards and neon-lit structures. The atmosphere is cinematic, ultra-realistic, and science-fiction inspired, combining photorealism with a high-tech futuristic style." "$IN_VIDEO"
 
               # ════════════════ PART B: HIGH-LEVEL profiler ONLY (no neuron-profiler/systrace) ═══════
               # The per-block "Block N: DiT=.. VAE=.. fps" timing in the render above IS the
@@ -193,7 +194,7 @@ spec:
               value: "exp/sdv2-14b"
             # v2v input video on the PVC — staged to /tmp at job start (off critical path).
             - name: INPUT_VIDEO_SRC
-              value: ""  # 14B first test: t2v, isolate load/fit
+              value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v: real golden-puppy input
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
