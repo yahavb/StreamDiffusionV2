@@ -31,7 +31,6 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn2
-        kubernetes.io/hostname: ip-192-168-119-96.ap-southeast-4.compute.internal
       resourceClaims:
         - name: m-trn2
           resourceClaimTemplateName: m-trn2
@@ -70,7 +69,7 @@ spec:
               echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tr '\n' ' ')  USE_NKI_VAE=${USE_NKI_VAE:-unset} USE_VAE_COMPILE=${USE_VAE_COMPILE:-unset}"
 
               # ─── model weights + checkpoint (S3-backed cache) ───
-              WAN_1_3B_TAR="/tmp/cache/Wan2.1-T2V-1.3B.tar"
+              WAN_1_3B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
               mkdir -p wan_models
               if [[ -f "$WAN_1_3B_TAR" ]]; then
                 cp "$WAN_1_3B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
@@ -79,7 +78,7 @@ spec:
                 tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-1.3B
                 mkdir -p "$(dirname $WAN_1_3B_TAR)" && cp /tmp/w.tar "$WAN_1_3B_TAR" && rm -f /tmp/w.tar
               fi
-              SDV2_CKPT_CACHE="/tmp/cache/wan_causal_dmd_v2v/model.pt"
+              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
               mkdir -p ckpts/wan_causal_dmd_v2v
               if [[ -f "$SDV2_CKPT_CACHE" ]]; then
                 cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v/model.pt
@@ -95,7 +94,7 @@ spec:
               # the whole run folder to /var/mdl ONCE at the very end, off critical path.
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
               RUN_DIR="/tmp/run/$TS"
-              FINAL_DIR="/tmp/run/$TS"  # S3 down: keep local, no /var/mdl copy
+              FINAL_DIR="/var/mdl/stream_diffusion/runs/$TS"
               PROF_DIR="$RUN_DIR/profile"
               mkdir -p "$PROF_DIR"
               echo "RUN_DIR=$RUN_DIR  (final -> $FINAL_DIR)"
@@ -167,15 +166,12 @@ spec:
               echo "captured+viewed OK: $OK / ${#NEFFS[@]}"
               python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$PROF_DIR/perneff_breakdown.txt" || echo "aggregation failed"
 
-              # ─── S3 DOWN: output stays in $RUN_DIR (/tmp). No /var/mdl copy. ───
-              echo "=== DONE. output in $RUN_DIR (local /tmp — kubectl cp from here) ==="
-              ls -lhR "$RUN_DIR" | head -80
-
-              # ─── HANG so the pod stays alive for `kubectl cp` (S3 down). ───
-              # kubectl cp <pod>:$RUN_DIR/cat.mp4 ./cat.mp4
-              echo "=== HOLDING pod open for kubectl cp. RUN_DIR=$RUN_DIR ==="
-              echo "    kubectl cp <pod>:$RUN_DIR ./out"
-              while true; do sleep 3600; done
+              # ─── copy the WHOLE local run folder to /var/mdl ONCE, off critical path ───
+              echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
+              mkdir -p "$FINAL_DIR"
+              cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy to /var/mdl failed"
+              echo "=== DONE. contents of $FINAL_DIR ==="
+              ls -lhR "$FINAL_DIR" | head -80
           resources:
             claims:
               - name: m-trn2
