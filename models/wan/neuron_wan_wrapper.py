@@ -171,14 +171,15 @@ class NeuronWanVAEWrapper(VAEInterface):
 
         Args:  video [B, T, C, H, W] in [-1, 1] (pixel space, bf16)
         Returns: latent [B, T_lat, z_dim, H/8, W/8]  (matches the noise/denoise layout)
-        The VAE encode uses scale=[mean, std] (NOT 1/std) — encode normalizes by
-        (mu - mean) * std, the inverse of decode's z/std + mean.
+        Encode uses scale=[mean, 1/std] — SAME as the GPU stream_encode. The model's
+        encode does mu=(mu-mean)*scale[1], so scale[1] MUST be 1/std (normalize), not
+        std. (Earlier bug: passing std mis-scaled latents by std^2 -> noisy v2v output.)
         """
         # The RF VAE (_use_rf_vae) is DECODER-ONLY (encoder weights stripped), so it
         # has no .encode. Lazily build the ORIGINAL full VAE just for encoding; decode
         # still uses the fast RF decoder. Non-RF path uses self._model directly.
         device = video.device
-        scale = [self._mean.to(device), self._std.to(device)]
+        scale = [self._mean.to(device), (1.0 / self._std).to(device)]
         video = rearrange(video, 'b t c h w -> b c t h w').contiguous()
         if self._use_rf_vae:
             if getattr(self, "_enc_model", None) is None:
