@@ -129,9 +129,12 @@ spec:
               # FPS-OPTIMIZED: 1.3B (14B is fps-hopeless) at 480p, all quality-neutral
               # levers ON (NKI attn/rope kernels via USE_NKI_KERNELS, VAE optimized).
               # 5-step = quality floor. STEPS env (default 5) lets us sweep fps-vs-quality
-              # without editing the config. NPROC = TP degree (cap 6: 12 heads / TP must
-              # be integer; TP-4 default). Single-stream fps is what this measures; 8 chips
-              # only multiply via independent data-parallel streams, not one faster stream.
+              # without editing the config. NPROC = TP degree: 1.3B has 12 attention heads
+              # so TP must divide 12 (4/6/12); TP-12 is the single-instance MAX. A trn2
+              # chip = 8 NeuronCores (8 chips = 64 cores / 32 LNC2 logical) — but extra
+              # cores DON'T speed one stream past TP-12 (sublinear, head-capped). They
+              # multiply AGGREGATE fps via independent data-parallel streams. This job
+              # measures ONE stream; aggregate = (cores/TP) x single-stream fps.
               NPROC="${NPROC:-4}"
               STEPS="${STEPS:-700,500,400,200,0}"
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
