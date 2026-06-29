@@ -68,26 +68,26 @@ spec:
               PROBE='import models.wan.neuron_layers as a; print("nki="+str(a.USE_NKI_KERNELS), "self_nki="+str(a.SELF_ATTN_NKI_AVAILABLE), "rope_nki="+str(a.ROPE_NKI_AVAILABLE), "ATTN_MULT="+str(a.ATTN_SEQLEN_MULTIPLE))'
               echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tr '\n' ' ')  USE_NKI_VAE=${USE_NKI_VAE:-unset} USE_VAE_COMPILE=${USE_VAE_COMPILE:-unset}"
 
-              # ─── 14B model weights + DMD checkpoint (S3-backed cache) ───
-              # Best-quality model. CP-at-240p plan: 14B amortizes ring-attention better
-              # than 1.3B (10 heads/rank @ TP-4 = ~3x more attn compute per K/V byte moved).
-              # Base Wan2.1-T2V-14B (UMT5-XXL + VAE under it) + jerryfeng 14B DMD ckpt.
-              WAN_14B_TAR="/var/mdl/wan_models/Wan2.1-T2V-14B.tar"
+              # ─── 1.3B model weights + DMD checkpoint (S3-backed cache) ───
+              # PERF-POTENTIAL comparison: same experiment (240p, t2v+v2v, profiled, TP-4)
+              # as the 14B run, but 1.3B — to assess the perf ceiling of the smaller model.
+              # 1.3B caps at TP-4 (ffn 8960 / 12 heads). Base Wan2.1-T2V-1.3B + jerryfeng DMD.
+              WAN_13B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
               mkdir -p wan_models
-              if [[ -f "$WAN_14B_TAR" ]]; then
-                cp "$WAN_14B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
+              if [[ -f "$WAN_13B_TAR" ]]; then
+                cp "$WAN_13B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
               else
-                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-14B', local_dir='wan_models/Wan2.1-T2V-14B', local_dir_use_symlinks=False)"
-                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-14B
-                mkdir -p "$(dirname $WAN_14B_TAR)" && cp /tmp/w.tar "$WAN_14B_TAR" && rm -f /tmp/w.tar
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN_13B_TAR)" && cp /tmp/w.tar "$WAN_13B_TAR" && rm -f /tmp/w.tar
               fi
-              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v_14b/model.pt"
-              mkdir -p ckpts/wan_causal_dmd_v2v_14b
+              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
+              mkdir -p ckpts/wan_causal_dmd_v2v
               if [[ -f "$SDV2_CKPT_CACHE" ]]; then
-                cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v_14b/model.pt
+                cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v/model.pt
               else
-                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v_14b/*'], local_dir='ckpts')"
-                mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v_14b/model.pt "$SDV2_CKPT_CACHE"
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v/*'], local_dir='ckpts')"
+                mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v/model.pt "$SDV2_CKPT_CACHE"
               fi
               echo "Model weights ready!"
 
@@ -126,19 +126,16 @@ spec:
                 fi
               fi
 
-              # 14B @ 240p — CP-plan BASELINE (step 1 of 3). Best-quality model at the
-              # known-good resolution (240x416). This run MEASURES 14B@240p single-stream
-              # fps (unmeasured till now) AND captures the known-good video that the CP
-              # build must reproduce frame-for-frame. NKI attn/rope kernels ON. 5-step =
-              # quality floor; STEPS env can sweep. NPROC = TP degree (14B: 40 heads, ffn
-              # 13824 -> TP-4 and TP-8 both shard cleanly; TP-4 default). CP (ring-attn,
-              # token-shard) comes AFTER this baseline + the attention profile confirm
-              # attention is the dominant cost. Honest single-stream ceiling 14B@240p+CP:
-              # ~0.5-0.7 fps. Not 8/16fps single-stream — that's the 14B model-size wall.
+              # 1.3B @ 240p — PERF-POTENTIAL comparison vs the 14B@240p run (same res,
+              # both modes, profiled). Assesses the smaller model's fps ceiling. 1.3B caps
+              # at TP-4 (ffn 8960 / 12 heads). NKI attn/rope kernels ON. 5-step quality
+              # floor; STEPS env can sweep. Memory: 1.3B@240p measured 0.63 fps previously
+              # — this run confirms + gives the per-NEFF profile for the same bottleneck
+              # breakdown we did for 14B.
               NPROC="${NPROC:-4}"
               STEPS="${STEPS:-700,500,400,200,0}"
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
-                --config streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml \
+                --config streamv2v/configs/wan_causal_fps_neuron.yaml \
                 --steps $STEPS \
                 --num_frames 81 --height 240 --width 416 --device neuron"
 
