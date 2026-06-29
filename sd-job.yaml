@@ -126,17 +126,20 @@ spec:
                 fi
               fi
 
-              # 14B @ 240p — LOCKED config (1.3B quality rejected). Quality good, 0.33 t2v
-              # / 0.53 v2v. FPS work from here is TP-8 (#19) + DMA-fusion (#20), NOT model
-              # downsize. NKI attn/rope ON. NPROC = TP degree (14B: TP-4 default, TP-8 also
-              # shards cleanly — set NPROC=8 on m-lnc1-trn2 to test lever A). STEPS env sweeps.
-              NPROC="${NPROC:-8}"
+              # 14B @ 240p — LOCKED config (1.3B quality rejected). NKI attn/rope ON.
+              # NPROC = total processes (= cores used); TP_DEGREE = ranks per TP group.
+              # In-pod data-parallel: num streams = NPROC / TP_DEGREE.
+              #   NPROC=16 TP_DEGREE=8  -> 2 streams x TP-8 (this run, all 16 cores)
+              #   NPROC=8  TP_DEGREE=8  -> 1 stream  x TP-8 (lever A single-stream)
+              #   NPROC=4  TP_DEGREE=4  -> 1 stream  x TP-4 (baseline)
+              # 14B shards cleanly at TP {2,4,8} (40 heads, ffn 13824). Each group renders
+              # its own seed -> its own _g{id} video; aggregate fps = sum of groups.
+              NPROC="${NPROC:-16}"
+              TP_DEGREE="${TP_DEGREE:-8}"
               STEPS="${STEPS:-700,500,400,200,0}"
-              # --tp_degree MUST equal NPROC so the whole world is ONE wide TP group
-              # (TP-8 single stream), not 2 TP-4 groups (accidental data-parallel).
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
                 --config streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml \
-                --steps $STEPS --tp_degree $NPROC \
+                --steps $STEPS --tp_degree $TP_DEGREE \
                 --num_frames 81 --height 240 --width 416 --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
@@ -219,11 +222,12 @@ spec:
             # FPS run = t2v from noise (no input video). Empty -> t2v path.
             - name: INPUT_VIDEO_SRC
               value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v input (cat=t2v also runs)
-            # TP degree (= --nproc_per_node = --tp_degree). LEVER A: TP-8 for 14B (40
-            # heads/8=5, ffn 13824/8=1728, dim 5120/8=640 — all clean). Needs 8 logical
-            # cores => m-lnc1-trn2 (LNC1, 16 cores) + NEURON_LOGICAL_NC_CONFIG=1 below.
-            # Set NPROC=4 to fall back to the TP-4 baseline (with m-trn2 + LNC=2).
+            # In-pod data-parallel (Way 1): NPROC procs / TP_DEGREE per group = #streams.
+            # 16/8 = 2 concurrent TP-8 streams across all 16 cores of m-lnc1-trn2.
+            # (NPROC=8,TP_DEGREE=8 = 1 stream TP-8; NPROC=4,TP_DEGREE=4 = TP-4 baseline.)
             - name: NPROC
+              value: "16"
+            - name: TP_DEGREE
               value: "8"
             # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
             # weights; set e.g. "500,0" to sweep faster-but-worse points.
