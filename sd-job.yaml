@@ -222,11 +222,12 @@ spec:
             # FPS run = t2v from noise (no input video). Empty -> t2v path.
             - name: INPUT_VIDEO_SRC
               value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v input (cat=t2v also runs)
-            # In-pod data-parallel (Way 1): NPROC procs / TP_DEGREE per group = #streams.
-            # 16/8 = 2 concurrent TP-8 streams across all 16 cores of m-lnc1-trn2.
-            # (NPROC=8,TP_DEGREE=8 = 1 stream TP-8; NPROC=4,TP_DEGREE=4 = TP-4 baseline.)
+            # SINGLE-STREAM TP-8 (FPS lever A): NPROC==TP_DEGREE==8 -> one wide TP-8
+            # group, NO data-parallel split. Measures whether 8 cores beat 4 on ONE
+            # stream's per-block DiT (TP-4 baseline = 8.65s/block). DP (NPROC=16) was
+            # throughput-only and is NOT an fps lever — do not use it.
             - name: NPROC
-              value: "16"
+              value: "8"
             - name: TP_DEGREE
               value: "8"
             # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
