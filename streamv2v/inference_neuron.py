@@ -78,6 +78,11 @@ def parse_args():
     # descending timesteps ending in 0, e.g. "0" (1-step), "500,0" (2-step),
     # "700,400,0" (3-step). Empty -> use the config's list unchanged.
     parser.add_argument("--steps", type=str, default=None)
+    # TP override: tp_degree normally comes from the config (=4). When running more
+    # ranks (NPROC=8) this MUST be set to match, else init_tp_group makes
+    # world_size/tp_degree separate TP groups (accidental data-parallel) instead of
+    # one wider TP group. Keep --tp_degree == nproc_per_node for a single stream.
+    parser.add_argument("--tp_degree", type=int, default=None)
     return parser.parse_args()
 
 
@@ -408,10 +413,23 @@ def main():
 
     config = OmegaConf.load(args.config)
 
+    # Capture CLI tp_degree BEFORE merge (merge would overwrite None with config's value).
+    cli_tp_degree = getattr(args, 'tp_degree', None)
+
     # Merge config into args
     for k, v in config.items():
         if not hasattr(args, k) or getattr(args, k) is None:
             setattr(args, k, v)
+
+    # TP override: CLI --tp_degree wins over config. Must equal nproc_per_node so the
+    # whole world is ONE TP group (one wide stream), not several smaller TP groups.
+    if cli_tp_degree is not None:
+        args.tp_degree = cli_tp_degree
+        ws = int(os.environ.get('WORLD_SIZE', '0') or 0)
+        if ws and ws != cli_tp_degree:
+            print(f"[TP] WARNING: --tp_degree={cli_tp_degree} != WORLD_SIZE={ws} -> "
+                  f"{ws // cli_tp_degree} TP groups (data-parallel), not one wide stream.")
+        print(f"[TP] tp_degree overridden from --tp_degree: {cli_tp_degree}")
 
     # FPS sweep: CLI --steps OVERRIDES the config's denoising_step_list so one
     # job can sweep step counts. Must be descending and end at 0 (the schedule

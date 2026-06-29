@@ -32,8 +32,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-trn2
-          resourceClaimTemplateName: m-trn2
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
       containers:
         - name: sd
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -130,11 +130,13 @@ spec:
               # / 0.53 v2v. FPS work from here is TP-8 (#19) + DMA-fusion (#20), NOT model
               # downsize. NKI attn/rope ON. NPROC = TP degree (14B: TP-4 default, TP-8 also
               # shards cleanly — set NPROC=8 on m-lnc1-trn2 to test lever A). STEPS env sweeps.
-              NPROC="${NPROC:-4}"
+              NPROC="${NPROC:-8}"
               STEPS="${STEPS:-700,500,400,200,0}"
+              # --tp_degree MUST equal NPROC so the whole world is ONE wide TP group
+              # (TP-8 single stream), not 2 TP-4 groups (accidental data-parallel).
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
                 --config streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml \
-                --steps $STEPS \
+                --steps $STEPS --tp_degree $NPROC \
                 --num_frames 81 --height 240 --width 416 --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
@@ -197,7 +199,7 @@ spec:
               ls -lhR "$FINAL_DIR" | head -80
           resources:
             claims:
-              - name: m-trn2
+              - name: m-lnc1-trn2
             requests:
               cpu: 22
               memory: 440Gi
@@ -217,10 +219,12 @@ spec:
             # FPS run = t2v from noise (no input video). Empty -> t2v path.
             - name: INPUT_VIDEO_SRC
               value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v input (cat=t2v also runs)
-            # TP degree (= --nproc_per_node). 1.3B has 12 heads -> TP must divide into
-            # head count; TP-4 default, TP-6 is the useful max on one m-trn2 (8 cores).
+            # TP degree (= --nproc_per_node = --tp_degree). LEVER A: TP-8 for 14B (40
+            # heads/8=5, ffn 13824/8=1728, dim 5120/8=640 — all clean). Needs 8 logical
+            # cores => m-lnc1-trn2 (LNC1, 16 cores) + NEURON_LOGICAL_NC_CONFIG=1 below.
+            # Set NPROC=4 to fall back to the TP-4 baseline (with m-trn2 + LNC=2).
             - name: NPROC
-              value: "4"
+              value: "8"
             # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
             # weights; set e.g. "500,0" to sweep faster-but-worse points.
             - name: STEPS
@@ -233,13 +237,12 @@ spec:
               value: "ERROR"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
-            # RF runs the IDENTICAL VAE decode at 480x832 without the aten::cat
-            # compile crash — and sets these two. LNC=2 (logical NeuronCore config,
-            # matches m-trn2) changes core grouping the compile service uses; the
-            # RDH buffer bump (128MB) enlarges the runtime channel buffer. We were
-            # missing both — most likely why our 480p decode hit ConnectToService.
+            # LNC=1 to expose 8 logical cores per node for TP-8 (m-lnc1-trn2 grants
+            # LNC1). LNC=2 fuses core pairs -> only 4 logical cores -> can't do TP-8.
+            # (We're at 240p so the 480p VAE-compile env that needed LNC=2 is moot.)
+            # The RDH buffer bump (128MB) stays — harmless, enlarges runtime channel buf.
             - name: NEURON_LOGICAL_NC_CONFIG
-              value: "2"
+              value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
               value: "134217728"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
