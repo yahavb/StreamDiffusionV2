@@ -439,9 +439,25 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         current_start_int = int(current_start)
         current_end_int = int(current_end)
 
-        self.denoising_step_list[0] = current_step
-        num_steps = len(self.denoising_step_list)
-        for index, current_timestep in enumerate(self.denoising_step_list):
+        # Build the EFFECTIVE descending schedule for this block (SDEdit strength).
+        # The canonical DMD schedule is [700,500,400,200,0] (= noise_scale~0.8, the
+        # only point where current_step=int(1000*ns)-100 reproduces it). v2v chunks
+        # pass current_step<700; overwriting ONLY index[0] then leaves the tail fixed
+        # -> NON-MONOTONIC (e.g. ns=0.5 -> [400,500,400,200,0], which RE-NOISES back
+        # up to 500 mid-denoise and corrupts the output). Instead truncate to a proper
+        # descending schedule: start at current_step, then all canonical steps below
+        # it. Reduces EXACTLY to the canonical list when current_step>=700 (high ns),
+        # stays monotonic + uses only distilled timesteps at low ns, and runs fewer
+        # steps the lower you go (more input-faithful AND faster) — so a drastic low
+        # noise_scale becomes a VALID quality test instead of schedule garbage.
+        canonical = [int(s) for s in self.denoising_step_list.tolist()]
+        if current_step is None:
+            eff_steps = canonical
+        else:
+            cs = int(current_step)
+            eff_steps = [cs] + [s for s in canonical if s < cs]
+        num_steps = len(eff_steps)
+        for index, current_timestep in enumerate(eff_steps):
             timestep = torch.ones(
                 [batch_size, noise.shape[1]], device=noise.device,
                 dtype=torch.int64) * current_timestep
@@ -465,8 +481,8 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 shared_buffers=self.shared_buffers,
             )
 
-            if index < len(self.denoising_step_list) - 1:
-                next_timestep = self.denoising_step_list[index + 1]
+            if index < num_steps - 1:
+                next_timestep = eff_steps[index + 1]
                 noise = self.scheduler.add_noise(
                     denoised_pred.flatten(0, 1),
                     torch.randn_like(denoised_pred.flatten(0, 1)),

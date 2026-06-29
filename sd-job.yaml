@@ -128,7 +128,7 @@ spec:
                 echo "=== rendering [$NAME]: $PROMPT  (video=${VIDEO:-none}) ==="
                 local FRAMES_DIR="$RUN_DIR/${NAME}_frames"
                 local VID_ARG=""
-                [ -n "$VIDEO" ] && VID_ARG="--video_path $VIDEO --noise_scale 0.5"
+                [ -n "$VIDEO" ] && VID_ARG="--video_path $VIDEO --noise_scale 0.4"
                 $BENCH_CMD --prompt "$PROMPT" --fps 16 $VID_ARG \
                   --output_path "$RUN_DIR/${NAME}.mp4" || echo "[$NAME] render FAILED"
                 if ls "$FRAMES_DIR"/frame_*.png >/dev/null 2>&1; then
