@@ -112,6 +112,12 @@ spec:
                   IN_VIDEO="/tmp/$(basename "$INPUT_VIDEO_SRC")"
                   cp "$INPUT_VIDEO_SRC" "$IN_VIDEO"
                   echo "Staged input video: $INPUT_VIDEO_SRC -> $IN_VIDEO ($(du -h "$IN_VIDEO" | cut -f1))"
+                  # INPUT SHARPNESS CEILING: v2v cannot add detail the source lacks.
+                  # Print the clip's NATIVE res EARLY (before the long compile) so we
+                  # can see whether a higher render res can even help. If native res
+                  # < render res, the input is upscaled and gains nothing. (One-liner,
+                  # NOT a heredoc — a column-0 heredoc body breaks the YAML block scalar.)
+                  python3 -c "import sys,imageio.v3 as iio,numpy as np; a=np.asarray(iio.imread(sys.argv[1],plugin='pyav')); print('INPUT_RES: native %dx%d (WxH), %d frames'%(a.shape[2],a.shape[1],a.shape[0]))" "$IN_VIDEO" || echo "INPUT_RES: probe failed (non-fatal)"
                 else
                   echo "ERROR: INPUT_VIDEO_SRC set but not found: $INPUT_VIDEO_SRC"; ls -la "$(dirname "$INPUT_VIDEO_SRC")" 2>/dev/null | head; exit 1
                 fi
@@ -119,7 +125,7 @@ spec:
 
               BENCH_CMD="torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
                 --config streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml \
-                --num_frames 81 --height 480 --width 832 --device neuron"
+                --num_frames 81 --height 720 --width 1248 --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
               # $3 (optional) = input video path -> v2v restyle. Omit -> t2v from noise.
