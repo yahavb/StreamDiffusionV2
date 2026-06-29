@@ -32,8 +32,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-lnc1-trn2
-          resourceClaimTemplateName: m-lnc1-trn2
+        - name: m-trn2
+          resourceClaimTemplateName: m-trn2
       containers:
         - name: sd
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -202,7 +202,7 @@ spec:
               ls -lhR "$FINAL_DIR" | head -80
           resources:
             claims:
-              - name: m-lnc1-trn2
+              - name: m-trn2
             requests:
               cpu: 22
               memory: 440Gi
@@ -247,7 +247,7 @@ spec:
             # (We're at 240p so the 480p VAE-compile env that needed LNC=2 is moot.)
             # The RDH buffer bump (128MB) stays — harmless, enlarges runtime channel buf.
             - name: NEURON_LOGICAL_NC_CONFIG
-              value: "1"
+              value: "2"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
               value: "134217728"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
