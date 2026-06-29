@@ -27,18 +27,30 @@ import torch.distributed as dist
 _TP_GROUP: Optional[dist.ProcessGroup] = None
 _TP_RANK: int = 0
 _TP_WORLD_SIZE: int = 1
+# Data-parallel-within-pod: when world_size > tp_degree, the cores split into
+# world_size//tp_degree independent TP groups, each rendering its OWN stream.
+_DP_GROUP_ID: int = 0          # which DP group THIS rank is in (0..num-1)
+_DP_NUM_GROUPS: int = 1        # world_size // tp_degree
+_TP_GROUP_BASE: int = 0        # global rank of this group's local-rank-0
 
 
 def init_tp_group(tp_degree: int = 4):
-    """Initialize tensor parallelism process group.
+    """Initialize tensor parallelism process group(s).
 
     Must be called after torch.distributed.init_process_group().
-    On Trainium, the 4 NeuronCores within a chip form the TP group.
+    When world_size == tp_degree there is ONE TP group (the original behavior).
+    When world_size > tp_degree (in-pod data-parallel), the ranks split into
+    world_size//tp_degree contiguous TP groups, each an INDEPENDENT stream:
+    e.g. tp=8 on 16 cores -> group 0 = ranks[0..7], group 1 = ranks[8..15].
+    All-reduce uses the per-group _TP_GROUP, so each stream's DiT math is
+    self-contained. T5/VAE and prompt/latent broadcasts must be done relative
+    to _TP_GROUP_BASE (see get_dp_*), not global rank 0/2.
 
     Args:
-        tp_degree: Number of ranks in the TP group (default 4 for trn2 chip).
+        tp_degree: ranks per TP group (4 = one trn2 chip's worth at LNC2).
     """
     global _TP_GROUP, _TP_RANK, _TP_WORLD_SIZE
+    global _DP_GROUP_ID, _DP_NUM_GROUPS, _TP_GROUP_BASE
 
     if not dist.is_initialized():
         # Single-process fallback for testing
@@ -54,7 +66,9 @@ def init_tp_group(tp_degree: int = 4):
     assert world_size % tp_degree == 0, (
         f"World size {world_size} must be divisible by tp_degree {tp_degree}")
 
-    # Create TP groups: ranks [0,1,2,3], [4,5,6,7], etc.
+    # Create TP groups: ranks [0,1,2,3], [4,5,6,7], etc. ALL ranks must call
+    # new_group for EVERY group (collective requirement), even groups they're
+    # not in. Each rank then keeps the group it belongs to.
     num_groups = world_size // tp_degree
     for i in range(num_groups):
         ranks = list(range(i * tp_degree, (i + 1) * tp_degree))
@@ -63,8 +77,12 @@ def init_tp_group(tp_degree: int = 4):
             _TP_GROUP = group
             _TP_RANK = rank - i * tp_degree
             _TP_WORLD_SIZE = tp_degree
+            _DP_GROUP_ID = i
+            _DP_NUM_GROUPS = num_groups
+            _TP_GROUP_BASE = i * tp_degree
 
-    print(f"[TP] Initialized: rank={_TP_RANK}/{_TP_WORLD_SIZE}, "
+    print(f"[TP] Initialized: tp_rank={_TP_RANK}/{_TP_WORLD_SIZE}, "
+          f"dp_group={_DP_GROUP_ID}/{_DP_NUM_GROUPS}, base={_TP_GROUP_BASE}, "
           f"global_rank={rank}/{world_size}")
 
 
@@ -81,6 +99,21 @@ def get_tp_rank() -> int:
 def get_tp_world_size() -> int:
     """Get the TP world size (tp_degree)."""
     return _TP_WORLD_SIZE
+
+
+def get_dp_group_id() -> int:
+    """Which data-parallel group (independent stream) this rank belongs to."""
+    return _DP_GROUP_ID
+
+
+def get_dp_num_groups() -> int:
+    """Number of independent DP groups in this pod (world_size // tp_degree)."""
+    return _DP_NUM_GROUPS
+
+
+def get_tp_group_base() -> int:
+    """Global rank of this DP group's local-rank-0 (the group's T5/VAE/broadcast root)."""
+    return _TP_GROUP_BASE
 
 
 # ---------------------------------------------------------------------------

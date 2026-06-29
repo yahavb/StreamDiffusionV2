@@ -528,16 +528,33 @@ def main():
             print(f"median={median_total * 1000:.1f}ms throughput={throughput:.3f} frame/s",
                   flush=True)
     else:
+        # In-pod data-parallel: each DP group renders an INDEPENDENT stream. Give
+        # each group a different seed (so the videos differ) and a distinct output
+        # path (so the groups don't collide writing the same frames). With one group
+        # (dp_num_groups==1) this reduces to the original single-stream behavior.
+        dp_id = getattr(pipeline, 'dp_group_id', 0)
+        dp_n = getattr(pipeline, 'dp_num_groups', 1)
+        if dp_n > 1:
+            # Re-seed per group AFTER init (group id unknown at the earlier global
+            # seed). All ranks within a group share the seed so their noise agrees;
+            # groups differ. Big stride avoids accidental overlap.
+            torch.manual_seed(args.seed + 1000 * dp_id)
+            out_path = args.output_path.replace(".mp4", f"_g{dp_id}.mp4")
+            LOGGER.info(f"[DP] group {dp_id}/{dp_n}: seed={args.seed + 1000*dp_id}, out={out_path}")
+        else:
+            out_path = args.output_path
+
         LOGGER.info("Running inference...")
         video, latents, timings = run_inference(pipeline, args, config)
         LOGGER.info(f"T5+anchor: {timings['t5_encode']*1000:.0f}ms, "
                     f"DiT stream: {sum(timings['dit_stream'])*1000:.0f}ms, "
                     f"VAE stream: {sum(timings['vae_stream'])*1000:.0f}ms")
 
-        # Save (only rank 0 has decoded video)
+        # Save: each DP group's VAE rank has its own decoded video (None elsewhere),
+        # so each group writes its own _g{id} file independently.
         if video is not None:
-            save_video(video, args.output_path, fps=args.fps)
-            LOGGER.info(f"Video saved to {args.output_path}")
+            save_video(video, out_path, fps=args.fps)
+            LOGGER.info(f"Video saved to {out_path}")
 
 
 if __name__ == "__main__":

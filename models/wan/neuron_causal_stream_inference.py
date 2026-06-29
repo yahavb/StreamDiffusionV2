@@ -142,6 +142,16 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         # DiT TP-4 sharded on all ranks with torch.compile on sub-modules
         self.rank = dist.get_rank() if dist.is_initialized() else 0
 
+        # In-pod data-parallel: T5_RANK/VAE_RANK are offsets WITHIN a DP group, so
+        # each independent stream gets its own T5+VAE. Resolve to absolute ranks via
+        # the group base (base=0 for the single-group case -> original behavior).
+        from models.wan.tp_utils import get_tp_group_base, get_dp_group_id, get_dp_num_groups
+        self.tp_group_base = get_tp_group_base() if dist.is_initialized() else 0
+        self.dp_group_id = get_dp_group_id() if dist.is_initialized() else 0
+        self.dp_num_groups = get_dp_num_groups() if dist.is_initialized() else 1
+        self.t5_rank = self.tp_group_base + T5_RANK   # absolute rank hosting T5 for THIS group
+        self.vae_rank = self.tp_group_base + VAE_RANK  # absolute rank hosting VAE for THIS group
+
         # All ranks need the tokenizer (lightweight, CPU-only)
         wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
         if wan_base not in sys.path:
@@ -151,17 +161,17 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=512, clean='whitespace')
 
-        # Initialize T5 (only on T5_RANK — on Neuron with torch.compile)
-        if self.rank == T5_RANK:
-            LOGGER.info(f"Loading T5 text encoder on Neuron (rank {T5_RANK})...")
+        # Initialize T5 (only on this group's T5 rank — on Neuron with torch.compile)
+        if self.rank == self.t5_rank:
+            LOGGER.info(f"Loading T5 text encoder on Neuron (rank {self.rank}, dp_group {self.dp_group_id})...")
             self.text_encoder = NeuronWanTextEncoder(
                 model_path=model_path, device=device)
         else:
             self.text_encoder = None
 
-        # Initialize VAE (only on VAE_RANK — with torch.compile)
-        if self.rank == VAE_RANK:
-            LOGGER.info(f"Loading VAE decoder on rank {VAE_RANK}...")
+        # Initialize VAE (only on this group's VAE rank — with torch.compile)
+        if self.rank == self.vae_rank:
+            LOGGER.info(f"Loading VAE decoder on rank {self.rank} (dp_group {self.dp_group_id})...")
             self.vae = NeuronWanVAEWrapper(
                 vae_pth=vae_path, device=device)
             # Compile VAE for fast decode — gated by USE_VAE_COMPILE (default on).
@@ -313,8 +323,8 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         ids = ids.to(device)
         mask = mask.to(device)
 
-        # Step 2: T5_RANK encodes with compiled T5 on Neuron
-        if self.rank == T5_RANK:
+        # Step 2: this group's T5 rank encodes with compiled T5 on Neuron
+        if self.rank == self.t5_rank:
             seq_len = mask.gt(0).sum(dim=1).long()
             enc_result = self.text_encoder(text_prompts)
             prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
@@ -325,9 +335,13 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             prompt_embeds = torch.zeros(
                 batch_size, 512, 4096, dtype=dtype, device=device)
 
-        # Step 3: Broadcast bf16 embeddings from T5_RANK to all ranks
+        # Step 3: Broadcast embeddings WITHIN this DP group only (src = group's T5
+        # rank, group = this group's process group). With one group this is the
+        # original global broadcast; with DP groups each stream broadcasts its own
+        # prompt embeds independently.
         if dist.is_initialized():
-            dist.broadcast(prompt_embeds, src=T5_RANK)
+            from models.wan.tp_utils import get_tp_group
+            dist.broadcast(prompt_embeds, src=self.t5_rank, group=get_tp_group())
 
         self.conditional_dict = {
             'prompt_embeds': prompt_embeds,
@@ -497,7 +511,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         Returns decoded video on VAE_RANK, None on other ranks.
         """
-        if self.rank == VAE_RANK:
+        if self.rank == self.vae_rank:
             return self.vae.decode_to_pixel(latents)
         else:
             # Other ranks don't have VAE loaded — return None
@@ -506,7 +520,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
     def reset_decode_stream(self):
         """Reset the VAE temporal-cache stream — call ONCE per clip before the
         first (anchor) decode so the RF VAE streams its cache across blocks."""
-        if self.rank == VAE_RANK and self.vae is not None and hasattr(self.vae, "reset_decode_stream"):
+        if self.rank == self.vae_rank and self.vae is not None and hasattr(self.vae, "reset_decode_stream"):
             self.vae.reset_decode_stream()
 
     def encode_video_latents(self, video, num_lat_frames, height, width):
@@ -518,11 +532,13 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         on every rank.
         """
         lat_shape = (1, num_lat_frames, 16, height // 8, width // 8)
-        if self.rank == VAE_RANK and video is not None:
+        if self.rank == self.vae_rank and video is not None:
             latent = self.vae.encode_to_latent(video).to(dtype=self.dtype, device=self.device)
             latent = latent.contiguous()
         else:
             latent = torch.zeros(lat_shape, dtype=self.dtype, device=self.device)
         if dist.is_initialized():
-            dist.broadcast(latent, src=VAE_RANK)
+            # Broadcast WITHIN this DP group (src = group's VAE rank).
+            from models.wan.tp_utils import get_tp_group
+            dist.broadcast(latent, src=self.vae_rank, group=get_tp_group())
         return latent
