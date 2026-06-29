@@ -205,10 +205,10 @@ spec:
               - name: m-trn2
             requests:
               cpu: 22
-              memory: 440Gi
+              memory: 640Gi
             limits:
               cpu: 22
-              memory: 440Gi
+              memory: 640Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
