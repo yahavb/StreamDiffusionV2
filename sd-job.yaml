@@ -158,12 +158,19 @@ spec:
                   echo "[$NAME] NO frames in $FRAMES_DIR — mp4 not written"
                 fi
               }
-              # FPS MEASUREMENT: t2v from noise (no input-video dependency, matches the
-              # paper's benchmark setup) with the KNOWN-GOOD cat prompt (memory: confirmed
-              # good quality on these weights). We measure single-stream fps at 480p/5-step
-              # AND keep the mp4+frames so quality is validated, not just a number. (No
-              # "$IN_VIDEO" arg -> t2v path.)
+              # CP BASELINE — measure 14B@240p fps AND capture known-good video for BOTH
+              # modes (the CP build must reproduce both frame-for-frame):
+              #   1) t2v: from noise, known-good cat prompt (memory: confirmed good).
+              #   2) v2v: restyle the staged input ($IN_VIDEO) -> cyber-dog (noise_scale
+              #      in render(), schedule = fixed SDEdit truncated-descending).
+              # Two renders = ~2x time but the cold compile + NEFF cache is shared, so the
+              # 2nd render mostly reuses kernels.
               render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard, riding the waves at sunset, cinematic lighting, high quality, photorealistic"
+              if [ -n "$IN_VIDEO" ]; then
+                render dog "A highly detailed futuristic cybernetic dog running through a glowing neon field, metallic plates with iridescent blue and purple neon reflections, mechanical joints and wires, glowing sensor eyes, brushed-steel body with holographic circuits, cinematic, ultra-realistic, science-fiction style" "$IN_VIDEO"
+              else
+                echo "[v2v] skipped — INPUT_VIDEO_SRC not set/staged (t2v-only run)"
+              fi
 
               # ════════════════ PART B: HIGH-LEVEL profiler ONLY (no neuron-profiler/systrace) ═══════
               # The per-block "Block N: DiT=.. VAE=.. fps" timing in the render above IS the
@@ -214,7 +221,7 @@ spec:
               value: "exp/fps-1.3b"
             # FPS run = t2v from noise (no input video). Empty -> t2v path.
             - name: INPUT_VIDEO_SRC
-              value: ""  # t2v: pure fps measurement, no v2v input
+              value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v input (cat=t2v also runs)
             # TP degree (= --nproc_per_node). 1.3B has 12 heads -> TP must divide into
             # head count; TP-4 default, TP-6 is the useful max on one m-trn2 (8 cores).
             - name: NPROC
