@@ -68,23 +68,26 @@ spec:
               PROBE='import models.wan.neuron_layers as a; print("nki="+str(a.USE_NKI_KERNELS), "self_nki="+str(a.SELF_ATTN_NKI_AVAILABLE), "rope_nki="+str(a.ROPE_NKI_AVAILABLE), "ATTN_MULT="+str(a.ATTN_SEQLEN_MULTIPLE))'
               echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tr '\n' ' ')  USE_NKI_VAE=${USE_NKI_VAE:-unset} USE_VAE_COMPILE=${USE_VAE_COMPILE:-unset}"
 
-              # ─── 14B model weights + checkpoint (S3-backed cache) ───
-              WAN_14B_TAR="/var/mdl/wan_models/Wan2.1-T2V-14B.tar"
+              # ─── 1.3B model weights + DMD checkpoint (S3-backed cache) ───
+              # FPS path uses the 1.3B model (14B is fps-hopeless). Base Wan2.1-T2V-1.3B
+              # (UMT5-XXL + VAE live under it) + the official jerryfeng DMD checkpoint
+              # ckpts/wan_causal_dmd_v2v/model.pt (the known-good good-quality weights).
+              WAN_13B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
               mkdir -p wan_models
-              if [[ -f "$WAN_14B_TAR" ]]; then
-                cp "$WAN_14B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
+              if [[ -f "$WAN_13B_TAR" ]]; then
+                cp "$WAN_13B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
               else
-                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-14B', local_dir='wan_models/Wan2.1-T2V-14B', local_dir_use_symlinks=False)"
-                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-14B
-                mkdir -p "$(dirname $WAN_14B_TAR)" && cp /tmp/w.tar "$WAN_14B_TAR" && rm -f /tmp/w.tar
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN_13B_TAR)" && cp /tmp/w.tar "$WAN_13B_TAR" && rm -f /tmp/w.tar
               fi
-              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v_14b/model.pt"
-              mkdir -p ckpts/wan_causal_dmd_v2v_14b
+              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
+              mkdir -p ckpts/wan_causal_dmd_v2v
               if [[ -f "$SDV2_CKPT_CACHE" ]]; then
-                cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v_14b/model.pt
+                cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v/model.pt
               else
-                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v_14b/*'], local_dir='ckpts')"
-                mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v_14b/model.pt "$SDV2_CKPT_CACHE"
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v/*'], local_dir='ckpts')"
+                mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v/model.pt "$SDV2_CKPT_CACHE"
               fi
               echo "Model weights ready!"
 
@@ -123,9 +126,18 @@ spec:
                 fi
               fi
 
-              BENCH_CMD="torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
-                --config streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml \
-                --num_frames 81 --height 720 --width 1248 --device neuron"
+              # FPS-OPTIMIZED: 1.3B (14B is fps-hopeless) at 480p, all quality-neutral
+              # levers ON (NKI attn/rope kernels via USE_NKI_KERNELS, VAE optimized).
+              # 5-step = quality floor. STEPS env (default 5) lets us sweep fps-vs-quality
+              # without editing the config. NPROC = TP degree (cap 6: 12 heads / TP must
+              # be integer; TP-4 default). Single-stream fps is what this measures; 8 chips
+              # only multiply via independent data-parallel streams, not one faster stream.
+              NPROC="${NPROC:-4}"
+              STEPS="${STEPS:-700,500,400,200,0}"
+              BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
+                --config streamv2v/configs/wan_causal_fps_neuron.yaml \
+                --steps $STEPS \
+                --num_frames 81 --height 480 --width 832 --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
               # $3 (optional) = input video path -> v2v restyle. Omit -> t2v from noise.
@@ -143,13 +155,12 @@ spec:
                   echo "[$NAME] NO frames in $FRAMES_DIR — mp4 not written"
                 fi
               }
-              # v2v restyle TEST (subject-matched): input is a golden puppy running in
-              # grass; the prompt restyles it into a CYBERNETIC DOG. Matching the prompt
-              # subject (dog) to the input subject (dog) keeps the puppy's shape + motion
-              # and tests RESTYLE quality — the fair v2v test (vs the bird prompt, which
-              # fought the dog-shaped input). Judge: does it keep dog form + gain cyber
-              # texture, and is it sharp/realistic (not cartoon)? noise_scale set in render().
-              render dog "A highly detailed futuristic cybernetic dog running through a glowing neon field, blending canine grace with advanced robotics. Its fur is metallic plates with iridescent reflections of blue and purple neon light, each joint covered by intricate mechanical gears and wires. The eyes glow with a pulsating core, scanning ahead like high-tech sensors. The body is layered brushed steel, partially transparent with holographic circuits flowing through it. Behind it a vast futuristic landscape with holographic billboards and neon-lit structures. The atmosphere is cinematic, ultra-realistic, and science-fiction inspired, combining photorealism with a high-tech futuristic style." "$IN_VIDEO"
+              # FPS MEASUREMENT: t2v from noise (no input-video dependency, matches the
+              # paper's benchmark setup) with the KNOWN-GOOD cat prompt (memory: confirmed
+              # good quality on these weights). We measure single-stream fps at 480p/5-step
+              # AND keep the mp4+frames so quality is validated, not just a number. (No
+              # "$IN_VIDEO" arg -> t2v path.)
+              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard, riding the waves at sunset, cinematic lighting, high quality, photorealistic"
 
               # ════════════════ PART B: HIGH-LEVEL profiler ONLY (no neuron-profiler/systrace) ═══════
               # The per-block "Block N: DiT=.. VAE=.. fps" timing in the render above IS the
@@ -197,10 +208,18 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "exp/sdv2-14b"
-            # v2v input video on the PVC — staged to /tmp at job start (off critical path).
+              value: "exp/fps-1.3b"
+            # FPS run = t2v from noise (no input video). Empty -> t2v path.
             - name: INPUT_VIDEO_SRC
-              value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v: real golden-puppy input
+              value: ""  # t2v: pure fps measurement, no v2v input
+            # TP degree (= --nproc_per_node). 1.3B has 12 heads -> TP must divide into
+            # head count; TP-4 default, TP-6 is the useful max on one m-trn2 (8 cores).
+            - name: NPROC
+              value: "4"
+            # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
+            # weights; set e.g. "500,0" to sweep faster-but-worse points.
+            - name: STEPS
+              value: "700,500,400,200,0"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL

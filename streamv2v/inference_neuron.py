@@ -73,6 +73,11 @@ def parse_args():
     # v2v: input video to restyle (the paper's actual mode). If unset -> t2v from noise.
     parser.add_argument("--video_path", type=str, default=None)
     parser.add_argument("--noise_scale", type=float, default=0.8)
+    # FPS sweep: override the config's denoising_step_list from the CLI so one
+    # job can measure fps-vs-quality at several step counts. Comma-separated
+    # descending timesteps ending in 0, e.g. "0" (1-step), "500,0" (2-step),
+    # "700,400,0" (3-step). Empty -> use the config's list unchanged.
+    parser.add_argument("--steps", type=str, default=None)
     return parser.parse_args()
 
 
@@ -407,6 +412,17 @@ def main():
     for k, v in config.items():
         if not hasattr(args, k) or getattr(args, k) is None:
             setattr(args, k, v)
+
+    # FPS sweep: CLI --steps OVERRIDES the config's denoising_step_list so one
+    # job can sweep step counts. Must be descending and end at 0 (the schedule
+    # invariant the loop relies on).
+    if getattr(args, 'steps', None):
+        parsed = [int(s) for s in str(args.steps).split(',') if s.strip() != '']
+        assert parsed[-1] == 0, f"--steps must end in 0, got {parsed}"
+        assert all(parsed[i] > parsed[i+1] for i in range(len(parsed)-1)), \
+            f"--steps must be strictly descending, got {parsed}"
+        args.denoising_step_list = parsed
+        print(f"[FPS sweep] denoising_step_list overridden from --steps: {parsed}")
 
     # Ensure required fields
     if not hasattr(args, 'denoising_step_list'):
