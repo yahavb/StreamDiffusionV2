@@ -233,7 +233,7 @@ spec:
             # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
             # weights; set e.g. "500,0" to sweep faster-but-worse points.
             - name: STEPS
-              value: "700,500,200,0"
+              value: "700,500,400,200,0"
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)
             - name: NEURON_RT_LOG_LEVEL
