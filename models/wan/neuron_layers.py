@@ -415,6 +415,16 @@ class CausalWanSelfAttention(nn.Module):
         self._self_attn_kernel = wan_flash_self_attn_nki
         self.register_buffer('identity', torch.eye(self.head_dim), persistent=False)
         self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
+        # #20 KV-prefix cache: the anchor+window prefix assembled into the attention
+        # buffer is IDENTICAL across all denoise steps of a block (kv_cache only
+        # updates on the block's first step). Caching it per-layer and rebuilding
+        # only the small current-block tail per step removes the dominant per-step
+        # copy NEFFs (41% DMA in the profiler). Gated; persists across steps.
+        self._kv_prefix_cache = os.environ.get("USE_KV_PREFIX_CACHE", "").lower() in ("1", "true")
+        self._pfx_k = None        # per-layer persistent attention buffers (k, v)
+        self._pfx_v = None
+        self._pfx_start = -1      # current_start the cached prefix was built for
+        self._pfx_offset = 0      # prefix length (tail written at [offset:offset+valid])
 
     def cache_copy_inplace(self, k_dst, k_src, v_dst=None, v_src=None):
         k_dst.copy_(k_src)
@@ -546,32 +556,59 @@ class CausalWanSelfAttention(nn.Module):
                 self.cache_copy_inplace(buffer_k[0, :self.block_length], anchor_roped[0])
             k_len_int = cache_len
         else:
+            # #20: the anchor+window PREFIX (built into buffer_k/v at [0:offset]) is
+            # identical across all denoise steps of a block — kv_cache only changes on
+            # the block's first step. When USE_KV_PREFIX_CACHE, assemble the prefix
+            # into a PER-LAYER persistent buffer once per block (detected by a change
+            # in current_start), and on later steps skip the big prefix copies and
+            # write only the small current-block tail. Same math, ~1/num_steps the DMA.
+            use_pfx = self._kv_prefix_cache
+            if use_pfx:
+                if (self._pfx_k is None) or (self._pfx_k.shape != buffer_k.shape):
+                    self._pfx_k = torch.zeros_like(buffer_k)
+                    self._pfx_v = torch.zeros_like(buffer_v)
+                    self._pfx_start = -1
+                dst_k, dst_v = self._pfx_k, self._pfx_v
+                prefix_fresh = (self._pfx_start == int(current_start))
+            else:
+                dst_k, dst_v = buffer_k, buffer_v
+                prefix_fresh = False
+
             offset = 0
             if local_start_index > 0:
-                wc_max = self.max_attention_size - valid_tokens - self.block_length
-                wc_end = local_start_index
-                wc_start = max(self.block_length, wc_end - wc_max)
-                wc_len = wc_end - wc_start
-                wc_frame_length = wc_len // self.frame_length
-                rope_start_frame = current_start_frame - wc_frame_length - num_frames_per_block
-                anchor_roped = self._nki_rope_apply(
-                    kv_cache["k"][0, :self.block_length].unsqueeze(0),
-                    grid_sizes_one_block, freqs_cos, freqs_sin,
-                    start_frame=torch.tensor(rope_start_frame, device=v.device))
-                self.cache_copy_inplace(
-                    buffer_k[0, :self.block_length], anchor_roped[0],
-                    buffer_v[0, :self.block_length], kv_cache["v"][0, :self.block_length])
-                offset = self.block_length
-                if wc_len > 0:
+                if not prefix_fresh:
+                    wc_max = self.max_attention_size - valid_tokens - self.block_length
+                    wc_end = local_start_index
+                    wc_start = max(self.block_length, wc_end - wc_max)
+                    wc_len = wc_end - wc_start
+                    wc_frame_length = wc_len // self.frame_length
+                    rope_start_frame = current_start_frame - wc_frame_length - num_frames_per_block
+                    anchor_roped = self._nki_rope_apply(
+                        kv_cache["k"][0, :self.block_length].unsqueeze(0),
+                        grid_sizes_one_block, freqs_cos, freqs_sin,
+                        start_frame=torch.tensor(rope_start_frame, device=v.device))
                     self.cache_copy_inplace(
-                        buffer_k[0, offset:offset + wc_len], kv_cache["k"][0, wc_start:wc_start + wc_len],
-                        buffer_v[0, offset:offset + wc_len], kv_cache["v"][0, wc_start:wc_start + wc_len])
-                offset += wc_len
+                        dst_k[0, :self.block_length], anchor_roped[0],
+                        dst_v[0, :self.block_length], kv_cache["v"][0, :self.block_length])
+                    offset = self.block_length
+                    if wc_len > 0:
+                        self.cache_copy_inplace(
+                            dst_k[0, offset:offset + wc_len], kv_cache["k"][0, wc_start:wc_start + wc_len],
+                            dst_v[0, offset:offset + wc_len], kv_cache["v"][0, wc_start:wc_start + wc_len])
+                    offset += wc_len
+                    if use_pfx:
+                        self._pfx_offset = offset
+                else:
+                    # Prefix already in dst_k/v from this block's first step — reuse it.
+                    offset = self._pfx_offset
 
             self.cache_copy_inplace(
-                buffer_k[0, offset:offset + valid_tokens], roped_key[0, :valid_tokens],
-                buffer_v[0, offset:offset + valid_tokens], v[0, :valid_tokens])
+                dst_k[0, offset:offset + valid_tokens], roped_key[0, :valid_tokens],
+                dst_v[0, offset:offset + valid_tokens], v[0, :valid_tokens])
             k_len_int = offset + valid_tokens
+            if use_pfx:
+                self._pfx_start = int(current_start)
+                buffer_k, buffer_v = dst_k, dst_v  # attention reads from the per-layer buffer
 
         # Attention
         if roped_query.device.type == "neuron" and self._nki_available:
