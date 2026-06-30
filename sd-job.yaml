@@ -205,10 +205,10 @@ spec:
               - name: s-lnc1-trn2
             requests:
               cpu: 22
-              memory: 1200Gi
+              memory: 800Gi
             limits:
               cpu: 22
-              memory: 1200Gi
+              memory: 800Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -233,7 +233,7 @@ spec:
             # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
             # weights; set e.g. "500,0" to sweep faster-but-worse points.
             - name: STEPS
-              value: "700,400,0"
+              value: "700,500,200,0"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
