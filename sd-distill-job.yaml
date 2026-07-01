@@ -1,7 +1,7 @@
 # StreamDiffusion-v2 DISTILLATION job — DMD distill 14B t2v teacher -> few-step 1.3B
 # causal student, ON TRAINIUM. Produces a checkpoint drop-in for sd-job.yaml.
 #
-# Cores: 16 LNC1 (m-lnc1-trn2 = 2 chips x 8 cores).
+# Cores: 16 LNC1 (l-trn2 = 2 chips x 8 cores).
 #   ranks 0-7  = 14B teacher (real_score, FROZEN, TP-8, ~3.5GB/core -> fits 12GB)
 #   ranks 8-15 = student G + fake_score (TP-8, trainable, ~8GB/core -> fits 12GB)
 # (Trainer must place nets on these two rank groups — see distill_sdv2.py TODO.)
@@ -29,8 +29,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-lnc1-trn2
-          resourceClaimTemplateName: m-lnc1-trn2
+        - name: l-trn2
+          resourceClaimTemplateName: l-trn2
       containers:
         - name: sd-distill
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -105,7 +105,7 @@ spec:
               ls -lhR "$FINAL" | head -40
           resources:
             claims:
-              - name: m-lnc1-trn2
+              - name: l-trn2
             requests:
               cpu: 80
               memory: 512Gi
@@ -133,7 +133,7 @@ spec:
             - name: CAPTIONS_SRC
               value: "/var/mdl/video-distill/captions-20260701-062139.jsonl"
             - name: NEURON_LOGICAL_NC_CONFIG
-              value: "1"             # LNC1 -> 8 logical cores for NPROC=8
+              value: "2"             # l-trn2 = LNC2, 24GB/core (TP-4 packs 2x mem/core)
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
               value: "134217728"
             - name: NEURON_RT_LOG_LEVEL
