@@ -88,23 +88,20 @@ def parse_args():
 # ── distributed / device ────────────────────────────────────────────────────
 
 def init_dist():
-    """Neuron distributed init. torch_neuronx makes 'xla'/neuron device train with
-    native autograd; falls back to CPU/GPU for a tiny smoke test off-device."""
-    backend = "xla" if os.environ.get("RANK") else None
-    device = "cpu"
-    try:
-        import torch_neuronx  # noqa: F401
-        import torch_xla.core.xla_model as xm
-        device = xm.xla_device()
-        if os.environ.get("RANK"):
-            dist.init_process_group(backend="xla")
-        LOGGER.info(f"Neuron/XLA device: {device}")
-        return device, xm
-    except Exception as e:
-        LOGGER.warning(f"torch_neuronx unavailable ({e}); CPU smoke-test mode")
-        if os.environ.get("RANK"):
-            dist.init_process_group(backend="gloo")
-        return torch.device("cpu"), None
+    """Neuron distributed init — EXACTLY the proven inference path (eager torch_neuronx,
+    NOT torch_xla): dist backend 'neuron' + torch.neuron.set_device(local_rank), then
+    device='neuron'. Training uses native autograd (loss.backward(); optimizer.step()).
+    Falls back to CPU only when not launched under torchrun (local dev)."""
+    if "LOCAL_RANK" not in os.environ:
+        LOGGER.warning("no LOCAL_RANK (not torchrun) -> CPU dev mode")
+        return torch.device("cpu")
+    import torch_neuronx  # noqa: F401
+    dist.init_process_group(backend="neuron")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.neuron.set_device(local_rank)
+    LOGGER.info(f"Neuron distributed: rank={dist.get_rank()}/{dist.get_world_size()} "
+                f"local_rank={local_rank}, device=neuron")
+    return torch.device("neuron")
 
 
 # ── data ────────────────────────────────────────────────────────────────────
@@ -206,7 +203,7 @@ def fake_score_loss(x0_student, fake_score, conditional_dict, scheduler, device)
 
 def main():
     args = parse_args()
-    device, xm = init_dist()
+    device = init_dist()
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
 
@@ -288,7 +285,7 @@ def main():
                                      kv_cache=None, crossattn_cache=None)
                 loss_g = loss_g + F.mse_loss(x0_student, tgt)
             opt_g.zero_grad(); loss_g.backward()
-            (xm.optimizer_step(opt_g) if xm else opt_g.step())
+            opt_g.step()
             gl = float(loss_g.detach())
         else:
             gl = float("nan")
@@ -296,7 +293,7 @@ def main():
         # fake_score always tracks G
         loss_f = fake_score_loss(x0_student, fake_score, cond, scheduler, device)
         opt_f.zero_grad(); loss_f.backward()
-        (xm.optimizer_step(opt_f) if xm else opt_f.step())
+        opt_f.step()
 
         if it % 20 == 0:
             LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_fake={float(loss_f.detach()):.4f}")
