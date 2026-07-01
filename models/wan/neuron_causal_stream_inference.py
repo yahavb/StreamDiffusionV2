@@ -169,23 +169,37 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         else:
             self.text_encoder = None
 
-        # Initialize VAE (only on this group's VAE rank — with torch.compile)
-        if self.rank == self.vae_rank:
-            LOGGER.info(f"Loading VAE decoder on rank {self.rank} (dp_group {self.dp_group_id})...")
+        # VAE channel tensor-parallel: VAE_TP_DEGREE ranks starting at vae_rank
+        # decode TOGETHER (each holds a channel shard of the decoder convs and
+        # all-reduces inside them). Default 1 = single-rank (original behavior).
+        # The VAE is ~7-8% of the block; VAE-TP=2 roughly halves the conv work.
+        self.vae_tp_degree = int(os.environ.get("VAE_TP_DEGREE", "1"))
+        self.vae_tp_ranks = [self.tp_group_base + VAE_RANK + i
+                             for i in range(self.vae_tp_degree)]
+        is_vae_rank = self.rank in self.vae_tp_ranks
+
+        # Initialize VAE (on every VAE-TP rank — with torch.compile)
+        if is_vae_rank:
+            LOGGER.info(f"Loading VAE decoder on rank {self.rank} (dp_group {self.dp_group_id}, "
+                        f"vae_tp={self.vae_tp_degree} ranks={self.vae_tp_ranks})...")
             self.vae = NeuronWanVAEWrapper(
                 vae_pth=vae_path, device=device)
-            # Compile VAE for fast decode — gated by USE_VAE_COMPILE (default on).
-            # At 480p, torch.compile fuses the decoder's temporal upsample into a
-            # giant aten::cat (27x [1,9,3,480,832]) that the Neuron compile service
-            # fails to compile (ConnectToService errno=2). Setting USE_VAE_COMPILE=0
-            # runs the VAE EAGER (per-op NEFFs) -> avoids the fused cat -> 480p works.
             self.vae._ensure_model()
-            if os.environ.get("USE_VAE_COMPILE", "true").lower() in ("1", "true"):
+            # Channel-shard the decoder across the VAE-TP ranks (RF VAE variant).
+            if self.vae_tp_degree > 1:
+                from modules.vae_tp_rf import create_vae_tp_group, shard_vae_model_tp
+                create_vae_tp_group(self.vae_tp_ranks)
+                vtp_rank = self.vae_tp_ranks.index(self.rank)
+                shard_vae_model_tp(self.vae._model, vtp_rank, self.vae_tp_degree)
+                LOGGER.info(f"VAE channel-TP sharded: vae_tp_rank={vtp_rank}/{self.vae_tp_degree}")
+            # Compile VAE for fast decode — gated by USE_VAE_COMPILE (default on).
+            # NOTE: VAE-TP shards change channel dims off P=128; keep EAGER when sharded.
+            if self.vae_tp_degree == 1 and os.environ.get("USE_VAE_COMPILE", "true").lower() in ("1", "true"):
                 self.vae._model = torch.compile(
                     self.vae._model, backend='neuron', dynamic=False)
                 LOGGER.info("VAE compiled with torch.compile(backend='neuron')")
             else:
-                LOGGER.info("VAE running EAGER (USE_VAE_COMPILE=0) — avoids 480p fused-cat crash")
+                LOGGER.info("VAE running EAGER (sharded or USE_VAE_COMPILE=0)")
         else:
             self.vae = None
 
@@ -507,20 +521,31 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         return denoised_pred
 
     def decode_latents(self, latents):
-        """Decode latents to pixel space using VAE (only on VAE_RANK).
+        """Decode latents to pixel space using VAE.
 
-        Returns decoded video on VAE_RANK, None on other ranks.
+        Single-rank (vae_tp_degree==1): only vae_rank decodes, returns video there.
+        VAE channel-TP (>1): ALL vae_tp_ranks decode together (sharded convs
+        all-reduce inside). They need identical latents, so vae_rank broadcasts
+        the latents to the VAE-TP group first. Only vae_rank returns the video
+        (all ranks compute the full output via all-reduce, but we keep one copy).
         """
-        if self.rank == self.vae_rank:
-            return self.vae.decode_to_pixel(latents)
-        else:
-            # Other ranks don't have VAE loaded — return None
+        if self.vae_tp_degree <= 1:
+            return self.vae.decode_to_pixel(latents) if self.rank == self.vae_rank else None
+
+        # VAE-TP: broadcast latents from vae_rank to the whole VAE-TP group.
+        if self.rank not in self.vae_tp_ranks:
             return None
+        from modules.vae_tp_rf import get_vae_tp_group
+        latents = latents.contiguous()
+        dist.broadcast(latents, src=self.vae_rank, group=get_vae_tp_group())
+        video = self.vae.decode_to_pixel(latents)
+        return video if self.rank == self.vae_rank else None
 
     def reset_decode_stream(self):
         """Reset the VAE temporal-cache stream — call ONCE per clip before the
-        first (anchor) decode so the RF VAE streams its cache across blocks."""
-        if self.rank == self.vae_rank and self.vae is not None and hasattr(self.vae, "reset_decode_stream"):
+        first (anchor) decode so the RF VAE streams its cache across blocks.
+        Every VAE-TP rank holds its own cache -> reset on all of them."""
+        if self.vae is not None and hasattr(self.vae, "reset_decode_stream"):
             self.vae.reset_decode_stream()
 
     def encode_video_latents(self, video, num_lat_frames, height, width):
