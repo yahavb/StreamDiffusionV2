@@ -43,6 +43,12 @@ torch._dynamo.config.cache_size_limit = 128
 
 
 def _compile(mod_or_fn):
+    # VAE channel-TP inserts an all_reduce (torch.compiler.disable) inside the conv/
+    # attention path; a fullgraph=True compile can't trace through it. When VAE_TP is
+    # on, make @_compile a NO-OP so the whole VAE runs eager and the all-reduce works.
+    import os as _os
+    if int(_os.environ.get("VAE_TP_DEGREE", "1")) > 1:
+        return mod_or_fn
     return torch.compile(mod_or_fn, backend="neuron", dynamic=False, fullgraph=True)
 
 
