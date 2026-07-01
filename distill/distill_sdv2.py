@@ -36,6 +36,16 @@ import logging
 import os
 import sys
 
+# Repo root on sys.path — this script lives in distill/, but imports models.wan.*
+# and (via wan_base) modules.* which live at the repo root. Mirror how the
+# root-level entrypoints resolve imports.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+_WAN_BASE = os.path.join(_ROOT, "models", "wan", "wan_base")
+if os.path.isdir(_WAN_BASE) and _WAN_BASE not in sys.path:
+    sys.path.insert(0, _WAN_BASE)
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
