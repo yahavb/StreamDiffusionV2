@@ -107,10 +107,10 @@ spec:
             claims:
               - name: m-lnc1-trn2
             requests:
-              cpu: 40
+              cpu: 80
               memory: 512Gi
             limits:
-              cpu: 40
+              cpu: 80
               memory: 512Gi
           volumeMounts:
             - name: dshm
@@ -123,9 +123,9 @@ spec:
             - name: BRANCH
               value: "exp/fps-1.3b"
             - name: NPROC
-              value: "8"            # SMOKE TEST: 8 cores, single TP-8 group (teacher+student co-located)
+              value: "4"            # SMOKE: TP-4 works for BOTH 14B(40h) and 1.3B(12h); 8 breaks 1.3B
             - name: TP_DEGREE
-              value: "8"             # each net TP-8; teacher group + student group
+              value: "4"             # 1.3B student caps at TP-4 (12 heads); 14B ok too
             - name: STEPS
               value: "700,0"         # 2-step student (fps lever). "0" = 1-step.
             - name: ITERS
