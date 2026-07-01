@@ -226,15 +226,22 @@ def main():
     prompts = load_prompts(args.captions)
 
     # 2) three networks
+    # STUDENT inits from BASE 1.3B (we're CREATING the DMD ckpt, not consuming one).
+    # Clear generator_ckpt + set DISTILL_BASE_ONLY so the wrapper skips its
+    # inference-time DMD-required guard and runs on base weights.
+    args.generator_ckpt = None
+    os.environ["DISTILL_BASE_ONLY"] = "1"
     LOGGER.info("building student G (init base 1.3B, trainable)...")
     student = build_student_pipeline(args, device, dtype)      # generation path (== inference)
     G = student.generator                                       # the trainable DiT
-    G.requires_grad_(True)
+    G.model.requires_grad_(True)
 
-    LOGGER.info("building fake_score (1.3B, trainable)...")
+    LOGGER.info("building fake_score (1.3B, trainable, base init)...")
     fake_score = build_neuron_generator(
         args.student_base, None, args, device, trainable=True, tp_degree=args.tp_degree)
 
+    # teacher DOES need its 14B DMD ckpt — re-arm the guard.
+    os.environ["DISTILL_BASE_ONLY"] = ""
     LOGGER.info("building real_score = 14B t2v teacher (FROZEN)...")
     teacher_args = OmegaConf.create(dict(vars(args)))
     teacher_args.model_type = "T2V-14B"

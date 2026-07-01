@@ -247,20 +247,37 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
             state_dict = load_file(base_weights)
             self.model.load_state_dict(state_dict, strict=False)
 
-        # Load fine-tuned (DMD-distilled) checkpoint. This is REQUIRED: the base Wan2.1
+        # DISTILLATION: the student legitimately starts from BASE weights (we are
+        # CREATING the DMD checkpoint, not consuming one). DISTILL_BASE_ONLY=1 skips
+        # the DMD-required guard and runs on base weights. Inference path is untouched.
+        if os.environ.get("DISTILL_BASE_ONLY", "").lower() in ("1", "true") and not checkpoint_path:
+            LOGGER.info("DISTILL_BASE_ONLY: init from base Wan weights, no DMD ckpt (training).")
+            checkpoint_path = None
+            self._skip_dmd = True
+        else:
+            self._skip_dmd = False
+
+        # Load fine-tuned (DMD-distilled) checkpoint. REQUIRED for INFERENCE: base Wan2.1
         # weights are not causal/distilled, so without this the model outputs noise.
-        if not checkpoint_path:
+        if not self._skip_dmd and not checkpoint_path:
             raise ValueError(
                 "generator_ckpt is not set — the DMD checkpoint is required (base Wan "
-                "weights alone produce noise). Set generator_ckpt in the config.")
-        if not os.path.exists(checkpoint_path):
+                "weights alone produce noise). Set generator_ckpt in the config, or set "
+                "DISTILL_BASE_ONLY=1 for distillation training.")
+        if not self._skip_dmd and not os.path.exists(checkpoint_path):
             raise FileNotFoundError(
                 f"generator_ckpt not found: {checkpoint_path}. Download the official "
                 "StreamDiffusionV2 checkpoint (jerryfeng/StreamDiffusionV2 -> "
                 "ckpts/wan_causal_dmd_v2v/model.pt) — do NOT substitute RollingForcing.")
 
-        ckpt = torch.load(checkpoint_path, map_location='cpu')
-        if use_ema and 'generator_ema' in ckpt:
+        if self._skip_dmd:
+            # base weights already loaded above; no DMD ckpt to merge (training init)
+            ckpt = None
+        else:
+            ckpt = torch.load(checkpoint_path, map_location='cpu')
+        if ckpt is None:
+            sd = None
+        elif use_ema and 'generator_ema' in ckpt:
             sd = ckpt['generator_ema']
         elif 'generator' in ckpt:
             sd = ckpt['generator']
@@ -268,28 +285,29 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
             sd = ckpt['state_dict']
         else:
             sd = ckpt
-        cleaned = OrderedDict()
-        for k, v in sd.items():
-            k = k.replace("_fsdp_wrapped_module.", "")
-            k = k.replace("model.", "", 1) if k.startswith("model.") else k
-            cleaned[k] = v
-        # strict=False tolerates extra keys (e.g. logvar/scheduler buffers), but we MUST
-        # verify the DiT weights actually landed — a silent mismatch loads base weights
-        # and yields noise that looks like a "successful" run.
-        result = self.model.load_state_dict(cleaned, strict=False)
-        model_keys = set(self.model.state_dict().keys())
-        matched = len(model_keys) - len(set(result.missing_keys))
-        LOGGER.info(
-            "Loaded DMD checkpoint %s: matched %d/%d model params (missing=%d, unexpected=%d)",
-            checkpoint_path, matched, len(model_keys),
-            len(result.missing_keys), len(result.unexpected_keys))
-        if result.missing_keys:
-            LOGGER.warning("  first missing keys: %s", result.missing_keys[:8])
-        # Guard: if almost nothing matched, the checkpoint is wrong/incompatible.
-        if matched < 0.5 * len(model_keys):
-            raise RuntimeError(
-                f"DMD checkpoint matched only {matched}/{len(model_keys)} params — "
-                f"wrong checkpoint format or key naming ({checkpoint_path}).")
+        if sd is not None:
+            cleaned = OrderedDict()
+            for k, v in sd.items():
+                k = k.replace("_fsdp_wrapped_module.", "")
+                k = k.replace("model.", "", 1) if k.startswith("model.") else k
+                cleaned[k] = v
+            # strict=False tolerates extra keys (e.g. logvar/scheduler buffers), but we MUST
+            # verify the DiT weights actually landed — a silent mismatch loads base weights
+            # and yields noise that looks like a "successful" run.
+            result = self.model.load_state_dict(cleaned, strict=False)
+            model_keys = set(self.model.state_dict().keys())
+            matched = len(model_keys) - len(set(result.missing_keys))
+            LOGGER.info(
+                "Loaded DMD checkpoint %s: matched %d/%d model params (missing=%d, unexpected=%d)",
+                checkpoint_path, matched, len(model_keys),
+                len(result.missing_keys), len(result.unexpected_keys))
+            if result.missing_keys:
+                LOGGER.warning("  first missing keys: %s", result.missing_keys[:8])
+            # Guard: if almost nothing matched, the checkpoint is wrong/incompatible.
+            if matched < 0.5 * len(model_keys):
+                raise RuntimeError(
+                    f"DMD checkpoint matched only {matched}/{len(model_keys)} params — "
+                    f"wrong checkpoint format or key naming ({checkpoint_path}).")
 
         # Apply TP-4 sharding BEFORE moving to device (shard on CPU, then move)
         if tp_degree > 1:
