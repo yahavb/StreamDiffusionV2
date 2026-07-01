@@ -251,10 +251,7 @@ spec:
             - name: STEPS
               value: "700,500,400,200,0"
             - name: USE_KV_PREFIX_CACHE
-              value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)
-            - name: VAE_TP_DEGREE
-              value: "2"  # channel-parallel VAE across ranks 0,1 (VAE ~8% of block)
-            - name: NEURON_RT_LOG_LEVEL
+              value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
               value: "ERROR"
