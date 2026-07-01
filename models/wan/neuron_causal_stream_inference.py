@@ -190,7 +190,9 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 from modules.vae_tp_rf import create_vae_tp_group, shard_vae_model_tp
                 create_vae_tp_group(self.vae_tp_ranks)
                 vtp_rank = self.vae_tp_ranks.index(self.rank)
-                shard_vae_model_tp(self.vae._model, vtp_rank, self.vae_tp_degree)
+                # self.vae._model is the RF WanVAEWrapper; the WanVAE_ (with .decoder)
+                # is at ._model.model. shard_vae_model_tp expects the WanVAE_.
+                shard_vae_model_tp(self.vae._model.model, vtp_rank, self.vae_tp_degree)
                 LOGGER.info(f"VAE channel-TP sharded: vae_tp_rank={vtp_rank}/{self.vae_tp_degree}")
             # Compile VAE for fast decode — gated by USE_VAE_COMPILE (default on).
             # NOTE: VAE-TP shards change channel dims off P=128; keep EAGER when sharded.
