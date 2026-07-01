@@ -1,0 +1,162 @@
+# StreamDiffusion-v2 DISTILLATION job — DMD distill 14B t2v teacher -> few-step 1.3B
+# causal student, ON TRAINIUM. Produces a checkpoint drop-in for sd-job.yaml.
+#
+# Cores: 16 LNC1 (m-lnc1-trn2 = 2 chips x 8 cores).
+#   ranks 0-7  = 14B teacher (real_score, FROZEN, TP-8, ~3.5GB/core -> fits 12GB)
+#   ranks 8-15 = student G + fake_score (TP-8, trainable, ~8GB/core -> fits 12GB)
+# (Trainer must place nets on these two rank groups — see distill_sdv2.py TODO.)
+#
+# Output: checkpoints/distilled/model.pt as {'generator': model.* sd}, copied to
+#   /var/mdl/video-distill/checkpoints/<TS>/model.pt for sd-job to consume.
+#
+# Launch:
+#   kubectl delete job sd-distill --ignore-not-found
+#   kubectl apply -f sd-distill-job.yaml
+#   kubectl logs -f job/sd-distill
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sd-distill
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: sd-distill
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
+      containers:
+        - name: sd-distill
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              BRANCH="${BRANCH:-exp/fps-1.3b}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/StreamDiffusionV2.git REPO
+              cd REPO
+
+              GIT_SHA=$(git rev-parse HEAD)
+              echo "┌── PROVENANCE ──"
+              echo "│ branch : $(git rev-parse --abbrev-ref HEAD) (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              export RF_DEVICE_BACKEND=neuron
+              uv pip install -r requirements-neuron.txt || pip install -r requirements-neuron.txt
+              uv pip install "setuptools<81" || pip install "setuptools<81"
+
+              # ─── weights: 1.3B student base + 14B teacher base + 14B DMD ckpt (S3 cache) ───
+              mkdir -p wan_models ckpts/wan_causal_dmd_v2v_14b
+              WAN13="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
+              WAN14="/var/mdl/wan_models/Wan2.1-T2V-14B.tar"
+              CK14="/var/mdl/ckpts/wan_causal_dmd_v2v_14b/model.pt"
+              [[ -f "$WAN13" ]] && { cp "$WAN13" /tmp/a.tar && tar xf /tmp/a.tar -C wan_models/ && rm -f /tmp/a.tar; } \
+                || python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+              [[ -f "$WAN14" ]] && { cp "$WAN14" /tmp/b.tar && tar xf /tmp/b.tar -C wan_models/ && rm -f /tmp/b.tar; } \
+                || python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-14B', local_dir='wan_models/Wan2.1-T2V-14B', local_dir_use_symlinks=False)"
+              [[ -f "$CK14" ]] && cp "$CK14" ckpts/wan_causal_dmd_v2v_14b/model.pt \
+                || python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v_14b/*'], local_dir='ckpts')"
+              echo "weights ready"
+
+              # ─── stage the caption corpus from S3 to LOCAL /tmp (off critical path) ───
+              CAP_SRC="${CAPTIONS_SRC:-/var/mdl/video-distill/captions-20260701-062139.jsonl}"
+              CAP=/tmp/captions.jsonl
+              cp "$CAP_SRC" "$CAP" && echo "captions: $(wc -l < "$CAP") prompts from $CAP_SRC"
+
+              # ─── one timestamped output dir; work local, copy to S3 at end ───
+              TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
+              RUN=/tmp/distill/$TS; mkdir -p "$RUN"
+              FINAL=/var/mdl/video-distill/checkpoints/$TS
+              exec > >(tee "$RUN/train.log") 2>&1
+              echo "RUN=$RUN  (final -> $FINAL)"
+
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
+
+              # ─── DMD distillation train ───
+              # NPROC=16 (all cores). Trainer splits: teacher ranks 0-7, student+fake 8-15.
+              torchrun --nproc_per_node="${NPROC:-16}" distill/distill_sdv2.py \
+                --config streamv2v/configs/wan_causal_fps_neuron.yaml \
+                --captions "$CAP" \
+                --teacher_ckpt ckpts/wan_causal_dmd_v2v_14b/model.pt \
+                --teacher_base wan_models/Wan2.1-T2V-14B \
+                --student_base wan_models/Wan2.1-T2V-1.3B \
+                --steps "${STEPS:-700,0}" \
+                --iters "${ITERS:-500}" \
+                --tp_degree "${TP_DEGREE:-8}" \
+                --height 360 --width 640 \
+                --out "$RUN/model.pt" || echo "TRAIN FAILED"
+
+              # ─── copy checkpoint + log to S3 ONCE at end ───
+              mkdir -p "$FINAL"
+              cp -r "$RUN"/. "$FINAL"/ 2>&1 || echo "copy to /var/mdl failed"
+              echo "=== DONE. checkpoint at $FINAL/model.pt (drop into sd-job generator_ckpt) ==="
+              ls -lhR "$FINAL" | head -40
+          resources:
+            claims:
+              - name: m-lnc1-trn2
+            requests:
+              cpu: 44
+              memory: 1400Gi
+            limits:
+              cpu: 44
+              memory: 1400Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "exp/fps-1.3b"
+            - name: NPROC
+              value: "16"            # all 16 LNC1 cores
+            - name: TP_DEGREE
+              value: "8"             # each net TP-8; teacher group + student group
+            - name: STEPS
+              value: "700,0"         # 2-step student (fps lever). "0" = 1-step.
+            - name: ITERS
+              value: "500"           # 100-prompt dry run — plumbing shakeout, not a good ckpt
+            - name: CAPTIONS_SRC
+              value: "/var/mdl/video-distill/captions-20260701-062139.jsonl"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"             # LNC1 -> 16 logical cores across the 2 chips
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
