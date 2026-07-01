@@ -123,32 +123,39 @@ def load_prompts(path):
     return prompts
 
 
-# ── model construction (reuse SDV2's own wrappers so train==inference) ───────
+# ── model construction — NEURON wrappers/pipeline (train==inference, same as sd-job) ──
 
 def build_student_pipeline(args, device, dtype):
-    """Build SDV2's CausalStreamInferencePipeline for the STUDENT (G). We generate
-    through THIS so the training rollout uses the identical schedule + rolling KV
-    cache + sink tokens + block size as inference — the whole point."""
-    from models.wan.causal_stream_inference import CausalStreamInferencePipeline
-    pipe = CausalStreamInferencePipeline(args, device=device)
+    """Build SDV2's NEURON streaming pipeline for the STUDENT (G). Generate through
+    THIS so the training rollout uses the identical schedule + rolling KV cache +
+    sink tokens + block size as inference. It builds self.generator (the Neuron
+    wrapper) from the config. We flip the DiT to train/grad for distillation —
+    the pipeline was inference-only (eager, no grad), so enabling grads on the
+    sharded generator + backprop through the eager loop is the Neuron-training work."""
+    from models.wan.neuron_causal_stream_inference import NeuronCausalStreamInferencePipeline
+    pipe = NeuronCausalStreamInferencePipeline(args, device=device)
+    # student DiT must carry grads (pipeline built it eval/frozen for inference)
+    pipe.generator.model.train().requires_grad_(True)
     return pipe
 
 
-def build_generator(model_path, ckpt_path, args, device, dtype, trainable):
-    """Build a bare Wan causal DiT wrapper (G / fake_score / teacher).
-    trainable=False + frozen for the teacher (real_score)."""
-    from models.wan.wan_wrapper import WanDiffusionWrapper
-    g = WanDiffusionWrapper(model_type=args.model_type)
-    if ckpt_path and os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        sd = ckpt.get("generator", ckpt.get("state_dict", ckpt))
-        g.model.load_state_dict({k.replace("model.", "", 1): v for k, v in sd.items()},
-                                strict=False)
-    g = g.to(device=device, dtype=dtype)
-    if not trainable:
-        g.eval().requires_grad_(False)
+def build_neuron_generator(model_path, ckpt_path, args, device, trainable, tp_degree):
+    """Build a bare NEURON causal DiT wrapper (teacher real_score / fake_score),
+    using the SAME constructor + TP sharding sd-job uses. teacher: frozen."""
+    from models.wan.neuron_wan_wrapper import NeuronCausalWanDiffusionWrapper
+    g = NeuronCausalWanDiffusionWrapper(
+        model_path=model_path,
+        checkpoint_path=ckpt_path,
+        denoising_step_list=list(args.denoising_step_list),
+        timestep_shift=getattr(args, "timestep_shift", 8.0),
+        num_frame_per_block=getattr(args, "num_frame_per_block", 3),
+        device=device,
+        tp_degree=tp_degree,
+    )
+    if trainable:
+        g.model.train().requires_grad_(True)
     else:
-        g.train().requires_grad_(True)
+        g.model.eval().requires_grad_(False)
     return g
 
 
@@ -225,17 +232,18 @@ def main():
     G.requires_grad_(True)
 
     LOGGER.info("building fake_score (1.3B, trainable)...")
-    fake_score = build_generator(args.student_base, args.student_base + "/diffusion_pytorch_model.safetensors",
-                                 args, device, dtype, trainable=True)
+    fake_score = build_neuron_generator(
+        args.student_base, None, args, device, trainable=True, tp_degree=args.tp_degree)
 
     LOGGER.info("building real_score = 14B t2v teacher (FROZEN)...")
     teacher_args = OmegaConf.create(dict(vars(args)))
     teacher_args.model_type = "T2V-14B"
-    real_score = build_generator(args.teacher_base, args.teacher_ckpt,
-                                 teacher_args, device, dtype, trainable=False)
+    real_score = build_neuron_generator(
+        args.teacher_base, args.teacher_ckpt, teacher_args, device,
+        trainable=False, tp_degree=args.tp_degree)
 
-    opt_g = torch.optim.AdamW([p for p in G.parameters() if p.requires_grad], lr=args.lr)
-    opt_f = torch.optim.AdamW(fake_score.parameters(), lr=args.lr)
+    opt_g = torch.optim.AdamW([p for p in G.model.parameters() if p.requires_grad], lr=args.lr)
+    opt_f = torch.optim.AdamW(fake_score.model.parameters(), lr=args.lr)
     scheduler = student.scheduler
 
     frame_seq = student.frame_seq_length
