@@ -123,7 +123,7 @@ spec:
             - name: BRANCH
               value: "exp/fps-1.3b"
             - name: NPROC
-              value: "8"            # 2 groups x TP-4: teacher ranks 0-3, student+fake ranks 4-7
+              value: "12"           # 3 groups x TP-4: teacher 0-3, student 4-7, fake 8-11 (12 of 16 cores)
             - name: TP_DEGREE
               value: "4"             # 1.3B student caps at TP-4 (12 heads); 14B ok too
             - name: STEPS

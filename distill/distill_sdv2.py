@@ -230,21 +230,33 @@ def main():
     #   student broadcasts x_t (src in student grp) -> teacher scores -> teacher
     #   broadcasts real_score back (src in teacher grp). Every rank calls every
     #   broadcast (collective requirement); only the src group provides real data.
+    # ── THREE-GROUP PLACEMENT (2-group student side still OOM'd: student+fake+2xAdam
+    # +rollout activations > 24GB). Give EACH net its own TP-4 group = 12 cores:
+    #   TEACHER group = ranks [0..3]    14B frozen
+    #   STUDENT group = ranks [4..7]    G + its Adam + rollout activations
+    #   FAKE    group = ranks [8..11]   fake_score + its Adam
+    # Cross-group via global broadcast: student bcasts (x_t,t,embeds); teacher AND
+    # fake each score it in their group; each bcasts its pred back to student.
     ws = dist.get_world_size() if dist.is_initialized() else 1
     tp = args.tp_degree
-    is_two_group = ws == 2 * tp
+    three_group = ws == 3 * tp
     teacher_ranks = list(range(0, tp))
     student_ranks = list(range(tp, 2 * tp))
+    fake_ranks = list(range(2 * tp, 3 * tp))
     my_rank = dist.get_rank() if dist.is_initialized() else 0
-    in_teacher = (not is_two_group) or (my_rank in teacher_ranks)
-    in_student = (not is_two_group) or (my_rank in student_ranks)
-    tsrc, ssrc = teacher_ranks[0], student_ranks[0]  # broadcast roots
-    LOGGER.info(f"placement: world={ws} tp={tp} two_group={is_two_group} "
-                f"rank={my_rank} in_teacher={in_teacher} in_student={in_student}")
+    if three_group:
+        in_teacher = my_rank in teacher_ranks
+        in_student = my_rank in student_ranks
+        in_fake = my_rank in fake_ranks
+    else:
+        in_teacher = in_student = in_fake = True  # single-proc dev
+    tsrc, ssrc, fsrc = teacher_ranks[0], student_ranks[0], fake_ranks[0]
+    LOGGER.info(f"placement: world={ws} tp={tp} three_group={three_group} rank={my_rank} "
+                f"teacher={in_teacher} student={in_student} fake={in_fake}")
 
     student = fake_score = real_score = G = None
 
-    # STUDENT + fake on the student group (base 1.3B init; we're CREATING the DMD ckpt)
+    # STUDENT (G) on the student group — base 1.3B init (we're CREATING the DMD ckpt)
     if in_student:
         args.generator_ckpt = None
         os.environ["DISTILL_BASE_ONLY"] = "1"
@@ -252,6 +264,11 @@ def main():
         student = build_student_pipeline(args, device, dtype)
         G = student.generator
         G.model.requires_grad_(True)
+        os.environ["DISTILL_BASE_ONLY"] = ""
+
+    # FAKE_SCORE on its OWN group (base 1.3B init)
+    if in_fake:
+        os.environ["DISTILL_BASE_ONLY"] = "1"
         LOGGER.info("building fake_score (1.3B, trainable, base init)...")
         fake_score = build_neuron_generator(
             args.student_base, None, args, device, trainable=True, tp_degree=tp)
@@ -266,48 +283,37 @@ def main():
             args.teacher_base, args.teacher_ckpt, teacher_args, device,
             trainable=False, tp_degree=tp)
 
-    # optimizers only on the student group (teacher is frozen, has no params to train)
+    # G optimizer on student group; fake optimizer on fake group (each net its own group)
     opt_g = torch.optim.AdamW([p for p in G.model.parameters() if p.requires_grad], lr=args.lr) if in_student else None
-    opt_f = torch.optim.AdamW(fake_score.model.parameters(), lr=args.lr) if in_student else None
+    opt_f = torch.optim.AdamW(fake_score.model.parameters(), lr=args.lr) if in_fake else None
     scheduler = student.scheduler if in_student else None
+    # fake group needs a scheduler too (add_noise for its diffusion loss); the wrapper
+    # builds one on .scheduler.
+    scheduler_fake = fake_score.scheduler if in_fake else None
     frame_seq = student.frame_seq_length if in_student else 0
     npb = args.num_frame_per_block
 
-    # latent shape both groups agree on (for broadcast buffer allocation)
     lat_shape = (1, npb, 16, args.height // 8, args.width // 8)
     emb_shape = (1, 512, 4096)
 
     def bcast(t, src):
-        """global broadcast; every rank must call. returns the src's tensor."""
+        """global broadcast; EVERY rank must call in lockstep. returns src's tensor."""
         t = t.contiguous()
         if dist.is_initialized():
             dist.broadcast(t, src=src)
         return t
 
-    def teacher_score_cross(x_t, tt, cond_embeds):
-        """Cross-group teacher score. BOTH groups call in lockstep:
-        student broadcasts (x_t, tt, embeds) from ssrc; teacher scores; teacher
-        broadcasts real_pred back from tsrc. Returns real_pred on student ranks."""
-        xb = bcast(x_t if in_student else torch.zeros(lat_shape, dtype=dtype, device=device), ssrc)
-        eb = bcast(cond_embeds if in_student else torch.zeros(emb_shape, dtype=dtype, device=device), ssrc)
-        tb = bcast(tt.to(torch.int64) if in_student else torch.zeros((1, npb), dtype=torch.int64, device=device), ssrc)
-        real_pred = torch.zeros(lat_shape, dtype=dtype, device=device)
-        if in_teacher:
-            with torch.no_grad():
-                real_pred = real_score(noisy_image_or_video=xb,
-                                       conditional_dict={"prompt_embeds": eb},
-                                       timestep=tb, kv_cache=None, crossattn_cache=None)
-        real_pred = bcast(real_pred, tsrc)
-        return real_pred
+    def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
-    # 3) training loop — SYMMETRIC across groups (both hit every collective in lockstep)
+    # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
     for it in range(args.iters):
         prompt = [prompts[it % len(prompts)]]
+
+        # (a) student generates x0 via Self-Forcing rollout (grad on)
         x0_student = cond = None
         if in_student:
             student.kv_cache1 = None
             student.crossattn_cache = None
-            # Self-Forcing rollout: G generates through OUR streaming loop (grad on)
             noise = torch.randn(lat_shape, dtype=dtype, device=device)
             x0_student = student.prepare(
                 text_prompts=prompt, device=device, dtype=dtype,
@@ -315,36 +321,54 @@ def main():
                 batch_denoise=False)
             cond = student.conditional_dict
 
-        update_g = (it % args.dfake_gen_update_ratio == 0)
-        gl = float("nan")
-        if update_g:
-            # student prepares x_t + timestep; teacher scores via cross-group bcast
-            if in_student:
-                b = x0_student.shape[0]
-                t = torch.randint(20, 980, (b,), device=device)
-                noise_t = torch.randn_like(x0_student)
-                x_t = scheduler.add_noise(x0_student.flatten(0, 1), noise_t.flatten(0, 1),
-                                          t).unflatten(0, x0_student.shape[:2])
-                tt = t.view(b, 1).expand(b, x0_student.shape[1])
-                embeds = cond["prompt_embeds"]
-            else:
-                x_t = tt = embeds = None
-            real_pred = teacher_score_cross(x_t, tt, embeds)
-            if in_student:
-                with torch.no_grad():
-                    fake_pred = fake_score(noisy_image_or_video=x_t, conditional_dict=cond,
-                                           timestep=tt, kv_cache=None, crossattn_cache=None)
-                grad = (fake_pred - real_pred)
-                grad = grad / (grad.abs().mean() + 1e-8)
-                target = (x0_student - grad).detach()
-                loss_g = 0.5 * F.mse_loss(x0_student, target)
-                opt_g.zero_grad(); loss_g.backward(); opt_g.step()
-                gl = float(loss_g.detach())
-
-        # fake_score tracks G (student group only, no cross-group needed)
-        lf = float("nan")
+        # (b) student builds x_t + timestep + embeds, broadcasts to teacher & fake groups
         if in_student:
-            loss_f = fake_score_loss(x0_student, fake_score, cond, scheduler, device)
+            b = x0_student.shape[0]
+            t = torch.randint(20, 980, (b,), device=device)
+            x_t = scheduler.add_noise(x0_student.flatten(0, 1),
+                                      torch.randn_like(x0_student).flatten(0, 1),
+                                      t).unflatten(0, x0_student.shape[:2])
+            tt = t.view(b, 1).expand(b, x0_student.shape[1])
+            embeds = cond["prompt_embeds"]
+            # also send x0 (detached) so the fake group can train on it
+            x0_send = x0_student.detach()
+        else:
+            x_t = zeros_lat(); tt = torch.zeros((1, npb), dtype=torch.int64, device=device)
+            embeds = torch.zeros(emb_shape, dtype=dtype, device=device); x0_send = zeros_lat()
+        x_t = bcast(x_t, ssrc); tt = bcast(tt.to(torch.int64), ssrc)
+        embeds = bcast(embeds, ssrc); x0_send = bcast(x0_send, ssrc)
+        condb = {"prompt_embeds": embeds}
+
+        # (c) teacher scores x_t (its group), broadcasts real_pred back
+        real_pred = zeros_lat()
+        if in_teacher:
+            with torch.no_grad():
+                real_pred = real_score(noisy_image_or_video=x_t, conditional_dict=condb,
+                                       timestep=tt, kv_cache=None, crossattn_cache=None)
+        real_pred = bcast(real_pred, tsrc)
+
+        # (d) fake scores x_t (its group), broadcasts fake_pred back
+        fake_pred = zeros_lat()
+        if in_fake:
+            with torch.no_grad():
+                fake_pred = fake_score(noisy_image_or_video=x_t, conditional_dict=condb,
+                                       timestep=tt, kv_cache=None, crossattn_cache=None)
+        fake_pred = bcast(fake_pred, fsrc)
+
+        # (e) student DMD update (its group)
+        gl = float("nan")
+        if in_student and (it % args.dfake_gen_update_ratio == 0):
+            grad = (fake_pred - real_pred)
+            grad = grad / (grad.abs().mean() + 1e-8)
+            target = (x0_student - grad).detach()
+            loss_g = 0.5 * F.mse_loss(x0_student, target)
+            opt_g.zero_grad(); loss_g.backward(); opt_g.step()
+            gl = float(loss_g.detach())
+
+        # (f) fake trains to track G, on x0_send (its group)
+        lf = float("nan")
+        if in_fake:
+            loss_f = fake_score_loss(x0_send, fake_score, condb, scheduler_fake, device)
             opt_f.zero_grad(); loss_f.backward(); opt_f.step()
             lf = float(loss_f.detach())
 
