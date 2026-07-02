@@ -81,6 +81,9 @@ def parse_args():
     p.add_argument("--height", type=int, default=352)   # /8=44 even (patchify needs /2); not 240/480
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--max_prompts", type=int, default=0,
+                   help="cap the corpus to the first N prompts (0 = all). For targeted "
+                        "small-set distillation (e.g. 10 prompts, memorize them).")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -228,6 +231,9 @@ def main():
                 f"block={args.num_frame_per_block} res={args.height}x{args.width}")
 
     prompts = load_prompts(args.captions)
+    if args.max_prompts and args.max_prompts < len(prompts):
+        prompts = prompts[:args.max_prompts]
+        LOGGER.info(f"capped to first {len(prompts)} prompts (targeted distill)")
 
     # ── TWO-GROUP PLACEMENT (avoids OOM: 3 nets co-located = ~21GB/core -> OOM) ──
     # world=8 on l-trn2, tp_degree=4:
@@ -403,6 +409,7 @@ def main():
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
+    _gl_hist = []  # recent loss_G values for the running-average convergence metric
     for it in range(args.iters):
         prompt = [prompts[it % len(prompts)]]
 
@@ -474,8 +481,19 @@ def main():
             opt_f.zero_grad(); loss_f.backward(); opt_f.step()
             lf = float(loss_f.detach())
 
-        if (my_rank == ssrc or not dist.is_initialized()) and it % 20 == 0:
-            LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_fake={lf:.4f}")
+        # CONVERGENCE METRIC = loss_G (DMD generator loss). It should DECREASE and
+        # FLATTEN — that's convergence (student distribution -> teacher). Per-iter is
+        # noisy (random timestep each step), so also print a running average over the
+        # last 50 student updates to see the trend. (loss_fake is the fake-group's
+        # metric; on the student-root log it's nan — ignore it here.)
+        if in_student and gl == gl:  # gl==gl false when nan (non-G-update iters)
+            _gl_hist.append(gl)
+            if len(_gl_hist) > 50:
+                _gl_hist.pop(0)
+        if my_rank == ssrc or not dist.is_initialized():
+            avg = sum(_gl_hist) / len(_gl_hist) if _gl_hist else float("nan")
+            LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_G_avg50={avg:.4f}  "
+                        f"(CONVERGENCE: watch loss_G_avg50 decrease + flatten)")
         if it > 0 and it % args.save_every == 0:
             save_ckpt(it)
 

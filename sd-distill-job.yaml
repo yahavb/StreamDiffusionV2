@@ -93,8 +93,11 @@ spec:
                 --teacher_base wan_models/Wan2.1-T2V-14B \
                 --student_base wan_models/Wan2.1-T2V-1.3B \
                 --steps "${STEPS:-700,0}" \
-                --iters "${ITERS:-500}" \
+                --iters "${ITERS:-800}" \
                 --tp_degree "${TP_DEGREE:-8}" \
+                --max_prompts "${MAX_PROMPTS:-10}" \
+                --dfake_gen_update_ratio "${DFAKE_RATIO:-1}" \
+                --save_every "${SAVE_EVERY:-200}" \
                 --height 352 --width 640 \
                 --out "$RUN/model.pt" || echo "TRAIN FAILED"
 
@@ -131,7 +134,7 @@ spec:
             - name: DISTILL_GRAD_LAST_ONLY
               value: "1"  # DMD: grad only through last denoise step (cuts rollout activation OOM)
             - name: ITERS
-              value: "5"             # SMOKE TEST: 5 iters to prove the loop steps, not a real ckpt
+              value: "800"           # convergence run: 10 prompts x 800 iters, dfake_ratio 1, save every 200
             - name: CAPTIONS_SRC
               value: "/var/mdl/video-distill/captions-20260701-062139.jsonl"
             - name: NEURON_LOGICAL_NC_CONFIG
