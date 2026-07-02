@@ -465,6 +465,7 @@ def main():
             target = (x0_student - grad).detach()
             loss_g = 0.5 * F.mse_loss(x0_student, target)
             opt_g.zero_grad(); loss_g.backward(); opt_g.step()
+            del grad, target  # drop student DMD graph tensors
             gl = float(loss_g.detach())
 
         # (f) fake trains to track G, on x0_send (its group) — diffusion loss
@@ -480,6 +481,7 @@ def main():
             loss_f = F.mse_loss(pred_f, x0_send)
             opt_f.zero_grad(); loss_f.backward(); opt_f.step()
             lf = float(loss_f.detach())
+            del pred_f, loss_f, xtf  # drop fake-group autograd graph (was leaking -> OOM)
 
         # CONVERGENCE METRIC = loss_G (DMD generator loss). It should DECREASE and
         # FLATTEN — that's convergence (student distribution -> teacher). Per-iter is
@@ -501,6 +503,7 @@ def main():
         # OOM at iter 1 start was iter 0's autograd graph + latents lingering. Rebind
         # the big tensors to None (drops refs -> autograd graph freed) and clear the
         # student's KV/cross/shared caches so HBM is reclaimed before the next rollout.
+        # Free per-iter tensors (autograd graphs) across ALL groups.
         x0_student = x_t = real_pred = fake_pred = x0_send = None
         if in_student:
             student.kv_cache1 = None
