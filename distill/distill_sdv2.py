@@ -511,6 +511,14 @@ def main():
             student.shared_buffers = None
         import gc as _gc
         _gc.collect()
+        # Force Neuron to reclaim HBM now — eager torch_neuronx defers frees, so
+        # del/gc alone let device memory creep up across iters (OOM ~iter 12). A
+        # synchronize flushes pending frees before the next iter allocates.
+        if hasattr(torch, "neuron") and hasattr(torch.neuron, "synchronize"):
+            try:
+                torch.neuron.synchronize()
+            except Exception:
+                pass
 
     save_ckpt(args.iters)
     LOGGER.info("done. VALIDATE: load the checkpoint into sd-job.yaml and WATCH the video "

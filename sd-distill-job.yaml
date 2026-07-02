@@ -98,7 +98,7 @@ spec:
                 --max_prompts "${MAX_PROMPTS:-10}" \
                 --dfake_gen_update_ratio "${DFAKE_RATIO:-1}" \
                 --save_every "${SAVE_EVERY:-200}" \
-                --height 352 --width 640 \
+                --height 240 --width 416 \
                 --out "$RUN/model.pt" || echo "TRAIN FAILED"
 
               # ─── copy checkpoint + log to S3 ONCE at end ───
