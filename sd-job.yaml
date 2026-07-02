@@ -129,7 +129,7 @@ spec:
               # 700,0). Prompt is IN-DISTRIBUTION (in the 100-prompt distill corpus).
               NPROC="${NPROC:-4}"
               TP_DEGREE="${TP_DEGREE:-4}"
-              STEPS="${STEPS:-700,0}"
+              STEPS="${STEPS:-700,500,400,200,0}"
               DISTILL_CKPT="${DISTILL_CKPT:-/var/mdl/video-distill/checkpoints/202607021142/model.pt}"
               mkdir -p ckpts/distilled && cp "$DISTILL_CKPT" ckpts/distilled/model.pt
               echo "distilled ckpt: $DISTILL_CKPT ($(du -h ckpts/distilled/model.pt | cut -f1))"
@@ -234,7 +234,7 @@ spec:
               value: "4"
             # MUST match the distilled step count (trained with 700,0).
             - name: STEPS
-              value: "700,0"
+              value: "700,500,400,200,0"
             - name: DISTILL_CKPT
               value: "/var/mdl/video-distill/checkpoints/202607021142/model.pt"
             - name: USE_KV_PREFIX_CACHE
