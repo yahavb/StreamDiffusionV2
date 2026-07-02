@@ -222,88 +222,141 @@ def main():
 
     prompts = load_prompts(args.captions)
 
-    # 2) three networks
-    # STUDENT inits from BASE 1.3B (we're CREATING the DMD ckpt, not consuming one).
-    # Clear generator_ckpt + set DISTILL_BASE_ONLY so the wrapper skips its
-    # inference-time DMD-required guard and runs on base weights.
-    args.generator_ckpt = None
-    os.environ["DISTILL_BASE_ONLY"] = "1"
-    LOGGER.info("building student G (init base 1.3B, trainable)...")
-    student = build_student_pipeline(args, device, dtype)      # generation path (== inference)
-    G = student.generator                                       # the trainable DiT
-    G.model.requires_grad_(True)
+    # ── TWO-GROUP PLACEMENT (avoids OOM: 3 nets co-located = ~21GB/core -> OOM) ──
+    # world=8 on l-trn2, tp_degree=4:
+    #   TEACHER group  = ranks [0..3]  -> 14B frozen (7GB/core, no optimizer)
+    #   STUDENT group  = ranks [4..7]  -> student + fake (weights+Adam, no 14B sharing)
+    # Cross-group transfer via GLOBAL broadcast (Neuron: broadcast yes, P2P no):
+    #   student broadcasts x_t (src in student grp) -> teacher scores -> teacher
+    #   broadcasts real_score back (src in teacher grp). Every rank calls every
+    #   broadcast (collective requirement); only the src group provides real data.
+    ws = dist.get_world_size() if dist.is_initialized() else 1
+    tp = args.tp_degree
+    is_two_group = ws == 2 * tp
+    teacher_ranks = list(range(0, tp))
+    student_ranks = list(range(tp, 2 * tp))
+    my_rank = dist.get_rank() if dist.is_initialized() else 0
+    in_teacher = (not is_two_group) or (my_rank in teacher_ranks)
+    in_student = (not is_two_group) or (my_rank in student_ranks)
+    tsrc, ssrc = teacher_ranks[0], student_ranks[0]  # broadcast roots
+    LOGGER.info(f"placement: world={ws} tp={tp} two_group={is_two_group} "
+                f"rank={my_rank} in_teacher={in_teacher} in_student={in_student}")
 
-    LOGGER.info("building fake_score (1.3B, trainable, base init)...")
-    fake_score = build_neuron_generator(
-        args.student_base, None, args, device, trainable=True, tp_degree=args.tp_degree)
+    student = fake_score = real_score = G = None
 
-    # teacher DOES need its 14B DMD ckpt — re-arm the guard.
-    os.environ["DISTILL_BASE_ONLY"] = ""
-    LOGGER.info("building real_score = 14B t2v teacher (FROZEN)...")
-    teacher_args = OmegaConf.create(dict(vars(args)))
-    teacher_args.model_type = "T2V-14B"
-    real_score = build_neuron_generator(
-        args.teacher_base, args.teacher_ckpt, teacher_args, device,
-        trainable=False, tp_degree=args.tp_degree)
+    # STUDENT + fake on the student group (base 1.3B init; we're CREATING the DMD ckpt)
+    if in_student:
+        args.generator_ckpt = None
+        os.environ["DISTILL_BASE_ONLY"] = "1"
+        LOGGER.info("building student G (init base 1.3B, trainable)...")
+        student = build_student_pipeline(args, device, dtype)
+        G = student.generator
+        G.model.requires_grad_(True)
+        LOGGER.info("building fake_score (1.3B, trainable, base init)...")
+        fake_score = build_neuron_generator(
+            args.student_base, None, args, device, trainable=True, tp_degree=tp)
+        os.environ["DISTILL_BASE_ONLY"] = ""
 
-    opt_g = torch.optim.AdamW([p for p in G.model.parameters() if p.requires_grad], lr=args.lr)
-    opt_f = torch.optim.AdamW(fake_score.model.parameters(), lr=args.lr)
-    scheduler = student.scheduler
+    # TEACHER (14B DMD ckpt) on the teacher group
+    if in_teacher:
+        LOGGER.info("building real_score = 14B t2v teacher (FROZEN)...")
+        teacher_args = OmegaConf.create(dict(vars(args)))
+        teacher_args.model_type = "T2V-14B"
+        real_score = build_neuron_generator(
+            args.teacher_base, args.teacher_ckpt, teacher_args, device,
+            trainable=False, tp_degree=tp)
 
-    frame_seq = student.frame_seq_length
+    # optimizers only on the student group (teacher is frozen, has no params to train)
+    opt_g = torch.optim.AdamW([p for p in G.model.parameters() if p.requires_grad], lr=args.lr) if in_student else None
+    opt_f = torch.optim.AdamW(fake_score.model.parameters(), lr=args.lr) if in_student else None
+    scheduler = student.scheduler if in_student else None
+    frame_seq = student.frame_seq_length if in_student else 0
     npb = args.num_frame_per_block
 
-    # 3) training loop
+    # latent shape both groups agree on (for broadcast buffer allocation)
+    lat_shape = (1, npb, 16, args.height // 8, args.width // 8)
+    emb_shape = (1, 512, 4096)
+
+    def bcast(t, src):
+        """global broadcast; every rank must call. returns the src's tensor."""
+        t = t.contiguous()
+        if dist.is_initialized():
+            dist.broadcast(t, src=src)
+        return t
+
+    def teacher_score_cross(x_t, tt, cond_embeds):
+        """Cross-group teacher score. BOTH groups call in lockstep:
+        student broadcasts (x_t, tt, embeds) from ssrc; teacher scores; teacher
+        broadcasts real_pred back from tsrc. Returns real_pred on student ranks."""
+        xb = bcast(x_t if in_student else torch.zeros(lat_shape, dtype=dtype, device=device), ssrc)
+        eb = bcast(cond_embeds if in_student else torch.zeros(emb_shape, dtype=dtype, device=device), ssrc)
+        tb = bcast(tt.to(torch.int64) if in_student else torch.zeros((1, npb), dtype=torch.int64, device=device), ssrc)
+        real_pred = torch.zeros(lat_shape, dtype=dtype, device=device)
+        if in_teacher:
+            with torch.no_grad():
+                real_pred = real_score(noisy_image_or_video=xb,
+                                       conditional_dict={"prompt_embeds": eb},
+                                       timestep=tb, kv_cache=None, crossattn_cache=None)
+        real_pred = bcast(real_pred, tsrc)
+        return real_pred
+
+    # 3) training loop — SYMMETRIC across groups (both hit every collective in lockstep)
     for it in range(args.iters):
         prompt = [prompts[it % len(prompts)]]
-        # fresh caches per clip (streaming state must not leak across prompts)
-        student.kv_cache1 = None
-        student.crossattn_cache = None
-
-        # --- Self-Forcing rollout: G generates the anchor block through OUR loop ---
-        # (multi-block rollout conditioned on G's OWN kv cache = the streaming signal)
-        noise = torch.randn(1, npb, 16, args.height // 8, args.width // 8,
-                            dtype=dtype, device=device)
-        x0_student = student.prepare(
-            text_prompts=prompt, device=device, dtype=dtype,
-            noise=noise, current_start=0, current_end=frame_seq * npb,
-            batch_denoise=False)  # returns the few-step clean student output, WITH grad
-
-        cond = student.conditional_dict
+        x0_student = cond = None
+        if in_student:
+            student.kv_cache1 = None
+            student.crossattn_cache = None
+            # Self-Forcing rollout: G generates through OUR streaming loop (grad on)
+            noise = torch.randn(lat_shape, dtype=dtype, device=device)
+            x0_student = student.prepare(
+                text_prompts=prompt, device=device, dtype=dtype,
+                noise=noise, current_start=0, current_end=frame_seq * npb,
+                batch_denoise=False)
+            cond = student.conditional_dict
 
         update_g = (it % args.dfake_gen_update_ratio == 0)
+        gl = float("nan")
         if update_g:
-            # optional regression warmup toward teacher (stabilize early)
-            loss_g = dmd_generator_loss(x0_student, real_score, fake_score, cond,
-                                        scheduler, device, dtype)
-            if it < args.warmup_regression:
+            # student prepares x_t + timestep; teacher scores via cross-group bcast
+            if in_student:
+                b = x0_student.shape[0]
+                t = torch.randint(20, 980, (b,), device=device)
+                noise_t = torch.randn_like(x0_student)
+                x_t = scheduler.add_noise(x0_student.flatten(0, 1), noise_t.flatten(0, 1),
+                                          t).unflatten(0, x0_student.shape[:2])
+                tt = t.view(b, 1).expand(b, x0_student.shape[1])
+                embeds = cond["prompt_embeds"]
+            else:
+                x_t = tt = embeds = None
+            real_pred = teacher_score_cross(x_t, tt, embeds)
+            if in_student:
                 with torch.no_grad():
-                    # teacher's own clean pred at low-noise as a coarse trajectory target
-                    t_lo = torch.full((1, x0_student.shape[1]), 50, device=device, dtype=torch.long)
-                    tgt = real_score(noisy_image_or_video=x0_student.detach(),
-                                     conditional_dict=cond, timestep=t_lo,
-                                     kv_cache=None, crossattn_cache=None)
-                loss_g = loss_g + F.mse_loss(x0_student, tgt)
-            opt_g.zero_grad(); loss_g.backward()
-            opt_g.step()
-            gl = float(loss_g.detach())
-        else:
-            gl = float("nan")
+                    fake_pred = fake_score(noisy_image_or_video=x_t, conditional_dict=cond,
+                                           timestep=tt, kv_cache=None, crossattn_cache=None)
+                grad = (fake_pred - real_pred)
+                grad = grad / (grad.abs().mean() + 1e-8)
+                target = (x0_student - grad).detach()
+                loss_g = 0.5 * F.mse_loss(x0_student, target)
+                opt_g.zero_grad(); loss_g.backward(); opt_g.step()
+                gl = float(loss_g.detach())
 
-        # fake_score always tracks G
-        loss_f = fake_score_loss(x0_student, fake_score, cond, scheduler, device)
-        opt_f.zero_grad(); loss_f.backward()
-        opt_f.step()
+        # fake_score tracks G (student group only, no cross-group needed)
+        lf = float("nan")
+        if in_student:
+            loss_f = fake_score_loss(x0_student, fake_score, cond, scheduler, device)
+            opt_f.zero_grad(); loss_f.backward(); opt_f.step()
+            lf = float(loss_f.detach())
 
-        if it % 20 == 0:
-            LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_fake={float(loss_f.detach()):.4f}")
-
-        # 4) checkpoint in the {'generator': ...} format sd-job loads (drop-in)
-        rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
-        if rank0 and it > 0 and it % args.save_every == 0:
+        # save from the STUDENT group's root (ssrc) — global rank 0 is a teacher rank (no G)
+        save_here = (my_rank == ssrc) or (not dist.is_initialized())
+        if save_here and it % 20 == 0:
+            LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_fake={lf:.4f}")
+        if save_here and it > 0 and it % args.save_every == 0:
             _save(G, args.out, it)
 
-    if (not dist.is_initialized()) or dist.get_rank() == 0:
+    save_here = (my_rank == ssrc) or (not dist.is_initialized())
+    if save_here:
         _save(G, args.out, args.iters)
     LOGGER.info("done. VALIDATE: load the checkpoint into sd-job.yaml and WATCH the video "
                 "(never trust training loss alone).")

@@ -123,7 +123,7 @@ spec:
             - name: BRANCH
               value: "exp/fps-1.3b"
             - name: NPROC
-              value: "4"            # SMOKE: TP-4 works for BOTH 14B(40h) and 1.3B(12h); 8 breaks 1.3B
+              value: "8"            # 2 groups x TP-4: teacher ranks 0-3, student+fake ranks 4-7
             - name: TP_DEGREE
               value: "4"             # 1.3B student caps at TP-4 (12 heads); 14B ok too
             - name: STEPS
