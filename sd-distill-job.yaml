@@ -130,7 +130,7 @@ spec:
             - name: TP_DEGREE
               value: "4"             # 1.3B student caps at TP-4 (12 heads); 14B ok too
             - name: STEPS
-              value: "700,0"         # 2-step student (fps lever). "0" = 1-step.
+              value: "0"             # 1-step: max fps target (~10fps)
             - name: DISTILL_GRAD_LAST_ONLY
               value: "1"  # DMD: grad only through last denoise step (cuts rollout activation OOM)
             - name: ITERS
