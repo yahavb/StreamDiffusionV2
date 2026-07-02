@@ -239,7 +239,10 @@ def main():
     # fake each score it in their group; each bcasts its pred back to student.
     ws = dist.get_world_size() if dist.is_initialized() else 1
     tp = args.tp_degree
-    three_group = ws == 3 * tp
+    # need >=3 TP groups (12 cores). world may be larger (e.g. 16 on l-trn2 LNC2 —
+    # NPROC MUST equal the full claim for a clean device-barrier topology; ranks
+    # beyond 3*tp are IDLE but still join every broadcast in lockstep).
+    three_group = ws >= 3 * tp
     teacher_ranks = list(range(0, tp))
     student_ranks = list(range(tp, 2 * tp))
     fake_ranks = list(range(2 * tp, 3 * tp))
@@ -248,6 +251,7 @@ def main():
         in_teacher = my_rank in teacher_ranks
         in_student = my_rank in student_ranks
         in_fake = my_rank in fake_ranks
+        # ranks >= 3*tp: idle (no model), but MUST still call every bcast
     else:
         in_teacher = in_student = in_fake = True  # single-proc dev
     tsrc, ssrc, fsrc = teacher_ranks[0], student_ranks[0], fake_ranks[0]
