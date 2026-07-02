@@ -359,7 +359,8 @@ def main():
         concatenates per layer (col->dim0, row->dim1, norm->dim0, replicated->rank0)."""
         if not in_student:
             return
-        from models.wan.tp_utils import (ColumnParallelLinear, RowParallelLinear, TPRMSNorm)
+        from models.wan.tp_utils import (ColumnParallelLinear, RowParallelLinear,
+                                         TPRMSNorm, get_tp_group)
         local_tp_rank = my_rank - ssrc
         shard_dir = os.path.join(os.path.dirname(args.out), "shards")
         os.makedirs(shard_dir, exist_ok=True)
