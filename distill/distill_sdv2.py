@@ -78,7 +78,7 @@ def parse_args():
                    help="first N iters also regress G toward teacher trajectory (stabilizes DMD)")
     p.add_argument("--tp_degree", type=int, default=8)
     p.add_argument("--num_frames", type=int, default=81)
-    p.add_argument("--height", type=int, default=360)   # not 240 (too small) / not 480 (too heavy)
+    p.add_argument("--height", type=int, default=352)   # /8=44 even (patchify needs /2); not 240/480
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
