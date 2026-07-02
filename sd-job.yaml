@@ -68,28 +68,17 @@ spec:
               PROBE='import models.wan.neuron_layers as a; print("nki="+str(a.USE_NKI_KERNELS), "self_nki="+str(a.SELF_ATTN_NKI_AVAILABLE), "rope_nki="+str(a.ROPE_NKI_AVAILABLE), "ATTN_MULT="+str(a.ATTN_SEQLEN_MULTIPLE))'
               echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tr '\n' ' ')  USE_NKI_VAE=${USE_NKI_VAE:-unset} USE_VAE_COMPILE=${USE_VAE_COMPILE:-unset}"
 
-              # ─── 14B model weights + DMD checkpoint (S3-backed cache) ───
-              # 14B is the LOCKED model: 1.3B@240p quality was REJECTED by user (too
-              # cartoony) — its ~2x fps is moot. 14B@240p = 0.33/0.53 fps, quality good.
-              # Base Wan2.1-T2V-14B (UMT5-XXL + VAE under it) + jerryfeng 14B DMD ckpt.
-              WAN_14B_TAR="/var/mdl/wan_models/Wan2.1-T2V-14B.tar"
+              # ─── 1.3B base weights (student size — the distilled ckpt is loaded below) ───
+              WAN13="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
               mkdir -p wan_models
-              if [[ -f "$WAN_14B_TAR" ]]; then
-                cp "$WAN_14B_TAR" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
+              if [[ -f "$WAN13" ]]; then
+                cp "$WAN13" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar
               else
-                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-14B', local_dir='wan_models/Wan2.1-T2V-14B', local_dir_use_symlinks=False)"
-                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-14B
-                mkdir -p "$(dirname $WAN_14B_TAR)" && cp /tmp/w.tar "$WAN_14B_TAR" && rm -f /tmp/w.tar
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN13)" && cp /tmp/w.tar "$WAN13" && rm -f /tmp/w.tar
               fi
-              SDV2_CKPT_CACHE="/var/mdl/ckpts/wan_causal_dmd_v2v_14b/model.pt"
-              mkdir -p ckpts/wan_causal_dmd_v2v_14b
-              if [[ -f "$SDV2_CKPT_CACHE" ]]; then
-                cp "$SDV2_CKPT_CACHE" ckpts/wan_causal_dmd_v2v_14b/model.pt
-              else
-                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v_14b/*'], local_dir='ckpts')"
-                mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v_14b/model.pt "$SDV2_CKPT_CACHE"
-              fi
-              echo "Model weights ready!"
+              echo "1.3B base weights ready (distilled ckpt loaded at render time)!"
 
               # ─── ONE timestamped folder for this whole run ───
               # WORK ON LOCAL DISK (/tmp) — /var/mdl is S3-backed: slow on the critical
@@ -134,13 +123,21 @@ spec:
               #   NPROC=4  TP_DEGREE=4  -> 1 stream  x TP-4 (baseline)
               # 14B shards cleanly at TP {2,4,8} (40 heads, ffn 13824). Each group renders
               # its own seed -> its own _g{id} video; aggregate fps = sum of groups.
-              NPROC="${NPROC:-16}"
-              TP_DEGREE="${TP_DEGREE:-8}"
-              STEPS="${STEPS:-700,500,400,200,0}"
+              # DISTILLED 1.3B inference (branch exp/distilled-infer): run the SD pipeline
+              # with OUR distilled checkpoint (from sd-distill-job). 1.3B config, ckpt
+              # overridden to the distilled model.pt, at the TRAINED res/steps (352x640,
+              # 700,0). Prompt is IN-DISTRIBUTION (in the 100-prompt distill corpus).
+              NPROC="${NPROC:-4}"
+              TP_DEGREE="${TP_DEGREE:-4}"
+              STEPS="${STEPS:-700,0}"
+              DISTILL_CKPT="${DISTILL_CKPT:-/var/mdl/video-distill/checkpoints/202607021036/model.pt}"
+              mkdir -p ckpts/distilled && cp "$DISTILL_CKPT" ckpts/distilled/model.pt
+              echo "distilled ckpt: $DISTILL_CKPT ($(du -h ckpts/distilled/model.pt | cut -f1))"
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
-                --config streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml \
+                --config streamv2v/configs/wan_causal_fps_neuron.yaml \
+                --generator_ckpt ckpts/distilled/model.pt \
                 --steps $STEPS --tp_degree $TP_DEGREE \
-                --num_frames 81 --height 240 --width 416 --device neuron"
+                --num_frames 81 --height 352 --width 640 --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
               # $3 (optional) = input video path -> v2v restyle. Omit -> t2v from noise.
@@ -158,19 +155,11 @@ spec:
                   echo "[$NAME] NO frames in $FRAMES_DIR — mp4 not written"
                 fi
               }
-              # CP BASELINE — measure 14B@240p fps AND capture known-good video for BOTH
-              # modes (the CP build must reproduce both frame-for-frame):
-              #   1) t2v: from noise, known-good cat prompt (memory: confirmed good).
-              #   2) v2v: restyle the staged input ($IN_VIDEO) -> cyber-dog (noise_scale
-              #      in render(), schedule = fixed SDEdit truncated-descending).
-              # Two renders = ~2x time but the cold compile + NEFF cache is shared, so the
-              # 2nd render mostly reuses kernels.
-              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard, riding the waves at sunset, cinematic lighting, high quality, photorealistic"
-              if [ -n "$IN_VIDEO" ]; then
-                render dog "A highly detailed futuristic cybernetic dog running through a glowing neon field, metallic plates with iridescent blue and purple neon reflections, mechanical joints and wires, glowing sensor eyes, brushed-steel body with holographic circuits, cinematic, ultra-realistic, science-fiction style" "$IN_VIDEO"
-              else
-                echo "[v2v] skipped — INPUT_VIDEO_SRC not set/staged (t2v-only run)"
-              fi
+              # DISTILLED-MODEL VALIDATION (task #23): render an IN-DISTRIBUTION prompt
+              # (record 1 of the 100-prompt distill corpus — pancake flip). If the
+              # distilled student produces a coherent on-prompt clip (vs base-1.3B cartoony),
+              # the distill concept works; then the per-block fps line = the perf payoff.
+              render pancake "A person in a striped shirt flips a pancake in a kitchen. The camera is handheld and shaky, capturing the motion as the person lifts and releases the pan. The background shows a dining area with another person seated. Warm indoor lighting illuminates the scene."
 
               # ════════════════ PART B: HIGH-LEVEL profiler ONLY (no neuron-profiler/systrace) ═══════
               # The per-block "Block N: DiT=.. VAE=.. fps" timing in the render above IS the
@@ -234,22 +223,20 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "exp/fps-1.3b"
-            # FPS run = t2v from noise (no input video). Empty -> t2v path.
+              value: "exp/distilled-infer"
+            # t2v (no input video) — distilled 1.3B validation on in-distribution prompt.
             - name: INPUT_VIDEO_SRC
-              value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v input (cat=t2v also runs)
-            # SINGLE-STREAM TP-8 (FPS lever A): NPROC==TP_DEGREE==8 -> one wide TP-8
-            # group, NO data-parallel split. Measures whether 8 cores beat 4 on ONE
-            # stream's per-block DiT (TP-4 baseline = 8.65s/block). DP (NPROC=16) was
-            # throughput-only and is NOT an fps lever — do not use it.
+              value: ""
+            # 1.3B student: TP-4 (12 heads -> TP must divide 12). NPROC==TP_DEGREE=4.
             - name: NPROC
-              value: "8"
+              value: "4"
             - name: TP_DEGREE
-              value: "8"
-            # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
-            # weights; set e.g. "500,0" to sweep faster-but-worse points.
+              value: "4"
+            # MUST match the distilled step count (trained with 700,0).
             - name: STEPS
-              value: "700,500,400,200,0"
+              value: "700,0"
+            - name: DISTILL_CKPT
+              value: "/var/mdl/video-distill/checkpoints/202607021036/model.pt"
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
