@@ -387,7 +387,16 @@ def main():
                 d = cat_dim.get(k, None)
                 full[k] = shards[0][k] if (d is None or tp == 1) else torch.cat(
                     [shards[r][k] for r in range(tp)], dim=d)
-            sd = {f"model.{k}": v for k, v in full.items()}
+            # Strip compile/wrapper infixes so keys match the FRESH (uncompiled) inference
+            # model at load time: neuron_compile wraps submodules in _ContiguousWrapper
+            # (.compiled_module.) and torch.compile adds ._orig_mod. The loader builds a
+            # bare model and loads BEFORE compiling, so it expects clean names.
+            def _clean(k):
+                return (k.replace(".compiled_module.", ".")
+                         .replace("._orig_mod.", ".")
+                         .replace(".compiled_module", "")
+                         .replace("._orig_mod", ""))
+            sd = {f"model.{_clean(k)}": v for k, v in full.items()}
             torch.save({"generator": sd, "distill_iter": it}, args.out)
             LOGGER.info(f"[ckpt] wrote {args.out} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
 
