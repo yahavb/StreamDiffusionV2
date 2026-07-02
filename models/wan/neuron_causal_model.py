@@ -96,7 +96,15 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
                            num_valid_frames=None, shared_buffers=None):
         assert self.model_type == 't2v'
         assert x.shape[0] == 1
-        assert not torch.is_grad_enabled()
+        # Inference asserts no-grad (the rolling KV cache uses in-place .copy_ writes,
+        # fine for eval). For DISTILLATION we backprop through this forward on Neuron
+        # (proven: eager loss.backward() works on device — see private-torch-neuronx
+        # gpt2-train-loop). The .copy_ targets are pre-allocated BUFFERS, not autograd
+        # leaves, so grads flow through attention normally. Allow grad when the DiT is
+        # in training mode; keep the inference guard otherwise.
+        if not self.training:
+            assert not torch.is_grad_enabled(), \
+                "grad enabled in inference forward — set model.eval() or wrap in no_grad"
 
         # Access device from a raw parameter (compiled modules may not expose .weight)
         device = next(self.parameters()).device
