@@ -95,7 +95,7 @@ spec:
                 --steps "${STEPS:-700,0}" \
                 --iters "${ITERS:-500}" \
                 --tp_degree "${TP_DEGREE:-8}" \
-                --height 360 --width 640 \
+                --height 352 --width 640 \
                 --out "$RUN/model.pt" || echo "TRAIN FAILED"
 
               # ─── copy checkpoint + log to S3 ONCE at end ───
