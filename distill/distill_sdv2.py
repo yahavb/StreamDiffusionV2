@@ -353,14 +353,39 @@ def main():
     fake_cache = make_score_cache(fake_score) if in_fake else None
 
     def save_ckpt(it):
-        """Gather full weights across the STUDENT TP group + write on its root.
-        ALL student ranks must call (all_gather is collective); only ssrc writes."""
+        """Reassemble FULL weights from TP shards WITHOUT an on-device collective
+        (device all_gather hits the Neuron compile service -> errno=2). Each student
+        rank dumps its CPU shard to a file; the student root reads all tp shards and
+        concatenates per layer (col->dim0, row->dim1, norm->dim0, replicated->rank0)."""
         if not in_student:
             return
-        from models.wan.tp_utils import get_tp_group
-        full = _gather_full_state_dict(G.model, get_tp_group(), tp)
+        from models.wan.tp_utils import (ColumnParallelLinear, RowParallelLinear, TPRMSNorm)
+        local_tp_rank = my_rank - ssrc
+        shard_dir = os.path.join(os.path.dirname(args.out), "shards")
+        os.makedirs(shard_dir, exist_ok=True)
+        # 1) every student rank writes its shard (CPU) + a cat-dim map (rank0 only needs map)
+        cat_dim = {}
+        for mn, m in G.model.named_modules():
+            if isinstance(m, ColumnParallelLinear):
+                cat_dim[f"{mn}.weight"] = 0
+                if getattr(m, "bias", None) is not None: cat_dim[f"{mn}.bias"] = 0
+            elif isinstance(m, RowParallelLinear):
+                cat_dim[f"{mn}.weight"] = 1
+            elif isinstance(m, TPRMSNorm):
+                cat_dim[f"{mn}.weight"] = 0
+        shard = {k: v.detach().to(torch.bfloat16).cpu() for k, v in G.model.state_dict().items()}
+        torch.save(shard, os.path.join(shard_dir, f"shard_{local_tp_rank}.pt"))
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group())  # all shards on disk before root reads
+        # 2) root concatenates
         if my_rank == ssrc or not dist.is_initialized():
-            os.makedirs(os.path.dirname(args.out), exist_ok=True)
+            shards = [torch.load(os.path.join(shard_dir, f"shard_{r}.pt"), map_location="cpu")
+                      for r in range(tp)]
+            full = {}
+            for k in shards[0]:
+                d = cat_dim.get(k, None)
+                full[k] = shards[0][k] if (d is None or tp == 1) else torch.cat(
+                    [shards[r][k] for r in range(tp)], dim=d)
             sd = {f"model.{k}": v for k, v in full.items()}
             torch.save({"generator": sd, "distill_iter": it}, args.out)
             LOGGER.info(f"[ckpt] wrote {args.out} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
