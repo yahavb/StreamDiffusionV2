@@ -307,6 +307,44 @@ def main():
             dist.broadcast(t, src=src)
         return t
 
+    # Teacher/fake forward REQUIRES a kv_cache (model has no cache-free path). For a
+    # one-shot score we allocate a FRESH single-block cache each call (no streaming
+    # state carried). Sized from the net's own dims (14B vs 1.3B differ).
+    def make_score_cache(net):
+        m = net.model
+        nb = m.num_layers if hasattr(m, "num_layers") else len(m.blocks)
+        nh = m.num_heads // tp
+        hd = m.dim // m.num_heads
+        fseq = (args.height // 8 // 2) * (args.width // 8 // 2)  # patch2 latent tokens
+        kvlen = fseq * getattr(args, "num_kv_cache", 6)
+        import models.wan.neuron_layers as _nl
+        pad = ((21 * fseq + _nl.ATTN_SEQLEN_MULTIPLE - 1) // _nl.ATTN_SEQLEN_MULTIPLE) * _nl.ATTN_SEQLEN_MULTIPLE
+        kv = [{"k": torch.zeros(1, kvlen, nh, hd, dtype=dtype, device=device),
+               "v": torch.zeros(1, kvlen, nh, hd, dtype=dtype, device=device),
+               "global_end_index": 0, "local_end_index": 0} for _ in range(nb)]
+        ca = [{"k": torch.zeros(1, 512, nh, hd, dtype=dtype, device=device),
+               "v": torch.zeros(1, 512, nh, hd, dtype=dtype, device=device),
+               "is_init": False} for _ in range(nb)]
+        sb = (torch.zeros(1, pad, nh, hd, dtype=dtype, device=device),
+              torch.zeros(1, pad, nh, hd, dtype=dtype, device=device))
+        return kv, ca, sb, fseq
+
+    def score(net, x_t, tt, condb, cache):
+        kv, ca, sb, fseq = cache
+        # reset cache indices each call -> every score is a fresh single-block denoise
+        # (no streaming state carried between iters; DMD scores are independent).
+        for c in kv:
+            c["global_end_index"] = 0; c["local_end_index"] = 0
+        for c in ca:
+            c["is_init"] = False
+        return net(noisy_image_or_video=x_t, conditional_dict=condb, timestep=tt,
+                   kv_cache=kv, crossattn_cache=ca, current_start=0,
+                   current_end=fseq * npb, updating_cache=True, shared_buffers=sb)
+
+    # allocate scoring caches once (fresh per call would leak; reset indices each iter)
+    teacher_cache = make_score_cache(real_score) if in_teacher else None
+    fake_cache = make_score_cache(fake_score) if in_fake else None
+
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
@@ -347,16 +385,14 @@ def main():
         real_pred = zeros_lat()
         if in_teacher:
             with torch.no_grad():
-                real_pred = real_score(noisy_image_or_video=x_t, conditional_dict=condb,
-                                       timestep=tt, kv_cache=None, crossattn_cache=None)
+                real_pred = score(real_score, x_t, tt, condb, teacher_cache)
         real_pred = bcast(real_pred, tsrc)
 
         # (d) fake scores x_t (its group), broadcasts fake_pred back
         fake_pred = zeros_lat()
         if in_fake:
             with torch.no_grad():
-                fake_pred = fake_score(noisy_image_or_video=x_t, conditional_dict=condb,
-                                       timestep=tt, kv_cache=None, crossattn_cache=None)
+                fake_pred = score(fake_score, x_t, tt, condb, fake_cache)
         fake_pred = bcast(fake_pred, fsrc)
 
         # (e) student DMD update (its group)
@@ -369,10 +405,17 @@ def main():
             opt_g.zero_grad(); loss_g.backward(); opt_g.step()
             gl = float(loss_g.detach())
 
-        # (f) fake trains to track G, on x0_send (its group)
+        # (f) fake trains to track G, on x0_send (its group) — diffusion loss
         lf = float("nan")
         if in_fake:
-            loss_f = fake_score_loss(x0_send, fake_score, condb, scheduler_fake, device)
+            bb = x0_send.shape[0]
+            tf = torch.randint(20, 980, (bb,), device=device)
+            xtf = scheduler_fake.add_noise(x0_send.flatten(0, 1),
+                                           torch.randn_like(x0_send).flatten(0, 1),
+                                           tf).unflatten(0, x0_send.shape[:2])
+            ttf = tf.view(bb, 1).expand(bb, x0_send.shape[1])
+            pred_f = score(fake_score, xtf, ttf, condb, fake_cache)
+            loss_f = F.mse_loss(pred_f, x0_send)
             opt_f.zero_grad(); loss_f.backward(); opt_f.step()
             lf = float(loss_f.detach())
 
