@@ -1,0 +1,131 @@
+# Validate the DISTILLED 1.3B checkpoint (task #23) — inference on an IN-DISTRIBUTION
+# prompt (one from the 100-prompt distill corpus). Answers: did the student learn the
+# distilled domain? If yes -> measure fps at the distilled step count.
+#
+# Compares against the base 1.3B implicitly (we KNOW base 1.3B was cartoony/rejected):
+# if the distilled output is meaningfully better ON THIS PROMPT, the concept works.
+#
+# Launch:
+#   kubectl delete job sd-distill-val --ignore-not-found
+#   kubectl apply -f sd-distill-validate-job.yaml
+#   kubectl logs -f job/sd-distill-val
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sd-distill-val
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: sd-distill-val
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
+      containers:
+        - name: sd-distill-val
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+              BRANCH="${BRANCH:-exp/fps-1.3b}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/StreamDiffusionV2.git REPO
+              cd REPO
+              echo "commit: $(git rev-parse HEAD)"
+              export RF_DEVICE_BACKEND=neuron
+              uv pip install -r requirements-neuron.txt || pip install -r requirements-neuron.txt
+              uv pip install "setuptools<81" || pip install "setuptools<81"
+
+              # ─── 1.3B base weights (student size) ───
+              WAN13="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
+              mkdir -p wan_models
+              [[ -f "$WAN13" ]] && { cp "$WAN13" /tmp/a.tar && tar xf /tmp/a.tar -C wan_models/ && rm -f /tmp/a.tar; } \
+                || python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+
+              # ─── the DISTILLED checkpoint (task #23 input) ───
+              mkdir -p ckpts/distilled
+              cp "$DISTILL_CKPT" ckpts/distilled/model.pt
+              echo "distilled ckpt: $DISTILL_CKPT ($(du -h ckpts/distilled/model.pt | cut -f1))"
+
+              TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
+              RUN=/tmp/run/$TS; FINAL=/var/mdl/stream_diffusion/runs/$TS
+              mkdir -p "$RUN"; exec > >(tee "$RUN/run.log") 2>&1
+              echo "RUN=$RUN"
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
+
+              # inference: 1.3B config, but generator_ckpt overridden to the DISTILLED model,
+              # at the TRAINED res (352x640) + step count (700,0). IN-DISTRIBUTION prompt.
+              torchrun --nproc_per_node=4 streamv2v/inference_neuron.py \
+                --config streamv2v/configs/wan_causal_fps_neuron.yaml \
+                --generator_ckpt ckpts/distilled/model.pt \
+                --steps "${STEPS:-700,0}" \
+                --num_frames 81 --height 352 --width 640 --device neuron \
+                --prompt "A person in a striped shirt flips a pancake in a kitchen. The camera is handheld and shaky, capturing the motion as the person lifts and releases the pan. The background shows a dining area with another person seated. Warm indoor lighting illuminates the scene." \
+                --fps 16 --output_path "$RUN/pancake.mp4" || echo "RENDER FAILED"
+
+              if ls "$RUN"/pancake_frames/frame_*.png >/dev/null 2>&1; then
+                python3 -c "import imageio,glob; fr=sorted(glob.glob('$RUN/pancake_frames/frame_*.png')); w=imageio.get_writer('$RUN/pancake.mp4', fps=16); [w.append_data(imageio.imread(f)) for f in fr]; w.close(); print('wrote pancake.mp4', len(fr), 'frames')"
+              fi
+              mkdir -p "$FINAL"; cp -r "$RUN"/. "$FINAL"/ || echo "copy failed"
+              echo "=== DONE. VALIDATE: watch $FINAL/pancake.mp4 (in-distribution prompt, distilled ckpt) ==="
+              ls -lhR "$FINAL" | head -30
+          resources:
+            claims:
+              - name: m-lnc1-trn2
+            requests:
+              cpu: 40
+              memory: 512Gi
+            limits:
+              cpu: 40
+              memory: 512Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "exp/fps-1.3b"
+            - name: DISTILL_CKPT
+              value: "/var/mdl/video-distill/checkpoints/202607021036/model.pt"
+            - name: STEPS
+              value: "700,0"        # the distilled step count (must match training)
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

@@ -83,6 +83,9 @@ def parse_args():
     # world_size/tp_degree separate TP groups (accidental data-parallel) instead of
     # one wider TP group. Keep --tp_degree == nproc_per_node for a single stream.
     parser.add_argument("--tp_degree", type=int, default=None)
+    # generator_ckpt override: load a DIFFERENT checkpoint than the config's (e.g. a
+    # freshly-distilled model.pt) without editing the yaml. Overrides config after merge.
+    parser.add_argument("--generator_ckpt", type=str, default=None)
     return parser.parse_args()
 
 
@@ -413,13 +416,20 @@ def main():
 
     config = OmegaConf.load(args.config)
 
-    # Capture CLI tp_degree BEFORE merge (merge would overwrite None with config's value).
+    # Capture CLI overrides BEFORE merge (merge would overwrite None with config's value).
     cli_tp_degree = getattr(args, 'tp_degree', None)
+    cli_generator_ckpt = getattr(args, 'generator_ckpt', None)
 
     # Merge config into args
     for k, v in config.items():
         if not hasattr(args, k) or getattr(args, k) is None:
             setattr(args, k, v)
+
+    # generator_ckpt override: CLI wins over config (load a distilled ckpt without
+    # editing the yaml). Explicit + logged so we never silently load the wrong model.
+    if cli_generator_ckpt is not None:
+        args.generator_ckpt = cli_generator_ckpt
+        print(f"[ckpt] generator_ckpt overridden from CLI: {cli_generator_ckpt}", flush=True)
 
     # TP override: CLI --tp_degree wins over config. Must equal nproc_per_node so the
     # whole world is ONE TP group (one wide stream), not several smaller TP groups.
