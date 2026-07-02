@@ -149,6 +149,13 @@ def build_neuron_generator(model_path, ckpt_path, args, device, trainable, tp_de
         device=device,
         tp_degree=tp_degree,
     )
+    # Match the attention frame_length to OUR resolution (default is 1560 = 480p);
+    # the pipeline does this for the student, but teacher/fake built here must too,
+    # or attention expects block_length=3*1560 while inputs are 3*frame_seq -> shape err.
+    frame_seq = (args.height // 16) * (args.width // 16)
+    g.model._update_frame_length(frame_seq,
+                                 num_frame_per_block=getattr(args, "num_frame_per_block", 3),
+                                 num_kv_cache=getattr(args, "num_kv_cache", 6))
     if trainable:
         g.model.train().requires_grad_(True)
     else:
