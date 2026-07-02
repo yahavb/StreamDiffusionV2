@@ -376,22 +376,32 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         current_start_int = int(current_start)
         current_end_int = int(current_end) if current_end is not None else self.frame_seq_length
 
+        # DISTILL memory: DMD only needs grad through the LAST denoise step. Wrap the
+        # earlier steps in no_grad so their activation graph isn't retained for
+        # backward (the multi-step x 30-layer rollout graph was the 24GB OOM). Set
+        # via env DISTILL_GRAD_LAST_ONLY=1 (inference path keeps full behavior).
+        _grad_last = os.environ.get("DISTILL_GRAD_LAST_ONLY", "").lower() in ("1", "true")
+        _nsteps = len(self.denoising_step_list)
         for index, current_timestep in enumerate(self.denoising_step_list):
             timestep = torch.ones(
                 [batch_size, noise.shape[1]], device=device,
                 dtype=torch.int64) * current_timestep
 
-            denoised_pred = self.generator(
-                noisy_image_or_video=noise,
-                conditional_dict=self.conditional_dict,
-                timestep=timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_int,
-                current_end=current_end_int,
-                updating_cache=True,
-                shared_buffers=self.shared_buffers,
-            )
+            _is_last = (index == _nsteps - 1)
+            import contextlib
+            _ctx = torch.no_grad() if (_grad_last and not _is_last) else contextlib.nullcontext()
+            with _ctx:
+                denoised_pred = self.generator(
+                    noisy_image_or_video=noise,
+                    conditional_dict=self.conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_int,
+                    current_end=current_end_int,
+                    updating_cache=True,
+                    shared_buffers=self.shared_buffers,
+                )
 
             if index < len(self.denoising_step_list) - 1:
                 next_timestep = self.denoising_step_list[index + 1]

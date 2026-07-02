@@ -128,6 +128,8 @@ spec:
               value: "4"             # 1.3B student caps at TP-4 (12 heads); 14B ok too
             - name: STEPS
               value: "700,0"         # 2-step student (fps lever). "0" = 1-step.
+            - name: DISTILL_GRAD_LAST_ONLY
+              value: "1"  # DMD: grad only through last denoise step (cuts rollout activation OOM)
             - name: ITERS
               value: "5"             # SMOKE TEST: 5 iters to prove the loop steps, not a real ckpt
             - name: CAPTIONS_SRC
