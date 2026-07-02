@@ -80,6 +80,19 @@ spec:
               fi
               echo "1.3B base weights ready (distilled ckpt loaded at render time)!"
 
+              # ─── SANITY CHECK: jerryfeng 1.3B DMD checkpoint (known-good) ───
+              # Isolates pipeline vs our-undertrained-ckpt: if THIS gives good video at
+              # 5-step, the pipeline is sound and our distilled noise is pure undertraining.
+              JERRY13="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
+              mkdir -p ckpts/wan_causal_dmd_v2v
+              if [[ -f "$JERRY13" ]]; then
+                cp "$JERRY13" ckpts/wan_causal_dmd_v2v/model.pt
+              else
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v/*'], local_dir='ckpts')"
+                mkdir -p "$(dirname $JERRY13)" && cp ckpts/wan_causal_dmd_v2v/model.pt "$JERRY13"
+              fi
+              echo "jerryfeng 1.3B DMD ckpt ready ($(du -h ckpts/wan_causal_dmd_v2v/model.pt | cut -f1))"
+
               # ─── ONE timestamped folder for this whole run ───
               # WORK ON LOCAL DISK (/tmp) — /var/mdl is S3-backed: slow on the critical
               # path AND ffmpeg can't write mp4 trailers there (Invalid argument). Copy
@@ -130,12 +143,13 @@ spec:
               NPROC="${NPROC:-4}"
               TP_DEGREE="${TP_DEGREE:-4}"
               STEPS="${STEPS:-700,500,400,200,0}"
-              DISTILL_CKPT="${DISTILL_CKPT:-/var/mdl/video-distill/checkpoints/202607021142/model.pt}"
-              mkdir -p ckpts/distilled && cp "$DISTILL_CKPT" ckpts/distilled/model.pt
-              echo "distilled ckpt: $DISTILL_CKPT ($(du -h ckpts/distilled/model.pt | cut -f1))"
+              # SANITY CHECK: run the KNOWN-GOOD jerryfeng 1.3B DMD ckpt (not our distilled
+              # one) at 5-step. Good video here = pipeline sound; noise = pipeline broken.
+              CKPT="${CKPT:-ckpts/wan_causal_dmd_v2v/model.pt}"
+              echo "inference ckpt: $CKPT"
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
                 --config streamv2v/configs/wan_causal_fps_neuron.yaml \
-                --generator_ckpt ckpts/distilled/model.pt \
+                --generator_ckpt $CKPT \
                 --steps $STEPS --tp_degree $TP_DEGREE \
                 --num_frames 81 --height 352 --width 640 --device neuron"
 
