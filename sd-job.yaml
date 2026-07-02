@@ -130,7 +130,7 @@ spec:
               NPROC="${NPROC:-4}"
               TP_DEGREE="${TP_DEGREE:-4}"
               STEPS="${STEPS:-700,0}"
-              DISTILL_CKPT="${DISTILL_CKPT:-/var/mdl/video-distill/checkpoints/202607021036/model.pt}"
+              DISTILL_CKPT="${DISTILL_CKPT:-/var/mdl/video-distill/checkpoints/202607021142/model.pt}"
               mkdir -p ckpts/distilled && cp "$DISTILL_CKPT" ckpts/distilled/model.pt
               echo "distilled ckpt: $DISTILL_CKPT ($(du -h ckpts/distilled/model.pt | cut -f1))"
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
@@ -236,7 +236,7 @@ spec:
             - name: STEPS
               value: "700,0"
             - name: DISTILL_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607021036/model.pt"
+              value: "/var/mdl/video-distill/checkpoints/202607021142/model.pt"
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
