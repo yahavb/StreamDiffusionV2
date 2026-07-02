@@ -433,6 +433,18 @@ def main():
         if save_here and it > 0 and it % args.save_every == 0:
             _save(G, args.out, it)
 
+        # ── FREE the iteration's graph/tensors before the next iter allocates ──
+        # OOM at iter 1 start was iter 0's autograd graph + latents lingering. Rebind
+        # the big tensors to None (drops refs -> autograd graph freed) and clear the
+        # student's KV/cross/shared caches so HBM is reclaimed before the next rollout.
+        x0_student = x_t = real_pred = fake_pred = x0_send = None
+        if in_student:
+            student.kv_cache1 = None
+            student.crossattn_cache = None
+            student.shared_buffers = None
+        import gc as _gc
+        _gc.collect()
+
     save_here = (my_rank == ssrc) or (not dist.is_initialized())
     if save_here:
         _save(G, args.out, args.iters)
