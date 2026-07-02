@@ -352,6 +352,19 @@ def main():
     teacher_cache = make_score_cache(real_score) if in_teacher else None
     fake_cache = make_score_cache(fake_score) if in_fake else None
 
+    def save_ckpt(it):
+        """Gather full weights across the STUDENT TP group + write on its root.
+        ALL student ranks must call (all_gather is collective); only ssrc writes."""
+        if not in_student:
+            return
+        from models.wan.tp_utils import get_tp_group
+        full = _gather_full_state_dict(G.model, get_tp_group(), tp)
+        if my_rank == ssrc or not dist.is_initialized():
+            os.makedirs(os.path.dirname(args.out), exist_ok=True)
+            sd = {f"model.{k}": v for k, v in full.items()}
+            torch.save({"generator": sd, "distill_iter": it}, args.out)
+            LOGGER.info(f"[ckpt] wrote {args.out} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
+
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
@@ -426,12 +439,10 @@ def main():
             opt_f.zero_grad(); loss_f.backward(); opt_f.step()
             lf = float(loss_f.detach())
 
-        # save from the STUDENT group's root (ssrc) — global rank 0 is a teacher rank (no G)
-        save_here = (my_rank == ssrc) or (not dist.is_initialized())
-        if save_here and it % 20 == 0:
+        if (my_rank == ssrc or not dist.is_initialized()) and it % 20 == 0:
             LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_fake={lf:.4f}")
-        if save_here and it > 0 and it % args.save_every == 0:
-            _save(G, args.out, it)
+        if it > 0 and it % args.save_every == 0:
+            save_ckpt(it)
 
         # ── FREE the iteration's graph/tensors before the next iter allocates ──
         # OOM at iter 1 start was iter 0's autograd graph + latents lingering. Rebind
@@ -445,19 +456,50 @@ def main():
         import gc as _gc
         _gc.collect()
 
-    save_here = (my_rank == ssrc) or (not dist.is_initialized())
-    if save_here:
-        _save(G, args.out, args.iters)
+    save_ckpt(args.iters)
     LOGGER.info("done. VALIDATE: load the checkpoint into sd-job.yaml and WATCH the video "
                 "(never trust training loss alone).")
 
 
-def _save(G, out, it):
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    # neuron_wan_wrapper strips 'model.' and _fsdp_wrapped_ prefixes; emit plain 'model.' keys.
-    sd = {f"model.{k}": v.to(torch.bfloat16).cpu() for k, v in G.model.state_dict().items()}
-    torch.save({"generator": sd, "distill_iter": it}, out)
-    LOGGER.info(f"[ckpt] wrote {out} (iter {it}) — drop-in for sd-job generator_ckpt")
+def _gather_full_state_dict(model, tp_group, tp_degree):
+    """Reassemble FULL (unsharded) weights from the TP-sharded model.
+    Each sharded layer split one dim across ranks; all_gather + concat reverses it:
+      ColumnParallelLinear.weight  -> split dim0 (out) -> gather+cat dim0
+      RowParallelLinear.weight     -> split dim1 (in)  -> gather+cat dim1
+      TPRMSNorm.weight             -> split dim0       -> gather+cat dim0
+      everything else (replicated) -> identical on all ranks -> take local
+    Returns a full state_dict on CPU (only meaningful on the group root)."""
+    from models.wan.tp_utils import ColumnParallelLinear, RowParallelLinear, TPRMSNorm
+
+    # map each parameter's full-name -> concat dim (or None = replicated)
+    cat_dim = {}
+    for mod_name, mod in model.named_modules():
+        if isinstance(mod, ColumnParallelLinear):
+            cat_dim[f"{mod_name}.weight"] = 0
+            if getattr(mod, "bias", None) is not None:
+                cat_dim[f"{mod_name}.bias"] = 0
+        elif isinstance(mod, RowParallelLinear):
+            cat_dim[f"{mod_name}.weight"] = 1
+            # row bias is full (added after all-reduce) -> replicated
+        elif isinstance(mod, TPRMSNorm):
+            cat_dim[f"{mod_name}.weight"] = 0
+
+    full = {}
+    for name, p in model.state_dict().items():
+        d = cat_dim.get(name, None)
+        loc = p.detach().to(torch.bfloat16)
+        if d is None or tp_degree == 1:
+            full[name] = loc.cpu()
+            continue
+        gathered = [torch.empty_like(loc) for _ in range(tp_degree)]
+        if dist.is_initialized():
+            dist.all_gather(gathered, loc.contiguous(), group=tp_group)
+        else:
+            gathered = [loc]
+        full[name] = torch.cat(gathered, dim=d).cpu()
+    return full
+
+
 
 
 if __name__ == "__main__":
