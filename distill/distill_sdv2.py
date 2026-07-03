@@ -446,33 +446,39 @@ def main():
         _stage(it, "iter-start")
         prompt = [prompts[it % len(prompts)]]
 
-        # (a) student generates x0 via Self-Forcing rollout (grad on)
-        x0_student = cond = None
+        # ── STRUCTURAL graph-free DMD (fixes the 22.7GB resident autograd graph) ──
+        # OLD: x0_student's full 30-block rollout GRAPH was held alive from (a) through
+        # the two broadcasts + teacher/fake scoring to (e) — 22.7GB resident, OOM iter12.
+        # NEW: (a) computes x0 under NO_GRAD (detached, cheap, no graph). Teacher/fake
+        # score that detached x0. Then (e) RECOMPUTES the student forward WITH grad
+        # right before backward, so the graph lives only for the single backward and is
+        # freed immediately. Same fixed noise/timestep is reused so recompute matches.
+
+        # (a) student generates x0 — NO GRAD (detached rollout, no retained graph)
+        x0_det = cond = None
+        _rollout_noise = _rollout_t = None
         if in_student:
             student.kv_cache1 = None
             student.crossattn_cache = None
-            noise = torch.randn(lat_shape, dtype=dtype, device=device)
-            x0_student = student.prepare(
-                text_prompts=prompt, device=device, dtype=dtype,
-                noise=noise, current_start=0, current_end=frame_seq * npb,
-                batch_denoise=False)
+            _rollout_noise = torch.randn(lat_shape, dtype=dtype, device=device)
+            with torch.no_grad():
+                x0_det = student.prepare(
+                    text_prompts=prompt, device=device, dtype=dtype,
+                    noise=_rollout_noise, current_start=0, current_end=frame_seq * npb,
+                    batch_denoise=False).detach()
             cond = student.conditional_dict
-        _stage(it, "a:student-rollout")
+        _stage(it, "a:student-rollout(no_grad)")
 
-        # (b) student builds x_t + timestep + embeds, broadcasts to teacher & fake groups
+        # (b) build x_t + timestep from the DETACHED x0; broadcast to teacher & fake
         if in_student:
-            b = x0_student.shape[0]
-            # DISCRETE timesteps: a random *value* every iter makes torch.compile trace a
-            # NEW graph -> a NEW module.neff loads and never unloads -> scratchpad grows ->
-            # OOM iter12. Pick from a FIXED small bucket set so NEFFs repeat/reuse.
-            t = _DMD_TIMESTEPS[torch.randint(0, len(_DMD_TIMESTEPS), (b,), device=device)]
-            x_t = scheduler.add_noise(x0_student.flatten(0, 1),
-                                      torch.randn_like(x0_student).flatten(0, 1),
-                                      t).unflatten(0, x0_student.shape[:2])
-            tt = t.view(b, 1).expand(b, x0_student.shape[1])
+            b = x0_det.shape[0]
+            _rollout_t = _DMD_TIMESTEPS[torch.randint(0, len(_DMD_TIMESTEPS), (b,), device=device)]
+            _noise_t = torch.randn_like(x0_det)
+            x_t = scheduler.add_noise(x0_det.flatten(0, 1), _noise_t.flatten(0, 1),
+                                      _rollout_t).unflatten(0, x0_det.shape[:2])
+            tt = _rollout_t.view(b, 1).expand(b, x0_det.shape[1])
             embeds = cond["prompt_embeds"]
-            # also send x0 (detached) so the fake group can train on it
-            x0_send = x0_student.detach()
+            x0_send = x0_det  # already detached
         else:
             x_t = zeros_lat(); tt = torch.zeros((1, npb), dtype=torch.int64, device=device)
             embeds = torch.zeros(emb_shape, dtype=dtype, device=device); x0_send = zeros_lat()
@@ -480,7 +486,7 @@ def main():
         embeds = bcast(embeds, ssrc); x0_send = bcast(x0_send, ssrc)
         condb = {"prompt_embeds": embeds}
 
-        # (c) teacher scores x_t (its group), broadcasts real_pred back
+        # (c) teacher scores x_t (no student graph alive), broadcasts real_pred back
         real_pred = zeros_lat()
         if in_teacher:
             with torch.no_grad():
@@ -488,7 +494,7 @@ def main():
         real_pred = bcast(real_pred, tsrc)
         _stage(it, "c:teacher-score")
 
-        # (d) fake scores x_t (its group), broadcasts fake_pred back
+        # (d) fake scores x_t, broadcasts fake_pred back
         fake_pred = zeros_lat()
         if in_fake:
             with torch.no_grad():
@@ -496,16 +502,23 @@ def main():
         fake_pred = bcast(fake_pred, fsrc)
         _stage(it, "d:fake-score")
 
-        # (e) student DMD update (its group)
+        # (e) student DMD update — RECOMPUTE the forward WITH grad now (fresh graph,
+        # freed right after backward). DMD gradient = (fake-real) applied to x0.
         gl = float("nan")
         if in_student and (it % args.dfake_gen_update_ratio == 0):
+            student.kv_cache1 = None
+            student.crossattn_cache = None
+            x0_grad = student.prepare(          # WITH grad this time
+                text_prompts=prompt, device=device, dtype=dtype,
+                noise=_rollout_noise, current_start=0, current_end=frame_seq * npb,
+                batch_denoise=False)
             grad = (fake_pred - real_pred)
             grad = grad / (grad.abs().mean() + 1e-8)
-            target = (x0_student - grad).detach()
-            loss_g = 0.5 * F.mse_loss(x0_student, target)
+            target = (x0_grad - grad).detach()
+            loss_g = 0.5 * F.mse_loss(x0_grad, target)
             opt_g.zero_grad(set_to_none=True); loss_g.backward(); opt_g.step()
-            del grad, target  # drop student DMD graph tensors
             gl = float(loss_g.detach())
+            del grad, target, x0_grad, loss_g   # free the fresh graph immediately
         _stage(it, "e:student-backward")
 
         # (f) fake trains to track G, on x0_send (its group) — diffusion loss
@@ -555,7 +568,7 @@ def main():
         # the big tensors to None (drops refs -> autograd graph freed) and clear the
         # student's KV/cross/shared caches so HBM is reclaimed before the next rollout.
         # Free per-iter tensors (autograd graphs) across ALL groups.
-        x0_student = x_t = real_pred = fake_pred = x0_send = None
+        x0_det = x_t = real_pred = fake_pred = x0_send = None
         if in_student:
             student.kv_cache1 = None
             student.crossattn_cache = None
