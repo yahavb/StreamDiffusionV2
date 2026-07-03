@@ -150,8 +150,12 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             })
             if _gckpt:
                 import torch.utils.checkpoint as _ckpt
+                # use_reentrant=True: no strict fwd/recompute tensor-match check (the block
+                # writes the KV cache in-place as a side effect, so recompute's tensor set
+                # differs -> non-reentrant asserts. Reentrant tolerates it; for our 1-step
+                # rollout the cache write is idempotent-per-block so double-write is safe).
                 x = _ckpt.checkpoint(lambda _x, _b=block, _k=dict(kwargs): _b(_x, **_k),
-                                     x, use_reentrant=False)
+                                     x, use_reentrant=True)
             else:
                 x = block(x, **kwargs)
 
