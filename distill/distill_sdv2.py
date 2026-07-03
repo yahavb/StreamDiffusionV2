@@ -160,20 +160,18 @@ def build_student_pipeline(args, device, dtype):
     # FSDP2: shard across the STUDENT group ONLY (ranks 4-7), not the whole world.
     # fully_shard needs a DeviceMesh over exactly those ranks. Build a mesh from the
     # student rank list (from tp_utils group base/size).
+    # Mesh pattern from private-torch-neuronx run_benchmarks.py: 2D (dp, shard) mesh,
+    # slice mesh["shard"] -> each rank's own group submesh. n = GROUP size (the 3-group
+    # placement = tp arg), NOT get_tp_world_size() (student built tp=1 so that's 1).
     from torch.distributed.device_mesh import init_device_mesh
-    from models.wan.tp_utils import get_tp_group_base, get_tp_world_size
-    base = get_tp_group_base()          # 4 for the student group
-    n = get_tp_world_size()             # 4
-    # a 1-D mesh over this group's ranks. init_device_mesh partitions the GLOBAL world
-    # into meshes; each rank lands in the mesh covering its contiguous block of size n.
+    n = int(os.environ.get("TP_DEGREE", "4"))   # ranks per placement group (4)
     mesh = init_device_mesh("neuron", (dist.get_world_size() // n, n),
                             mesh_dim_names=("dp", "shard"))
-    # this rank's row of the mesh = its group's size-n shard dimension
-    local_mesh = mesh["shard"]
+    local_mesh = mesh["shard"]   # this rank's size-n shard submesh (its group)
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for blk in m.blocks:
-        fully_shard(blk, mesh=local_mesh, mp_policy=mp)
-    fully_shard(m, mesh=local_mesh, mp_policy=mp)
+        fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+    fully_shard(m, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
     LOGGER.info(f"student: FSDP2 per-block+root on mesh ranks[{base}:{base+n}], "
                 f"{len(m.blocks)} blocks, NO_REENTRANT ckpt")
     return pipe
