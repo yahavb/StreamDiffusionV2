@@ -135,33 +135,23 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             shared_buffers=shared_buffers,
         )
 
-        # DISTILL_GRAD_CKPT: gradient-checkpoint each DiT block during training — the
-        # per-iter peak was ~13GB (student rollout retains all 30 layers' activations
-        # for backward -> OOM). Checkpointing recomputes activations in backward instead
-        # of storing them, cutting the activation peak ~5-8x. Only when grad is on.
-        # Only the STUDENT needs checkpointing (its multi-layer rollout is the 13GB
-        # peak). The fake_score's single training forward must NOT be checkpointed —
-        # reentrant checkpoint there double-frees the graph ("backward a second time").
-        # Gated by a per-model flag (set on the student only), AND grad enabled.
+        # DISTILL_GRAD_CKPT: gradient-checkpointing is applied INSIDE the block, on the
+        # FFN only (see CausalWanAttentionBlock) — NOT here at block level. Block-level
+        # checkpointing recomputes the self-attn's in-place KV .copy_ side-effect in
+        # backward -> "backward through the graph a second time". The FFN is pure compute
+        # (no cache), so checkpointing it is safe AND it's the widest activation
+        # (ffn_dim=8960) = most of the memory. Flag propagated to blocks below.
         _gckpt = (getattr(self, "_distill_grad_ckpt", False)
                   and self.training and torch.is_grad_enabled())
         for block_index, block in enumerate(self.blocks):
+            block._distill_ckpt_ffn = _gckpt
             kwargs.update({
                 "kv_cache": kv_cache[block_index],
                 "crossattn_cache": crossattn_cache[block_index],
                 "current_start": current_start,
                 "cache_start": cache_start,
             })
-            if _gckpt:
-                import torch.utils.checkpoint as _ckpt
-                # use_reentrant=True: no strict fwd/recompute tensor-match check (the block
-                # writes the KV cache in-place as a side effect, so recompute's tensor set
-                # differs -> non-reentrant asserts. Reentrant tolerates it; for our 1-step
-                # rollout the cache write is idempotent-per-block so double-write is safe).
-                x = _ckpt.checkpoint(lambda _x, _b=block, _k=dict(kwargs): _b(_x, **_k),
-                                     x, use_reentrant=True)
-            else:
-                x = block(x, **kwargs)
+            x = block(x, **kwargs)
 
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = x.flatten(1, 2)
