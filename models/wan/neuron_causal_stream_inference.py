@@ -161,11 +161,18 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=512, clean='whitespace')
 
-        # Initialize T5 (only on this group's T5 rank — on Neuron with torch.compile)
+        # DISTILL memory savers: training is 100% in latent space, so the VAE decoder
+        # is NEVER called (it only turns latents->pixels for viewing). And T5 runs once
+        # per prompt — fine on CPU. Both are dead weight in HBM during training.
+        _distill_t5_cpu = os.environ.get("DISTILL_T5_CPU", "").lower() in ("1", "true")
+        _distill_no_vae = os.environ.get("DISTILL_NO_VAE", "").lower() in ("1", "true")
+
+        # Initialize T5 (only on this group's T5 rank — CPU during distill to save HBM)
         if self.rank == self.t5_rank:
-            LOGGER.info(f"Loading T5 text encoder on Neuron (rank {self.rank}, dp_group {self.dp_group_id})...")
+            t5_dev = "cpu" if _distill_t5_cpu else device
+            LOGGER.info(f"Loading T5 text encoder on {t5_dev} (rank {self.rank}, dp_group {self.dp_group_id})...")
             self.text_encoder = NeuronWanTextEncoder(
-                model_path=model_path, device=device)
+                model_path=model_path, device=t5_dev)
         else:
             self.text_encoder = None
 
@@ -178,8 +185,12 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                              for i in range(self.vae_tp_degree)]
         is_vae_rank = self.rank in self.vae_tp_ranks
 
-        # Initialize VAE (on every VAE-TP rank — with torch.compile)
-        if is_vae_rank:
+        # Initialize VAE (on every VAE-TP rank — with torch.compile).
+        # DISTILL_NO_VAE: skip entirely — never called in latent-space training.
+        if _distill_no_vae:
+            self.vae = None
+            LOGGER.info("DISTILL_NO_VAE: skipping VAE build (latent-space training, decoder unused)")
+        elif is_vae_rank:
             LOGGER.info(f"Loading VAE decoder on rank {self.rank} (dp_group {self.dp_group_id}, "
                         f"vae_tp={self.vae_tp_degree} ranks={self.vae_tp_ranks})...")
             self.vae = NeuronWanVAEWrapper(

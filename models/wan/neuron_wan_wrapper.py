@@ -62,11 +62,15 @@ class NeuronWanTextEncoder(TextEncoderInterface):
         self.text_encoder.load_state_dict(
             torch.load(weights_path, map_location='cpu', weights_only=False))
 
-        # Move to Neuron device and compile
+        # Move to device. On Neuron: compile with the neuron backend. On CPU (distill
+        # memory saver — T5 off-device to free HBM): keep eager, NO neuron compile.
         self.text_encoder = self.text_encoder.to(device=self.device)
-        self.text_encoder = torch.compile(
-            self.text_encoder, backend='neuron', dynamic=False)
-        LOGGER.info("T5 compiled with torch.compile(backend='neuron')")
+        if self.device.type == "cpu":
+            LOGGER.info("T5 on CPU (eager, no neuron compile) — distill HBM saver")
+        else:
+            self.text_encoder = torch.compile(
+                self.text_encoder, backend='neuron', dynamic=False)
+            LOGGER.info("T5 compiled with torch.compile(backend='neuron')")
 
     def forward(self, text_prompts: List[str]) -> dict:
         ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
