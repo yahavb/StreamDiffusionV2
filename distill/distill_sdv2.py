@@ -127,16 +127,53 @@ def load_prompts(path):
 # ── model construction — NEURON wrappers/pipeline (train==inference, same as sd-job) ──
 
 def build_student_pipeline(args, device, dtype):
-    """Build SDV2's NEURON streaming pipeline for the STUDENT (G). Generate through
-    THIS so the training rollout uses the identical schedule + rolling KV cache +
-    sink tokens + block size as inference. It builds self.generator (the Neuron
-    wrapper) from the config. We flip the DiT to train/grad for distillation —
-    the pipeline was inference-only (eager, no grad), so enabling grads on the
-    sharded generator + backprop through the eager loop is the Neuron-training work."""
+    """Build SDV2's NEURON streaming pipeline for the STUDENT (G), sharded with FSDP2
+    (NOT our custom tensor-parallel). FSDP2 shards params+grads+OPTIMIZER STATE across
+    the student group and, with per-block activation checkpointing, is the proven
+    Neuron path for full-model diffusion training (ref: HunyuanVideo 8.33B DiT on 4
+    cores). This fixes the 22.7GB resident-tensor OOM that custom TP (weights-only
+    sharding) could not.
+
+    Build the DiT UNSHARDED (tp_degree=1 -> plain nn.Linear blocks), then fully_shard
+    each transformer block + the root. Custom TP is bypassed for the student."""
     from models.wan.neuron_causal_stream_inference import NeuronCausalStreamInferencePipeline
+    from models.wan.neuron_layers import CausalWanAttentionBlock
+    from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper, CheckpointImpl, apply_activation_checkpointing)
+    from models.wan.tp_utils import get_tp_group
+
+    # force UNSHARDED build (FSDP will shard instead of our custom TP)
+    saved_tp = getattr(args, "tp_degree", 1)
+    args.tp_degree = 1
     pipe = NeuronCausalStreamInferencePipeline(args, device=device)
-    # student DiT must carry grads (pipeline built it eval/frozen for inference)
-    pipe.generator.model.train().requires_grad_(True)
+    args.tp_degree = saved_tp
+    m = pipe.generator.model
+    m.train().requires_grad_(True)
+
+    # per-block NO_REENTRANT activation checkpointing (mandatory — OOMs without it)
+    apply_activation_checkpointing(
+        m,
+        checkpoint_wrapper_fn=lambda mod: checkpoint_wrapper(mod, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
+        check_fn=lambda mod: isinstance(mod, CausalWanAttentionBlock),
+    )
+    # FSDP2: shard across the STUDENT group ONLY (ranks 4-7), not the whole world.
+    # fully_shard needs a DeviceMesh over exactly those ranks. Build a mesh from the
+    # student rank list (from tp_utils group base/size).
+    from torch.distributed.device_mesh import init_device_mesh
+    from models.wan.tp_utils import get_tp_group_base, get_tp_world_size
+    base = get_tp_group_base()          # 4 for the student group
+    n = get_tp_world_size()             # 4
+    # a 1-D mesh over this group's ranks. init_device_mesh partitions the GLOBAL world
+    # into meshes; each rank lands in the mesh covering its contiguous block of size n.
+    mesh = init_device_mesh("neuron", (dist.get_world_size() // n, n))  # (num_groups, n)
+    local_mesh = mesh[base // n]        # this group's row -> a size-n mesh
+    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    for blk in m.blocks:
+        fully_shard(blk, mesh=local_mesh, mp_policy=mp)
+    fully_shard(m, mesh=local_mesh, mp_policy=mp)
+    LOGGER.info(f"student: FSDP2 per-block+root on mesh ranks[{base}:{base+n}], "
+                f"{len(m.blocks)} blocks, NO_REENTRANT ckpt")
     return pipe
 
 
@@ -279,12 +316,8 @@ def main():
         args.generator_ckpt = None
         os.environ["DISTILL_BASE_ONLY"] = "1"
         LOGGER.info("building student G (init base 1.3B, trainable)...")
-        student = build_student_pipeline(args, device, dtype)
+        student = build_student_pipeline(args, device, dtype)  # FSDP2-sharded + ckpt inside
         G = student.generator
-        G.model.requires_grad_(True)
-        # grad-checkpoint ONLY the student rollout (its 13GB peak). NOT fake/teacher.
-        if os.environ.get("DISTILL_GRAD_CKPT", "").lower() in ("1", "true"):
-            G.model._distill_grad_ckpt = True
         os.environ["DISTILL_BASE_ONLY"] = ""
 
     # FAKE_SCORE on its OWN group (base 1.3B init)
@@ -365,48 +398,27 @@ def main():
     shard_dir = os.path.join(os.path.dirname(args.out), "shards")
 
     def save_ckpt(it):
-        """Reassemble FULL weights from TP shards WITHOUT any device/sub-group collective
-        (device all_gather hits the compile service errno=2; Neuron barrier only works on
-        the DEFAULT group). Phase 1: each student rank writes its CPU shard to a file.
-        Phase 2: a GLOBAL barrier (all ranks) so shards are on disk. Phase 3: root concats."""
-        from models.wan.tp_utils import ColumnParallelLinear, RowParallelLinear, TPRMSNorm
-        # phase 1: student ranks dump shards
-        if in_student:
-            os.makedirs(shard_dir, exist_ok=True)
-            shard = {k: v.detach().to(torch.bfloat16).cpu()
-                     for k, v in G.model.state_dict().items()}
-            torch.save(shard, os.path.join(shard_dir, f"shard_{my_rank - ssrc}.pt"))
-        # phase 2: GLOBAL barrier — EVERY rank must call (default group; sub-group unsupported)
+        """FSDP2 full-state-dict gather (student is FSDP-sharded now, not custom-TP).
+        get_model_state_dict(full_state_dict=True) all-gathers the DTensor shards to a
+        full CPU state_dict on rank0-of-the-FSDP-group. ALL student ranks must call
+        (it's collective). Then strip compile infixes + write {'generator': model.*}."""
+        if not in_student:
+            # non-student ranks: still hit the global barrier so nobody deadlocks
+            if dist.is_initialized():
+                dist.barrier()
+            return
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict, StateDictOptions)
+        full = get_model_state_dict(
+            G.model,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True))
         if dist.is_initialized():
             dist.barrier()
-        # phase 3: student root concatenates the shards into the full model
-        if my_rank == ssrc or not dist.is_initialized():
-            cat_dim = {}
-            for mn, m in G.model.named_modules():
-                if isinstance(m, ColumnParallelLinear):
-                    cat_dim[f"{mn}.weight"] = 0
-                    if getattr(m, "bias", None) is not None: cat_dim[f"{mn}.bias"] = 0
-                elif isinstance(m, RowParallelLinear):
-                    cat_dim[f"{mn}.weight"] = 1
-                elif isinstance(m, TPRMSNorm):
-                    cat_dim[f"{mn}.weight"] = 0
-            shards = [torch.load(os.path.join(shard_dir, f"shard_{r}.pt"), map_location="cpu")
-                      for r in range(tp)]
-            full = {}
-            for k in shards[0]:
-                d = cat_dim.get(k, None)
-                full[k] = shards[0][k] if (d is None or tp == 1) else torch.cat(
-                    [shards[r][k] for r in range(tp)], dim=d)
-            # Strip compile/wrapper infixes so keys match the FRESH (uncompiled) inference
-            # model at load time: neuron_compile wraps submodules in _ContiguousWrapper
-            # (.compiled_module.) and torch.compile adds ._orig_mod. The loader builds a
-            # bare model and loads BEFORE compiling, so it expects clean names.
+        if my_rank == ssrc:
             def _clean(k):
-                return (k.replace(".compiled_module.", ".")
-                         .replace("._orig_mod.", ".")
-                         .replace(".compiled_module", "")
-                         .replace("._orig_mod", ""))
-            sd = {f"model.{_clean(k)}": v for k, v in full.items()}
+                return (k.replace(".compiled_module.", ".").replace("._orig_mod.", ".")
+                         .replace(".compiled_module", "").replace("._orig_mod", ""))
+            sd = {f"model.{_clean(k)}": v.to(torch.bfloat16) for k, v in full.items()}
             torch.save({"generator": sd, "distill_iter": it}, args.out)
             LOGGER.info(f"[ckpt] wrote {args.out} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
 
