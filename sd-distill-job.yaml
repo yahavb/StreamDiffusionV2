@@ -84,11 +84,19 @@ spec:
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 
+              # ─── PRECOMPUTE prompt embeds ONCE (CPU, 1 proc) — no T5 in training ───
+              # Removes T5 (9.6GB) + its broadcast collective from the FSDP training job.
+              EMB=/tmp/embeds.pt
+              python3 distill/precompute_embeds.py \
+                --captions "$CAP" --max_prompts "${MAX_PROMPTS:-10}" \
+                --model_path wan_models/Wan2.1-T2V-1.3B --out "$EMB" || { echo "EMBEDS PRECOMPUTE FAILED"; exit 1; }
+
               # ─── DMD distillation train ───
-              # NPROC=16 (all cores). Trainer splits: teacher ranks 0-7, student+fake 8-15.
+              # NPROC=16 (all cores). Trainer splits: teacher 0-3, student 4-7, fake 8-11.
               torchrun --nproc_per_node="${NPROC:-16}" distill/distill_sdv2.py \
                 --config streamv2v/configs/wan_causal_fps_neuron.yaml \
                 --captions "$CAP" \
+                --embeds "$EMB" \
                 --teacher_ckpt ckpts/wan_causal_dmd_v2v_14b/model.pt \
                 --teacher_base wan_models/Wan2.1-T2V-14B \
                 --student_base wan_models/Wan2.1-T2V-1.3B \

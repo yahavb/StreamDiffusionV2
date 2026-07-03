@@ -345,34 +345,37 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         batch_size = noise.shape[0]
 
-        # Step 1: Tokenize on all ranks (CPU, fast)
-        ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
-        ids = ids.to(device)
-        mask = mask.to(device)
-
-        # Step 2: this group's T5 rank encodes with compiled T5 on Neuron
-        if self.rank == self.t5_rank:
-            seq_len = mask.gt(0).sum(dim=1).long()
-            enc_result = self.text_encoder(text_prompts)
-            prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
-            # Zero-out padding (already done in encoder, but ensure contiguous)
-            prompt_embeds = prompt_embeds.contiguous()
+        # DISTILL bypass: if precomputed prompt-embeds are injected (self._distill_embeds
+        # maps prompt-text -> embeds tensor), use them DIRECTLY — NO T5 build, NO T5
+        # broadcast collective. This removes the T5-broadcast group (get_tp_group) that
+        # collides with the FSDP student's rebuilt process groups (tp_degree=1 + FSDP
+        # mesh scramble the global TP group -> all_reduce failure at line 397).
+        _pe = getattr(self, "_distill_embeds", None)
+        if _pe is not None:
+            emb = _pe[text_prompts[0]] if isinstance(_pe, dict) else _pe
+            self.conditional_dict = {"prompt_embeds": emb.to(device=device, dtype=dtype)}
         else:
-            # Allocate buffer to receive embeddings: [batch, 512, 4096] for umt5-xxl
-            prompt_embeds = torch.zeros(
-                batch_size, 512, 4096, dtype=dtype, device=device)
+            # Step 1: Tokenize on all ranks (CPU, fast)
+            ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
+            ids = ids.to(device)
+            mask = mask.to(device)
 
-        # Step 3: Broadcast embeddings WITHIN this DP group only (src = group's T5
-        # rank, group = this group's process group). With one group this is the
-        # original global broadcast; with DP groups each stream broadcasts its own
-        # prompt embeds independently.
-        if dist.is_initialized():
-            from models.wan.tp_utils import get_tp_group
-            dist.broadcast(prompt_embeds, src=self.t5_rank, group=get_tp_group())
+            # Step 2: this group's T5 rank encodes with compiled T5 on Neuron
+            if self.rank == self.t5_rank:
+                seq_len = mask.gt(0).sum(dim=1).long()
+                enc_result = self.text_encoder(text_prompts)
+                prompt_embeds = enc_result['prompt_embeds'].to(device=device, dtype=dtype)
+                prompt_embeds = prompt_embeds.contiguous()
+            else:
+                prompt_embeds = torch.zeros(
+                    batch_size, 512, 4096, dtype=dtype, device=device)
 
-        self.conditional_dict = {
-            'prompt_embeds': prompt_embeds,
-        }
+            # Step 3: Broadcast embeddings WITHIN this DP group only.
+            if dist.is_initialized():
+                from models.wan.tp_utils import get_tp_group
+                dist.broadcast(prompt_embeds, src=self.t5_rank, group=get_tp_group())
+
+            self.conditional_dict = {'prompt_embeds': prompt_embeds}
 
         # Initialize caches
         if self.kv_cache1 is None:

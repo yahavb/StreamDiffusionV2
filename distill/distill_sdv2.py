@@ -85,6 +85,9 @@ def parse_args():
     p.add_argument("--max_prompts", type=int, default=0,
                    help="cap the corpus to the first N prompts (0 = all). For targeted "
                         "small-set distillation (e.g. 10 prompts, memorize them).")
+    p.add_argument("--embeds", default=None,
+                   help="precomputed prompt->embeds .pt (from precompute_embeds.py). If set, "
+                        "T5 is NOT built/broadcast in training (avoids FSDP group collision).")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -273,6 +276,12 @@ def main():
         prompts = prompts[:args.max_prompts]
         LOGGER.info(f"capped to first {len(prompts)} prompts (targeted distill)")
 
+    # precomputed prompt embeds (no T5 in training) — dict prompt->[1,512,4096] on CPU
+    embeds_cache = None
+    if args.embeds and os.path.exists(args.embeds):
+        embeds_cache = torch.load(args.embeds, map_location="cpu")
+        LOGGER.info(f"loaded {len(embeds_cache)} precomputed embeds from {args.embeds}")
+
     # ── TWO-GROUP PLACEMENT (avoids OOM: 3 nets co-located = ~21GB/core -> OOM) ──
     # world=8 on l-trn2, tp_degree=4:
     #   TEACHER group  = ranks [0..3]  -> 14B frozen (7GB/core, no optimizer)
@@ -318,6 +327,10 @@ def main():
         LOGGER.info("building student G (init base 1.3B, trainable)...")
         student = build_student_pipeline(args, device, dtype)  # FSDP2-sharded + ckpt inside
         G = student.generator
+        if embeds_cache is not None:
+            # inject precomputed embeds -> prepare() skips T5 + its broadcast (no FSDP collision)
+            student._distill_embeds = {k: v.to(device) for k, v in embeds_cache.items()}
+            LOGGER.info("injected precomputed embeds into student (T5-free rollout)")
         os.environ["DISTILL_BASE_ONLY"] = ""
 
     # FAKE_SCORE on its OWN group (base 1.3B init)
