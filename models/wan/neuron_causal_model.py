@@ -3,6 +3,7 @@
 Ported from aws-neuron-eks-samples/rolling-forcing/app/models/causal_model.py.
 Uses Neuron-safe layers (no Conv3d, no flex_attention, no float64).
 """
+import os
 import torch
 import torch.nn as nn
 
@@ -134,6 +135,12 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             shared_buffers=shared_buffers,
         )
 
+        # DISTILL_GRAD_CKPT: gradient-checkpoint each DiT block during training — the
+        # per-iter peak was ~13GB (student rollout retains all 30 layers' activations
+        # for backward -> OOM). Checkpointing recomputes activations in backward instead
+        # of storing them, cutting the activation peak ~5-8x. Only when grad is on.
+        _gckpt = (self.training and torch.is_grad_enabled()
+                  and os.environ.get("DISTILL_GRAD_CKPT", "").lower() in ("1", "true"))
         for block_index, block in enumerate(self.blocks):
             kwargs.update({
                 "kv_cache": kv_cache[block_index],
@@ -141,7 +148,12 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
                 "current_start": current_start,
                 "cache_start": cache_start,
             })
-            x = block(x, **kwargs)
+            if _gckpt:
+                import torch.utils.checkpoint as _ckpt
+                x = _ckpt.checkpoint(lambda _x, _b=block, _k=dict(kwargs): _b(_x, **_k),
+                                     x, use_reentrant=False)
+            else:
+                x = block(x, **kwargs)
 
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = x.flatten(1, 2)

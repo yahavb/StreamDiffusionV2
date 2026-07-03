@@ -139,6 +139,8 @@ spec:
               value: "1"  # T5 runs once/prompt — put on CPU, free ~9.6GB device HBM
             - name: DISTILL_TRACE
               value: "1"  # per-stage HBM tracer: pin WHICH stage grows + survives cleanup
+            - name: DISTILL_GRAD_CKPT
+              value: "1"  # grad-checkpoint DiT blocks — cut 13GB rollout activation peak
             - name: ITERS
               value: "800"           # convergence run: 10 prompts x 800 iters, dfake_ratio 1, save every 200
             - name: CAPTIONS_SRC
