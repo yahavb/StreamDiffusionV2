@@ -409,9 +409,32 @@ def main():
 
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
+    # ── ALLOCATION TRACER: report device-tensor count+MB per STAGE, so we see WHICH
+    # stage grows and whether cleanup reclaims it. Only rank ssrc logs (avoid spam).
+    def _dev_stats():
+        n = mb = 0
+        for o in _gc.get_objects():
+            try:
+                if torch.is_tensor(o) and o.device.type == "neuron":
+                    n += 1; mb += o.numel() * o.element_size() / 1e6
+            except Exception:
+                pass
+        return n, mb
+    _trace_on = os.environ.get("DISTILL_TRACE", "").lower() in ("1", "true")
+    _prev = {"n": 0, "mb": 0.0}
+    def _stage(it, name):
+        if not _trace_on or not (my_rank == ssrc or not dist.is_initialized()):
+            return
+        n, mb = _dev_stats()
+        dn, dmb = n - _prev["n"], mb - _prev["mb"]
+        LOGGER.info(f"  [trace it{it}] {name:22s} dev_tensors={n:5d} ({dn:+d})  "
+                    f"dev_MB={mb:8.0f} ({dmb:+.0f})")
+        _prev["n"], _prev["mb"] = n, mb
+
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
     _gl_hist = []  # recent loss_G values for the running-average convergence metric
     for it in range(args.iters):
+        _stage(it, "iter-start")
         prompt = [prompts[it % len(prompts)]]
 
         # (a) student generates x0 via Self-Forcing rollout (grad on)
@@ -425,6 +448,7 @@ def main():
                 noise=noise, current_start=0, current_end=frame_seq * npb,
                 batch_denoise=False)
             cond = student.conditional_dict
+        _stage(it, "a:student-rollout")
 
         # (b) student builds x_t + timestep + embeds, broadcasts to teacher & fake groups
         if in_student:
@@ -450,6 +474,7 @@ def main():
             with torch.no_grad():
                 real_pred = score(real_score, x_t, tt, condb, teacher_cache)
         real_pred = bcast(real_pred, tsrc)
+        _stage(it, "c:teacher-score")
 
         # (d) fake scores x_t (its group), broadcasts fake_pred back
         fake_pred = zeros_lat()
@@ -457,6 +482,7 @@ def main():
             with torch.no_grad():
                 fake_pred = score(fake_score, x_t, tt, condb, fake_cache)
         fake_pred = bcast(fake_pred, fsrc)
+        _stage(it, "d:fake-score")
 
         # (e) student DMD update (its group)
         gl = float("nan")
@@ -468,6 +494,7 @@ def main():
             opt_g.zero_grad(); loss_g.backward(); opt_g.step()
             del grad, target  # drop student DMD graph tensors
             gl = float(loss_g.detach())
+        _stage(it, "e:student-backward")
 
         # (f) fake trains to track G, on x0_send (its group) — diffusion loss
         lf = float("nan")
@@ -483,6 +510,7 @@ def main():
             opt_f.zero_grad(); loss_f.backward(); opt_f.step()
             lf = float(loss_f.detach())
             del pred_f, loss_f, xtf  # drop fake-group autograd graph (was leaking -> OOM)
+        _stage(it, "f:fake-backward")
 
         # CONVERGENCE METRIC = loss_G (DMD generator loss). It should DECREASE and
         # FLATTEN — that's convergence (student distribution -> teacher). Per-iter is
@@ -529,6 +557,7 @@ def main():
                 torch.neuron.synchronize()
             except Exception:
                 pass
+        _stage(it, "z:after-cleanup")  # if dev_MB here climbs each iter -> that's the leak
 
     save_ckpt(args.iters)
     LOGGER.info("done. VALIDATE: load the checkpoint into sd-job.yaml and WATCH the video "
