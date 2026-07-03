@@ -55,6 +55,10 @@ def neuron_compile(module_or_fn, **kwargs):
 
 # ── NKI kernel loading ──────────────────────────────────────────────────
 USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "true").lower() == "true"
+# DISTILL: use the functional (out-of-place, no KV-cache) attention path so backward
+# works under FSDP + checkpoint. Constant for the whole run (unlike self.training which
+# checkpoint recompute can flip -> fwd/recompute tensor-count mismatch).
+_DISTILL_FUNCTIONAL_ATTN = os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true")
 
 NKI_AVAILABLE = False
 wan_cross_attn = None
@@ -511,7 +515,11 @@ class CausalWanSelfAttention(nn.Module):
         # attention K/V = the CURRENT block's own roped_key/v — no cache assembly
         # needed. Build it functionally (out-of-place) and attend directly. Matches
         # the clean-forward shape of the reference Neuron training examples.
-        if self.training:  # set once on the student DiT; stable across ckpt fwd/recompute
+        # Gate on an ENV flag, not self.training — checkpoint recompute / FSDP can flip
+        # module.training between the original forward and recompute, which would make
+        # fwd take the functional branch and recompute take the cache branch => different
+        # saved-tensor sets => CheckpointError. The env flag is constant for the whole run.
+        if _DISTILL_FUNCTIONAL_ATTN:
             k_len_int = valid_tokens
             kf = roped_key[:, :valid_tokens]              # [1, valid, n, d]
             vf = v[:, :valid_tokens]
