@@ -282,6 +282,9 @@ def main():
         student = build_student_pipeline(args, device, dtype)
         G = student.generator
         G.model.requires_grad_(True)
+        # grad-checkpoint ONLY the student rollout (its 13GB peak). NOT fake/teacher.
+        if os.environ.get("DISTILL_GRAD_CKPT", "").lower() in ("1", "true"):
+            G.model._distill_grad_ckpt = True
         os.environ["DISTILL_BASE_ONLY"] = ""
 
     # FAKE_SCORE on its OWN group (base 1.3B init)

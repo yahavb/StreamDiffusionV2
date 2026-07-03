@@ -139,8 +139,12 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         # per-iter peak was ~13GB (student rollout retains all 30 layers' activations
         # for backward -> OOM). Checkpointing recomputes activations in backward instead
         # of storing them, cutting the activation peak ~5-8x. Only when grad is on.
-        _gckpt = (self.training and torch.is_grad_enabled()
-                  and os.environ.get("DISTILL_GRAD_CKPT", "").lower() in ("1", "true"))
+        # Only the STUDENT needs checkpointing (its multi-layer rollout is the 13GB
+        # peak). The fake_score's single training forward must NOT be checkpointed —
+        # reentrant checkpoint there double-frees the graph ("backward a second time").
+        # Gated by a per-model flag (set on the student only), AND grad enabled.
+        _gckpt = (getattr(self, "_distill_grad_ckpt", False)
+                  and self.training and torch.is_grad_enabled())
         for block_index, block in enumerate(self.blocks):
             kwargs.update({
                 "kv_cache": kv_cache[block_index],
