@@ -166,8 +166,10 @@ def build_student_pipeline(args, device, dtype):
     n = get_tp_world_size()             # 4
     # a 1-D mesh over this group's ranks. init_device_mesh partitions the GLOBAL world
     # into meshes; each rank lands in the mesh covering its contiguous block of size n.
-    mesh = init_device_mesh("neuron", (dist.get_world_size() // n, n))  # (num_groups, n)
-    local_mesh = mesh[base // n]        # this group's row -> a size-n mesh
+    mesh = init_device_mesh("neuron", (dist.get_world_size() // n, n),
+                            mesh_dim_names=("dp", "shard"))
+    # this rank's row of the mesh = its group's size-n shard dimension
+    local_mesh = mesh["shard"]
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for blk in m.blocks:
         fully_shard(blk, mesh=local_mesh, mp_policy=mp)
