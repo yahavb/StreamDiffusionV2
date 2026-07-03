@@ -503,6 +503,25 @@ class CausalWanSelfAttention(nn.Module):
         else:
             valid_tokens = f * h * w
 
+        # ── TRAINING (grad-on) FUNCTIONAL PATH — no in-place cache writes ──
+        # Autograd forbids in-place modification of slice-views (the .copy_ into
+        # buffer_k/kv_cache slices), which is fine for inference (no_grad) but fatal
+        # for backprop (SliceBackward inplace error under FSDP). For DISTILLATION the
+        # student runs 1-step / single-block: local_start_index==0, no eviction, so
+        # attention K/V = the CURRENT block's own roped_key/v — no cache assembly
+        # needed. Build it functionally (out-of-place) and attend directly. Matches
+        # the clean-forward shape of the reference Neuron training examples.
+        if self.training:  # set once on the student DiT; stable across ckpt fwd/recompute
+            k_len_int = valid_tokens
+            kf = roped_key[:, :valid_tokens]              # [1, valid, n, d]
+            vf = v[:, :valid_tokens]
+            q_attn = roped_query.permute(0, 2, 1, 3)
+            k_attn = kf.permute(0, 2, 1, 3)
+            v_attn = vf.permute(0, 2, 1, 3)
+            attn_out = F.scaled_dot_product_attention(q_attn, k_attn, v_attn)
+            x = attn_out.permute(0, 2, 1, 3).flatten(2)
+            return self.o(x)
+
         # Cache management
         cache_end = cache_start + self.block_length
         global_end_index = kv_cache["global_end_index"]
