@@ -503,7 +503,7 @@ def main():
             grad = grad / (grad.abs().mean() + 1e-8)
             target = (x0_student - grad).detach()
             loss_g = 0.5 * F.mse_loss(x0_student, target)
-            opt_g.zero_grad(); loss_g.backward(); opt_g.step()
+            opt_g.zero_grad(set_to_none=True); loss_g.backward(); opt_g.step()
             del grad, target  # drop student DMD graph tensors
             gl = float(loss_g.detach())
         _stage(it, "e:student-backward")
@@ -519,7 +519,7 @@ def main():
             ttf = tf.view(bb, 1).expand(bb, x0_send.shape[1])
             pred_f = score(fake_score, xtf, ttf, condb, fake_cache)
             loss_f = F.mse_loss(pred_f, x0_send)
-            opt_f.zero_grad(); loss_f.backward(); opt_f.step()
+            opt_f.zero_grad(set_to_none=True); loss_f.backward(); opt_f.step()
             lf = float(loss_f.detach())
             del pred_f, loss_f, xtf  # drop fake-group autograd graph (was leaking -> OOM)
         _stage(it, "f:fake-backward")
