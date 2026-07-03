@@ -4,6 +4,33 @@ Notes from distilling a few-step **Wan2.1-1.3B causal student** from a **14B t2v
 teacher** (DMD2 + Self-Forcing) for StreamDiffusion-v2 on AWS Trainium. Written
 as working notes for a blog on *targeted* video-diffusion distillation.
 
+## How DMD works (the intuition, plain English)
+
+**3 models:**
+- **Student** (1.3B) — the one we're training. Makes a video in 1 step.
+- **Teacher** (14B, frozen) — the expert. Knows what "realistic" looks like.
+- **Fake** (1.3B, training) — a "mirror" that learns what the student currently produces.
+
+**One training step:**
+1. Student makes a video (latent) from a prompt.
+2. Add random noise to it.
+3. Ask **Teacher**: "which way is realistic?" → an arrow.
+4. Ask **Fake**: "which way is student-like?" → another arrow.
+5. The **gap between the two arrows** = the correction. Push the student toward
+   realistic, away from student-like.
+6. Separately, train **Fake** to keep matching the student.
+
+**What it converges to:** when the student's videos look so realistic that Teacher
+and Fake give the *same* arrow → gap = 0 → done. The student now makes
+teacher-quality video in 1 step.
+
+**The number to watch:** `loss_G` — the size of that gap. Goes down and flattens =
+converging.
+
+**One picture:** Student stands somewhere. Teacher points "realistic is that way."
+Fake points "you're currently here." The student walks the difference. Repeat until
+Teacher and Fake point the same way — the student has arrived.
+
 ## What the distillation actually optimizes
 
 DMD (Distribution Matching Distillation) does **not** compare the student's video
