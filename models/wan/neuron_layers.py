@@ -357,16 +357,26 @@ class WanT2VCrossAttention(nn.Module):
         b, n, d = x.size(0), self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
-        assert crossattn_cache is not None
-        if not crossattn_cache["is_init"]:
-            crossattn_cache["is_init"] = True
+        if _DISTILL_FUNCTIONAL_ATTN:
+            # DISTILL: always recompute k/v, never touch the cache. The is_init
+            # branch is stateful — under NO_REENTRANT checkpointing the original
+            # forward takes the "init" path (computes k/v -> more saved tensors)
+            # and the recompute takes the warm-cache path (fewer tensors), which
+            # trips CheckpointError (74 vs 64). Recomputing every time makes fwd
+            # and recompute take the SAME branch (context is tiny, cost trivial).
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
-            crossattn_cache["k"] = k
-            crossattn_cache["v"] = v
         else:
-            k = crossattn_cache["k"]
-            v = crossattn_cache["v"]
+            assert crossattn_cache is not None
+            if not crossattn_cache["is_init"]:
+                crossattn_cache["is_init"] = True
+                k = self.norm_k(self.k(context)).view(b, -1, n, d)
+                v = self.v(context).view(b, -1, n, d)
+                crossattn_cache["k"] = k
+                crossattn_cache["v"] = v
+            else:
+                k = crossattn_cache["k"]
+                v = crossattn_cache["v"]
 
         if q.device.type == "neuron" and NKI_AVAILABLE:
             q_nki = q[0].permute(1, 2, 0).contiguous()
