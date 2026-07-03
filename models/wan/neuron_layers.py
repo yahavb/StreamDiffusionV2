@@ -708,17 +708,12 @@ class CausalWanAttentionBlock(nn.Module):
         x = x + self.cross_attn(self.norm3(x), context, context_lens,
                                 crossattn_cache=crossattn_cache)
 
-        # FFN input (post-modulated-norm). The FFN is the widest layer (ffn_dim) = the
-        # bulk of activation memory, AND it's pure compute (no KV-cache side effect),
-        # so gradient-checkpointing it during distill is safe (unlike the self-attn,
-        # whose in-place cache write breaks recompute). Gated by _distill_ckpt_ffn.
-        ffn_in = self._modulated_norm_shift(
-            self._modulated_norm_scale(self.norm2(x), e4, norm_ones, num_frames, frame_seqlen),
-            e3)
-        if getattr(self, "_distill_ckpt_ffn", False) and torch.is_grad_enabled():
-            import torch.utils.checkpoint as _ckpt
-            y = _ckpt.checkpoint(self.ffn, ffn_in, use_reentrant=False)
-        else:
-            y = self.ffn(ffn_in)
+        # FFN. (Old inner FFN-checkpoint removed — FSDP's apply_activation_checkpointing
+        # wraps the WHOLE block; a second inner checkpoint double-recomputes -> tensor
+        # count mismatch in NO_REENTRANT.)
+        y = self.ffn(
+            self._modulated_norm_shift(
+                self._modulated_norm_scale(self.norm2(x), e4, norm_ones, num_frames, frame_seqlen),
+                e3))
         x = self._modulated_residual(x, y, e5, num_frames, frame_seqlen)
         return x

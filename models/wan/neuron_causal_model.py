@@ -135,16 +135,10 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             shared_buffers=shared_buffers,
         )
 
-        # DISTILL_GRAD_CKPT: gradient-checkpointing is applied INSIDE the block, on the
-        # FFN only (see CausalWanAttentionBlock) — NOT here at block level. Block-level
-        # checkpointing recomputes the self-attn's in-place KV .copy_ side-effect in
-        # backward -> "backward through the graph a second time". The FFN is pure compute
-        # (no cache), so checkpointing it is safe AND it's the widest activation
-        # (ffn_dim=8960) = most of the memory. Flag propagated to blocks below.
-        _gckpt = (getattr(self, "_distill_grad_ckpt", False)
-                  and self.training and torch.is_grad_enabled())
+        # Activation checkpointing is handled by FSDP's apply_activation_checkpointing
+        # (whole-block NO_REENTRANT) in the trainer — NOT here. (Old inner FFN-checkpoint
+        # setter removed; it double-recomputed and broke the NO_REENTRANT tensor-count.)
         for block_index, block in enumerate(self.blocks):
-            block._distill_ckpt_ffn = _gckpt
             kwargs.update({
                 "kv_cache": kv_cache[block_index],
                 "crossattn_cache": crossattn_cache[block_index],
