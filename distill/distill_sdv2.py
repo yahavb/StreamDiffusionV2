@@ -434,6 +434,12 @@ def main():
                     f"dev_MB={mb:8.0f} ({dmb:+.0f})")
         _prev["n"], _prev["mb"] = n, mb
 
+    # Fixed DMD timestep buckets (device tensor). Sampling from these instead of
+    # arbitrary randint keeps the compiled graph/NEFF set BOUNDED (~8), so NEFFs get
+    # reused across iters instead of a new module.neff per iter (the iter-12 OOM).
+    _DMD_TIMESTEPS = torch.tensor([100, 250, 400, 500, 600, 700, 800, 900],
+                                  dtype=torch.long, device=device)
+
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
     _gl_hist = []  # recent loss_G values for the running-average convergence metric
     for it in range(args.iters):
@@ -456,7 +462,10 @@ def main():
         # (b) student builds x_t + timestep + embeds, broadcasts to teacher & fake groups
         if in_student:
             b = x0_student.shape[0]
-            t = torch.randint(20, 980, (b,), device=device)
+            # DISCRETE timesteps: a random *value* every iter makes torch.compile trace a
+            # NEW graph -> a NEW module.neff loads and never unloads -> scratchpad grows ->
+            # OOM iter12. Pick from a FIXED small bucket set so NEFFs repeat/reuse.
+            t = _DMD_TIMESTEPS[torch.randint(0, len(_DMD_TIMESTEPS), (b,), device=device)]
             x_t = scheduler.add_noise(x0_student.flatten(0, 1),
                                       torch.randn_like(x0_student).flatten(0, 1),
                                       t).unflatten(0, x0_student.shape[:2])
@@ -503,7 +512,7 @@ def main():
         lf = float("nan")
         if in_fake:
             bb = x0_send.shape[0]
-            tf = torch.randint(20, 980, (bb,), device=device)
+            tf = _DMD_TIMESTEPS[torch.randint(0, len(_DMD_TIMESTEPS), (bb,), device=device)]
             xtf = scheduler_fake.add_noise(x0_send.flatten(0, 1),
                                            torch.randn_like(x0_send).flatten(0, 1),
                                            tf).unflatten(0, x0_send.shape[:2])
