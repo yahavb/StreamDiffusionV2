@@ -172,7 +172,7 @@ def build_student_pipeline(args, device, dtype):
     for blk in m.blocks:
         fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
     fully_shard(m, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
-    LOGGER.info(f"student: FSDP2 per-block+root on mesh ranks[{base}:{base+n}], "
+    LOGGER.info(f"student: FSDP2 per-block+root (group size {n}), "
                 f"{len(m.blocks)} blocks, NO_REENTRANT ckpt")
     return pipe
 
