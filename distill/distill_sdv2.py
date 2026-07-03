@@ -31,6 +31,7 @@ Usage (single node, torchrun on Trainium):
     --steps 700,0 --iters 2000
 """
 import argparse
+import gc as _gc
 import json
 import logging
 import os
@@ -492,10 +493,20 @@ def main():
             _gl_hist.append(gl)
             if len(_gl_hist) > 50:
                 _gl_hist.pop(0)
+        # MEM PROBE: count live device tensors + their MB each iter, so we can SEE
+        # what grows (leak vs NEFF-cache) instead of guessing. Cheap gc walk.
+        _dev_n = _dev_mb = 0
+        for _o in _gc.get_objects() if (it % 2 == 0) else []:
+            try:
+                if torch.is_tensor(_o) and _o.device.type == "neuron":
+                    _dev_n += 1; _dev_mb += _o.numel() * _o.element_size() / 1e6
+            except Exception:
+                pass
         if my_rank == ssrc or not dist.is_initialized():
             avg = sum(_gl_hist) / len(_gl_hist) if _gl_hist else float("nan")
             LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_G_avg50={avg:.4f}  "
-                        f"(CONVERGENCE: watch loss_G_avg50 decrease + flatten)")
+                        f"MEM[dev_tensors={_dev_n} dev_MB={_dev_mb:.0f}]  "
+                        f"(watch loss_G_avg50 flatten + MEM growth)")
         if it > 0 and it % args.save_every == 0:
             save_ckpt(it)
 
@@ -509,7 +520,6 @@ def main():
             student.kv_cache1 = None
             student.crossattn_cache = None
             student.shared_buffers = None
-        import gc as _gc
         _gc.collect()
         # Force Neuron to reclaim HBM now — eager torch_neuronx defers frees, so
         # del/gc alone let device memory creep up across iters (OOM ~iter 12). A
