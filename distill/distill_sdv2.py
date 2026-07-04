@@ -467,6 +467,7 @@ def main():
 
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
     _gl_hist = []  # recent loss_G values for the running-average convergence metric
+    _gap_hist = []  # recent RAW ||fake-real|| gap = the real convergence signal
     for it in range(args.iters):
         _stage(it, "iter-start")
         prompt = [prompts[it % len(prompts)]]
@@ -530,6 +531,7 @@ def main():
         # (e) student DMD update — RECOMPUTE the forward WITH grad now (fresh graph,
         # freed right after backward). DMD gradient = (fake-real) applied to x0.
         gl = float("nan")
+        dmd_gap = float("nan")
         if in_student and (it % args.dfake_gen_update_ratio == 0):
             student.kv_cache1 = None
             student.crossattn_cache = None
@@ -537,6 +539,10 @@ def main():
                 text_prompts=prompt, device=device, dtype=dtype,
                 noise=_rollout_noise, current_start=0, current_end=frame_seq * npb,
                 batch_denoise=False)
+            # RAW gap between the two arrows BEFORE normalization = the true
+            # convergence signal. loss_G is renormalized to ~const and cannot move;
+            # this ||fake - real|| shrinks as student->teacher (arrows align).
+            dmd_gap = float((fake_pred - real_pred).abs().mean().detach())
             grad = (fake_pred - real_pred)
             grad = grad / (grad.abs().mean() + 1e-8)
             target = (x0_grad - grad).detach()
@@ -571,6 +577,10 @@ def main():
             _gl_hist.append(gl)
             if len(_gl_hist) > 50:
                 _gl_hist.pop(0)
+        if in_student and dmd_gap == dmd_gap:
+            _gap_hist.append(dmd_gap)
+            if len(_gap_hist) > 50:
+                _gap_hist.pop(0)
         # MEM PROBE: count live device tensors + their MB each iter, so we can SEE
         # what grows (leak vs NEFF-cache) instead of guessing. Cheap gc walk.
         _dev_n = _dev_mb = 0
@@ -582,9 +592,13 @@ def main():
                 pass
         if my_rank == ssrc or not dist.is_initialized():
             avg = sum(_gl_hist) / len(_gl_hist) if _gl_hist else float("nan")
+            gap_avg = sum(_gap_hist) / len(_gap_hist) if _gap_hist else float("nan")
             LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_G_avg50={avg:.4f}  "
+                        f"DMDgap={dmd_gap:.4f}  DMDgap_avg50={gap_avg:.4f}  "
                         f"MEM[dev_tensors={_dev_n} dev_MB={_dev_mb:.0f}]  "
-                        f"(watch loss_G_avg50 flatten + MEM growth)")
+                        f"(loss_G is renormalized~const; watch DMDgap_avg50 DECREASE)")
+        if in_fake and my_rank == fsrc:
+            LOGGER.info(f"it {it}/{args.iters}  loss_fake={lf:.4f}  (fake tracks student; should stay low/steady)")
         if it > 0 and it % args.save_every == 0:
             save_ckpt(it)
 
