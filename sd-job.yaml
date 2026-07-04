@@ -137,10 +137,21 @@ spec:
               NPROC="${NPROC:-16}"
               TP_DEGREE="${TP_DEGREE:-8}"
               STEPS="${STEPS:-700,500,400,200,0}"
+              # VALIDATE-DISTILLED override: if GENERATOR_CKPT is set, load OUR distilled
+              # 1.3B student (--generator_ckpt) on the 1.3B config at the res it trained on.
+              CKPT_ARG=""
+              CFG="streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml"
+              RES_ARG="--num_frames 81 --height 240 --width 416"
+              if [ -n "${GENERATOR_CKPT:-}" ]; then
+                CKPT_ARG="--generator_ckpt $GENERATOR_CKPT"
+                CFG="streamv2v/configs/wan_causal_fps_neuron.yaml"
+                RES_ARG="--num_frames 81 --height ${HEIGHT:-352} --width ${WIDTH:-640}"
+                echo "VALIDATE-DISTILLED: ckpt=$GENERATOR_CKPT cfg=$CFG res=${HEIGHT:-352}x${WIDTH:-640} steps=$STEPS tp=$TP_DEGREE"
+              fi
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
-                --config streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml \
-                --steps $STEPS --tp_degree $TP_DEGREE \
-                --num_frames 81 --height 240 --width 416 --device neuron"
+                --config $CFG \
+                --steps $STEPS --tp_degree $TP_DEGREE $CKPT_ARG \
+                $RES_ARG --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
               # $3 (optional) = input video path -> v2v restyle. Omit -> t2v from noise.
@@ -178,6 +189,14 @@ spec:
               # per-NEFF engine breakdown (capture --single-io -> profile_all_neffs aggregate),
               # but SKIP step5 DMA-parquet and step6 systrace — those stack a 2nd full inference
               # under inspect instrumentation and OOM'd a core (878MB on NC4) last run.
+              if [ -n "${GENERATOR_CKPT:-}" ]; then
+                echo "=== [profiler] SKIPPED (validate-distilled run — just need the video) ==="
+                echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
+                mkdir -p "$FINAL_DIR"; cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy failed"
+                echo "=== DONE. VALIDATE THE VIDEO: $FINAL_DIR/cat.mp4 (branch exp/fps-1.3b @ $GIT_SHA) ==="
+                ls -lhR "$FINAL_DIR" | head -40
+                exit 0
+              fi
               echo "=== [profiler] LIGHT per-NEFF engine breakdown (no DMA/systrace) ==="
               POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
               mapfile -t NEFFS < <(find /tmp/neff_cache -name "*.neff" 2>/dev/null | sort)
@@ -235,21 +254,25 @@ spec:
               value: "1"
             - name: BRANCH
               value: "exp/fps-1.3b"
-            # FPS run = t2v from noise (no input video). Empty -> t2v path.
+            # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
+            - name: GENERATOR_CKPT
+              value: "/var/mdl/video-distill/checkpoints/202607040849/model.pt"
+            - name: HEIGHT
+              value: "352"          # trained res
+            - name: WIDTH
+              value: "640"
+            # t2v from noise (cat prompt). Distilled student not trained on v2v.
             - name: INPUT_VIDEO_SRC
-              value: "/var/mdl/stream_diffusion/dog.mp4"  # v2v input (cat=t2v also runs)
-            # SINGLE-STREAM TP-8 (FPS lever A): NPROC==TP_DEGREE==8 -> one wide TP-8
-            # group, NO data-parallel split. Measures whether 8 cores beat 4 on ONE
-            # stream's per-block DiT (TP-4 baseline = 8.65s/block). DP (NPROC=16) was
-            # throughput-only and is NOT an fps lever — do not use it.
+              value: ""
+            # 1.3B student caps at TP-4 (12 heads). Single stream: NPROC==TP_DEGREE==4.
             - name: NPROC
-              value: "8"
+              value: "4"
             - name: TP_DEGREE
-              value: "8"
-            # Denoising steps for the fps-vs-quality point. 5 = quality floor on these
-            # weights; set e.g. "500,0" to sweep faster-but-worse points.
+              value: "4"
+            # 1-STEP: the config we distilled for. This is the whole point — does 1 step
+            # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
-              value: "700,500,400,200,0"
+              value: "0"
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
