@@ -152,7 +152,9 @@ spec:
             - name: DISTILL_GRAD_CKPT
               value: "1"  # grad-checkpoint DiT blocks — cut 13GB rollout activation peak
             - name: ITERS
-              value: "800"           # convergence run: 10 prompts x 800 iters, dfake_ratio 1, save every 200
+              value: "12"            # SMOKE: verify ckpt-write + convergence signals in MINUTES, not 8h
+            - name: SAVE_EVERY
+              value: "5"             # SMOKE: save at iter 5 & 10 so we confirm model.pt is non-empty fast
             - name: CAPTIONS_SRC
               value: "/var/mdl/video-distill/captions-20260701-062139.jsonl"
             - name: NEURON_LOGICAL_NC_CONFIG

@@ -425,13 +425,31 @@ def main():
         full = get_model_state_dict(
             G.model,
             options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        # DIAG: get_model_state_dict returned 0 tensors in run 41 (empty ckpt). Log the
+        # count on EVERY student rank so we see whether the gather lands on ssrc only,
+        # all ranks, or nowhere. Cheap; runs once per save.
+        LOGGER.info(f"[ckpt-diag] rank {my_rank}: get_model_state_dict -> {len(full)} entries")
+        # FALLBACK: if the DCP gather came back empty, gather the raw (possibly DTensor)
+        # state_dict and materialize any DTensor shards to full tensors by hand.
+        if len(full) == 0:
+            from torch.distributed.tensor import DTensor
+            raw = G.model.state_dict()
+            full = {}
+            for k, v in raw.items():
+                if isinstance(v, DTensor):
+                    v = v.full_tensor()
+                full[k] = v.detach().to("cpu")
+            LOGGER.info(f"[ckpt-diag] rank {my_rank}: FALLBACK raw state_dict -> {len(full)} entries")
         if dist.is_initialized():
             dist.barrier()
         if my_rank == ssrc:
             def _clean(k):
                 return (k.replace(".compiled_module.", ".").replace("._orig_mod.", ".")
-                         .replace(".compiled_module", "").replace("._orig_mod", ""))
+                         .replace(".compiled_module", "").replace("._orig_mod", "")
+                         .replace("._checkpoint_wrapped_module.", ".")
+                         .replace("._checkpoint_wrapped_module", ""))
             sd = {f"model.{_clean(k)}": v.to(torch.bfloat16) for k, v in full.items()}
+            assert len(sd) > 0, "EMPTY checkpoint — get_model_state_dict AND fallback both returned 0 tensors"
             torch.save({"generator": sd, "distill_iter": it}, args.out)
             LOGGER.info(f"[ckpt] wrote {args.out} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
 
