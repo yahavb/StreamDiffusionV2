@@ -104,7 +104,9 @@ spec:
                 --iters "${ITERS:-800}" \
                 --tp_degree "${TP_DEGREE:-8}" \
                 --max_prompts "${MAX_PROMPTS:-10}" \
-                --dfake_gen_update_ratio "${DFAKE_RATIO:-1}" \
+                --dfake_gen_update_ratio "${DFAKE_RATIO:-5}" \
+                --lr "${LR:-2e-5}" \
+                --warmup "${WARMUP:-25}" \
                 --save_every "${SAVE_EVERY:-200}" \
                 --height 352 --width 640 \
                 --out "$RUN/model.pt" || echo "TRAIN FAILED"
@@ -152,9 +154,16 @@ spec:
             - name: DISTILL_GRAD_CKPT
               value: "1"  # grad-checkpoint DiT blocks — cut 13GB rollout activation peak
             - name: ITERS
-              value: "800"           # real convergence run: 10 prompts x 800 iters
+              value: "150"           # SMOKE-CONVERGENCE: warmup 25 + ratio 5 -> ~25 G-steps.
+                                     # enough to SEE DMDgap bend down with lr=2e-5 before 8h.
             - name: SAVE_EVERY
-              value: "200"           # checkpoints at 200/400/600/800
+              value: "150"           # one ckpt at the end
+            - name: LR
+              value: "2e-5"          # 10x the old 2e-6 (which was too small to move G -> flat gap)
+            - name: WARMUP
+              value: "25"            # freeze G first 25 iters so critic tracks student first
+            - name: DFAKE_RATIO
+              value: "5"             # critic leads: fake updates 5x per G update
             - name: CAPTIONS_SRC
               value: "/var/mdl/video-distill/captions-20260701-062139.jsonl"
             - name: NEURON_LOGICAL_NC_CONFIG

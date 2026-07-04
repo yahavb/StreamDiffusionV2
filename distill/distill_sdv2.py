@@ -73,10 +73,12 @@ def parse_args():
                    help="student few-step schedule (fps lever), e.g. '700,0' (2-step), "
                         "'0' (1-step). Overrides config denoising_step_list. MUST end in 0.")
     p.add_argument("--iters", type=int, default=2000)
-    p.add_argument("--lr", type=float, default=2e-6)          # from configs/wan_causal_dmd_v2v.yaml
-    p.add_argument("--dfake_gen_update_ratio", type=int, default=5)  # fake_score updates per G update
-    p.add_argument("--warmup_regression", type=int, default=200,
-                   help="first N iters also regress G toward teacher trajectory (stabilizes DMD)")
+    p.add_argument("--lr", type=float, default=2e-5)          # G lr. 2e-6 was ~50x too small
+                                                              # (AdamW step~=lr; student couldn't move -> flat gap)
+    p.add_argument("--dfake_gen_update_ratio", type=int, default=5)  # fake_score updates per G update (critic leads)
+    p.add_argument("--warmup", type=int, default=25,
+                   help="freeze G for first N iters so the critic (fake_score) tracks the "
+                        "student before we take DMD gradient steps (stabilizes early training)")
     p.add_argument("--tp_degree", type=int, default=8)
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument("--height", type=int, default=352)   # /8=44 even (patchify needs /2); not 240/480
@@ -550,17 +552,21 @@ def main():
         # freed right after backward). DMD gradient = (fake-real) applied to x0.
         gl = float("nan")
         dmd_gap = float("nan")
-        if in_student and (it % args.dfake_gen_update_ratio == 0):
+        # WARMUP: for the first args.warmup iters, do NOT step G — let fake_score (the
+        # critic) learn to track the still-base student first. A DMD gradient from an
+        # untrained critic points nowhere; stepping G on it wastes the early budget.
+        # After warmup, G updates once every dfake_gen_update_ratio iters (critic leads).
+        _do_g = (it >= args.warmup) and (it % args.dfake_gen_update_ratio == 0)
+        # always compute the raw gap (cheap, needs both preds) so we log convergence
+        if in_student:
+            dmd_gap = float((fake_pred - real_pred).abs().mean().detach())
+        if in_student and _do_g:
             student.kv_cache1 = None
             student.crossattn_cache = None
             x0_grad = student.prepare(          # WITH grad this time
                 text_prompts=prompt, device=device, dtype=dtype,
                 noise=_rollout_noise, current_start=0, current_end=frame_seq * npb,
                 batch_denoise=False)
-            # RAW gap between the two arrows BEFORE normalization = the true
-            # convergence signal. loss_G is renormalized to ~const and cannot move;
-            # this ||fake - real|| shrinks as student->teacher (arrows align).
-            dmd_gap = float((fake_pred - real_pred).abs().mean().detach())
             grad = (fake_pred - real_pred)
             grad = grad / (grad.abs().mean() + 1e-8)
             target = (x0_grad - grad).detach()
@@ -611,10 +617,14 @@ def main():
         if my_rank == ssrc or not dist.is_initialized():
             avg = sum(_gl_hist) / len(_gl_hist) if _gl_hist else float("nan")
             gap_avg = sum(_gap_hist) / len(_gap_hist) if _gap_hist else float("nan")
-            LOGGER.info(f"it {it}/{args.iters}  loss_G={gl:.4f}  loss_G_avg50={avg:.4f}  "
-                        f"DMDgap={dmd_gap:.4f}  DMDgap_avg50={gap_avg:.4f}  "
-                        f"MEM[dev_tensors={_dev_n} dev_MB={_dev_mb:.0f}]  "
-                        f"(loss_G is renormalized~const; watch DMDgap_avg50 DECREASE)")
+            # magnitudes of each arrow — if real~=fake from iter 0 the setup is degenerate;
+            # if real stays fixed while fake drifts, the critic IS tracking the student.
+            _rm = float(real_pred.abs().mean()); _fm = float(fake_pred.abs().mean())
+            _phase = "warmup" if it < args.warmup else ("G-step" if _do_g else "critic-only")
+            LOGGER.info(f"it {it}/{args.iters} [{_phase}] loss_G={gl:.4f} loss_G_avg50={avg:.4f}  "
+                        f"DMDgap={dmd_gap:.4f} DMDgap_avg50={gap_avg:.4f}  "
+                        f"|real|={_rm:.3f} |fake|={_fm:.3f}  "
+                        f"MEM[dev_MB={_dev_mb:.0f}]  (watch DMDgap_avg50 DECREASE)")
         if in_fake and my_rank == fsrc:
             LOGGER.info(f"it {it}/{args.iters}  loss_fake={lf:.4f}  (fake tracks student; should stay low/steady)")
         if it > 0 and it % args.save_every == 0:
