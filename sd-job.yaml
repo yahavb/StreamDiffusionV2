@@ -89,6 +89,18 @@ spec:
                 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v_14b/*'], local_dir='ckpts')"
                 mkdir -p "$(dirname $SDV2_CKPT_CACHE)" && cp ckpts/wan_causal_dmd_v2v_14b/model.pt "$SDV2_CKPT_CACHE"
               fi
+
+              # VALIDATE-DISTILLED also needs the 1.3B BASE weights (config.json/VAE/T5)
+              # — the 1.3B cfg loads them; only the DiT weights come from our ckpt.
+              if [ -n "${GENERATOR_CKPT:-}" ]; then
+                WAN_13B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
+                if [[ -f "$WAN_13B_TAR" ]]; then
+                  cp "$WAN_13B_TAR" /tmp/w13.tar && tar xf /tmp/w13.tar -C wan_models/ && rm -f /tmp/w13.tar
+                else
+                  python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                fi
+                echo "1.3B base ready: $(ls wan_models/Wan2.1-T2V-1.3B/config.json 2>/dev/null || echo MISSING)"
+              fi
               echo "Model weights ready!"
 
               # ─── ONE timestamped folder for this whole run ───
