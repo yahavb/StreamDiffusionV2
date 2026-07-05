@@ -173,10 +173,12 @@ spec:
             - name: STUDENT_DMD_CKPT
               value: "ckpts/wan_causal_dmd_v2v/model.pt"
             - name: ITERS
-              value: "120"           # WARM-START overfit test: TEACHgap should start LOW (real
-                                     # video from iter0) and DROP as we specialize to the prompt.
+              value: "600"           # 120 iters preserved 5-step (blurry) but noise@2-step. Push the
+                                     # 5->2 step jump: render each 100-ckpt to watch pancake noise->blurry.
+                                     # If it crosses over, 2-step reachable + we know the budget; if it
+                                     # plateaus at noise by 600, 2-step too aggressive -> switch to 3-step.
             - name: SAVE_EVERY
-              value: "120"           # one ckpt at end -> render to confirm video is real, not noise
+              value: "100"           # 6 ckpts (100..600) — the noise->blurry crossover curve
             - name: LR
               value: "2e-5"
             - name: WARMUP
