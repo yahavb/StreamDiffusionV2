@@ -297,7 +297,9 @@ spec:
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
-              value: "0"
+              value: "700,0"   # REAL 2-step denoise (start t=700 -> 0). STEPS=0 alone is a
+                               # no-op (denoise at t=0) that ALWAYS outputs noise — that was
+                               # the broken "1-step" test, not the models.
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
