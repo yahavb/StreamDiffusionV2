@@ -297,9 +297,10 @@ spec:
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
-              value: "700,0"   # match training: render OUR distilled ckpt at the 2-step it was
-                               # trained for. Raw DMD ckpt = noise@2-step; if OURS is blurry-or-better
-                               # @2-step, the distillation WORKED (held quality going 5-step->2-step).
+              value: "700,500,400,200,0"  # DIAGNOSTIC: render OUR distilled ckpt at 5-step. Raw DMD
+                               # ckpt is blurry@5-step. If ours is ALSO blurry@5-step -> training didn't
+                               # break it, just hasn't learned 2-step (need more iters). If ours is
+                               # NOISE@5-step -> 120 iters DAMAGED the weights (lr too high) -> back off.
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
