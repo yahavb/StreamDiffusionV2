@@ -130,11 +130,19 @@ disconnect the gradient. **The safeguard is to log `grad_norm` from iteration
 one** — it is the difference between "we cut memory 10× and still train" and "we
 cut memory 10× and froze the model without noticing for a week of runs."
 
-> STATUS (open): as of this writing the single-prompt overfit stayed flat across
-> 800 iters — a working loop always overfits one example, so this points at the
-> DMD update, and a `grad_norm` probe was added to decide between "graph severed"
-> (≈0) and "step-size" (>0). Update this section with the measured value and the
-> resolution.
+> STATUS (resolved — graph is fine): the single-prompt overfit stayed flat across
+> 800 iters, so we added the `grad_norm` probe to decide between "graph severed"
+> (≈0) and "step-size" (>0). **Measured: grad_norm ≈ 1.0e-2, stable across steps**
+> (0.0088 → 0.0122, no explosion). So the two-forward recompute graph IS connected
+> — the gradient reaches the student weights. The flat gap is therefore a
+> **step-size** problem, not a plumbing problem: with lr = 2e-5 and AdamW the
+> per-step weight change (~2e-5) is ~10–50× too small to visibly move a 1.3B model
+> in ~158 generator steps. The stable, modest grad_norm gives headroom to raise lr
+> substantially. Next: lr sweep (single-prompt overfit) — the fastest example
+> should collapse its gap once lr is in the right range.
+>
+> Lesson for the checklist: grad_norm didn't just say "broken vs not" — its
+> *magnitude relative to lr* directly sized the step problem. Log it always.
 
 ## Reusable checklist for a new training loop (before trusting any loss curve)
 
