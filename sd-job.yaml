@@ -188,7 +188,17 @@ spec:
               #      in render(), schedule = fixed SDEdit truncated-descending).
               # Two renders = ~2x time but the cold compile + NEFF cache is shared, so the
               # 2nd render mostly reuses kernels.
-              render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard, riding the waves at sunset, cinematic lighting, high quality, photorealistic"
+              # VALIDATE-DISTILLED: render an IN-DISTRIBUTION prompt (the exact first
+              # training caption the student memorized), NOT the generic cat prompt.
+              # Prompt 1 is trained most (it%10==0), so it's the fairest quality read.
+              if [ -n "${GENERATOR_CKPT:-}" ]; then
+                CAP_SRC="${CAPTIONS_SRC:-/var/mdl/video-distill/captions-20260701-062139.jsonl}"
+                TRAIN_PROMPT=$(python3 -c "import json; d=json.loads(open('$CAP_SRC').readline()); print(d.get('caption') or d.get('prompt') or d.get('text'))")
+                echo "IN-DISTRIBUTION prompt (trained): $TRAIN_PROMPT"
+                render pancake "$TRAIN_PROMPT"
+              else
+                render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard, riding the waves at sunset, cinematic lighting, high quality, photorealistic"
+              fi
               if [ -n "$IN_VIDEO" ]; then
                 render dog "A highly detailed futuristic cybernetic dog running through a glowing neon field, metallic plates with iridescent blue and purple neon reflections, mechanical joints and wires, glowing sensor eyes, brushed-steel body with holographic circuits, cinematic, ultra-realistic, science-fiction style" "$IN_VIDEO"
               else
@@ -205,7 +215,7 @@ spec:
                 echo "=== [profiler] SKIPPED (validate-distilled run — just need the video) ==="
                 echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
                 mkdir -p "$FINAL_DIR"; cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy failed"
-                echo "=== DONE. VALIDATE THE VIDEO: $FINAL_DIR/cat.mp4 (branch exp/fps-1.3b @ $GIT_SHA) ==="
+                echo "=== DONE. VALIDATE THE VIDEO: $FINAL_DIR/pancake.mp4 (in-distribution prompt, branch exp/fps-1.3b @ $GIT_SHA) ==="
                 ls -lhR "$FINAL_DIR" | head -40
                 exit 0
               fi
@@ -268,7 +278,7 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607040849/model.pt"
+              value: "/var/mdl/video-distill/checkpoints/202607042043/model.pt"  # 150-iter (warmup25+lr2e-5)
             - name: HEIGHT
               value: "352"          # trained res
             - name: WIDTH
