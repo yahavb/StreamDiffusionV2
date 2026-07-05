@@ -322,11 +322,23 @@ def main():
 
     student = fake_score = real_score = G = None
 
-    # STUDENT (G) on the student group — base 1.3B init (we're CREATING the DMD ckpt)
+    # WARM-START: base 1.3B is a MULTI-step model -> produces pure NOISE at 1-step, so
+    # distilling clean 1-step FROM BASE means learning the whole few-step transform from
+    # scratch (thousands of tuned iters). Instead init the student from the KNOWN-GOOD
+    # 1.3B few-step DMD ckpt: it already does few-step, so training only has to SPECIALIZE
+    # it to our prompts. Env STUDENT_DMD_CKPT set -> warm-start; empty -> old base init.
+    _warm = os.environ.get("STUDENT_DMD_CKPT", "").strip()
+
+    # STUDENT (G) on the student group
     if in_student:
-        args.generator_ckpt = None
-        os.environ["DISTILL_BASE_ONLY"] = "1"
-        LOGGER.info("building student G (init base 1.3B, trainable)...")
+        if _warm:
+            args.generator_ckpt = _warm
+            os.environ["DISTILL_BASE_ONLY"] = ""
+            LOGGER.info(f"building student G (WARM-START from few-step DMD ckpt {_warm}, trainable)...")
+        else:
+            args.generator_ckpt = None
+            os.environ["DISTILL_BASE_ONLY"] = "1"
+            LOGGER.info("building student G (init base 1.3B, trainable)...")
         student = build_student_pipeline(args, device, dtype)  # FSDP2-sharded + ckpt inside
         G = student.generator
         if embeds_cache is not None:
@@ -335,13 +347,20 @@ def main():
             LOGGER.info("injected precomputed embeds into student (T5-free rollout)")
         os.environ["DISTILL_BASE_ONLY"] = ""
 
-    # FAKE_SCORE on its OWN group (base 1.3B init)
+    # FAKE_SCORE on its OWN group — warm-start it from the SAME few-step ckpt so the
+    # critic also starts in the working regime (a base-init critic scoring a few-step
+    # student is a distribution mismatch -> the flaky |fake| we saw).
     if in_fake:
-        os.environ["DISTILL_BASE_ONLY"] = "1"
-        LOGGER.info("building fake_score (1.3B, trainable, base init)...")
-        fake_score = build_neuron_generator(
-            args.student_base, None, args, device, trainable=True, tp_degree=tp)
-        os.environ["DISTILL_BASE_ONLY"] = ""
+        if _warm:
+            LOGGER.info(f"building fake_score (WARM-START from {_warm}, trainable)...")
+            fake_score = build_neuron_generator(
+                args.student_base, _warm, args, device, trainable=True, tp_degree=tp)
+        else:
+            os.environ["DISTILL_BASE_ONLY"] = "1"
+            LOGGER.info("building fake_score (1.3B, trainable, base init)...")
+            fake_score = build_neuron_generator(
+                args.student_base, None, args, device, trainable=True, tp_degree=tp)
+            os.environ["DISTILL_BASE_ONLY"] = ""
 
     # TEACHER (14B DMD ckpt) on the teacher group
     if in_teacher:

@@ -68,6 +68,12 @@ spec:
                 || python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-14B', local_dir='wan_models/Wan2.1-T2V-14B', local_dir_use_symlinks=False)"
               [[ -f "$CK14" ]] && cp "$CK14" ckpts/wan_causal_dmd_v2v_14b/model.pt \
                 || python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v_14b/*'], local_dir='ckpts')"
+              # 1.3B few-step DMD ckpt — the WARM-START init for the student (STUDENT_DMD_CKPT).
+              # Base 1.3B is multi-step -> pure noise at 1-step; this ckpt already does few-step.
+              mkdir -p ckpts/wan_causal_dmd_v2v
+              CK13="/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"
+              [[ -f "$CK13" ]] && cp "$CK13" ckpts/wan_causal_dmd_v2v/model.pt \
+                || { python3 -c "from huggingface_hub import snapshot_download; snapshot_download('jerryfeng/StreamDiffusionV2', allow_patterns=['wan_causal_dmd_v2v/*'], local_dir='ckpts')"; mkdir -p "$(dirname $CK13)" && cp ckpts/wan_causal_dmd_v2v/model.pt "$CK13"; }
               echo "weights ready"
 
               # ─── stage the caption corpus from S3 to LOCAL /tmp (off critical path) ───
@@ -158,15 +164,18 @@ spec:
             # mechanics are broken (not a capacity/variety/iteration problem).
             - name: MAX_PROMPTS
               value: "1"             # overfit ONE prompt (the pancake, prompt 1)
+            # WARM-START from the 1.3B few-step DMD ckpt (NOT base). Base=multi-step=noise
+            # at 1-step; this ckpt already does few-step so the student renders REAL video
+            # from iter 0 and training only specializes it to our prompts.
+            - name: STUDENT_DMD_CKPT
+              value: "ckpts/wan_causal_dmd_v2v/model.pt"
             - name: ITERS
-              value: "120"           # DIRECTION TEST: log unconfounded TEACHgap=|x0_student-real_pred|.
-                                     # 10x lr made DMDgap WORSE + grad_norm flat -> the (fake-real)
-                                     # direction is unreliable (flaky critic). Watch TEACHgap instead:
-                                     # if IT also won't fall, the DMD gradient is genuinely wrong.
+              value: "120"           # WARM-START overfit test: TEACHgap should start LOW (real
+                                     # video from iter0) and DROP as we specialize to the prompt.
             - name: SAVE_EVERY
-              value: "120"           # one ckpt at end
+              value: "120"           # one ckpt at end -> render to confirm video is real, not noise
             - name: LR
-              value: "2e-5"          # back to 2e-5 (2e-4 was worse); isolate DIRECTION not step-size
+              value: "2e-5"
             - name: WARMUP
               value: "10"            # short warmup — 1 prompt, critic tracks fast
             - name: DFAKE_RATIO
