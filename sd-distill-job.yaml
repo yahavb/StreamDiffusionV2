@@ -154,10 +154,9 @@ spec:
             - name: DISTILL_GRAD_CKPT
               value: "1"  # grad-checkpoint DiT blocks — cut 13GB rollout activation peak
             - name: ITERS
-              value: "150"           # SMOKE-CONVERGENCE: warmup 25 + ratio 5 -> ~25 G-steps.
-                                     # enough to SEE DMDgap bend down with lr=2e-5 before 8h.
+              value: "800"           # real run: warmup 25 + ratio 5 -> ~155 G-steps
             - name: SAVE_EVERY
-              value: "150"           # one ckpt at the end
+              value: "200"           # 4 checkpoints (200/400/600/800) to compare as a series
             - name: LR
               value: "2e-5"          # 10x the old 2e-6 (which was too small to move G -> flat gap)
             - name: WARMUP

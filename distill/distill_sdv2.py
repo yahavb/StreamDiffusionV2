@@ -452,8 +452,13 @@ def main():
                          .replace("._checkpoint_wrapped_module", ""))
             sd = {f"model.{_clean(k)}": v.to(torch.bfloat16) for k, v in full.items()}
             assert len(sd) > 0, "EMPTY checkpoint — get_model_state_dict AND fallback both returned 0 tensors"
-            torch.save({"generator": sd, "distill_iter": it}, args.out)
-            LOGGER.info(f"[ckpt] wrote {args.out} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
+            payload = {"generator": sd, "distill_iter": it}
+            torch.save(payload, args.out)                       # latest (overwritten each save)
+            # ALSO keep a per-iter copy so the 200/400/600/800 SERIES survives for A/B video
+            # comparison (args.out alone gets overwritten -> only iter-800 would remain).
+            iter_path = args.out.replace(".pt", f".iter{it}.pt")
+            torch.save(payload, iter_path)
+            LOGGER.info(f"[ckpt] wrote {args.out} + {iter_path} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
 
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
