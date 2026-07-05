@@ -278,7 +278,7 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607042043/model.pt"  # 150-iter (warmup25+lr2e-5)
+              value: "/var/mdl/video-distill/checkpoints/202607050916/model.pt"  # 120-iter 1-prompt overfit, TEACHgap~0.84
             - name: HEIGHT
               value: "352"          # trained res
             - name: WIDTH
