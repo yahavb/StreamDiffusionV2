@@ -159,9 +159,11 @@ spec:
             - name: MAX_PROMPTS
               value: "1"             # overfit ONE prompt (the pancake, prompt 1)
             - name: ITERS
-              value: "200"           # warmup 10 + ratio 5 -> ~38 G-steps on the SAME prompt
+              value: "800"           # warmup 10 + ratio 5 -> ~158 G-steps on the SAME prompt
             - name: SAVE_EVERY
-              value: "50"            # 4 checkpoints (50/100/150/200) to see the overfit curve
+              value: "50"            # checkpoints every 50 (50/100/150/200/.../800) — superset of
+                                     # 50/100/150/200/400/600/800; watch the full overfit curve
+                                     # (~16 ckpts x 2.6GB ~= 42GB on PVC)
             - name: LR
               value: "2e-5"          # 10x the old 2e-6 (which was too small to move G -> flat gap)
             - name: WARMUP
