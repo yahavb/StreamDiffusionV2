@@ -159,13 +159,14 @@ spec:
             - name: MAX_PROMPTS
               value: "1"             # overfit ONE prompt (the pancake, prompt 1)
             - name: ITERS
-              value: "120"           # LR SWEEP (single-prompt overfit): grad_norm~1e-2 is
-                                     # connected but lr=2e-5 too small. Try 10x. ~22 G-steps —
-                                     # enough to SEE the gap collapse if lr is now right.
+              value: "120"           # DIRECTION TEST: log unconfounded TEACHgap=|x0_student-real_pred|.
+                                     # 10x lr made DMDgap WORSE + grad_norm flat -> the (fake-real)
+                                     # direction is unreliable (flaky critic). Watch TEACHgap instead:
+                                     # if IT also won't fall, the DMD gradient is genuinely wrong.
             - name: SAVE_EVERY
-              value: "120"           # one ckpt at end (to render the overfit result)
+              value: "120"           # one ckpt at end
             - name: LR
-              value: "2e-4"          # 10x — grad_norm was stable (~1e-2), headroom to push lr hard
+              value: "2e-5"          # back to 2e-5 (2e-4 was worse); isolate DIRECTION not step-size
             - name: WARMUP
               value: "10"            # short warmup — 1 prompt, critic tracks fast
             - name: DFAKE_RATIO

@@ -492,7 +492,8 @@ def main():
 
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
     _gl_hist = []  # recent loss_G values for the running-average convergence metric
-    _gap_hist = []  # recent RAW ||fake-real|| gap = the real convergence signal
+    _gap_hist = []  # recent RAW ||fake-real|| gap (CONFOUNDED by critic)
+    _tgap_hist = []  # recent ||x0_student-real_pred|| = UNCONFOUNDED student->teacher gap
     for it in range(args.iters):
         _stage(it, "iter-start")
         prompt = [prompts[it % len(prompts)]]
@@ -563,8 +564,15 @@ def main():
         # After warmup, G updates once every dfake_gen_update_ratio iters (critic leads).
         _do_g = (it >= args.warmup) and (it % args.dfake_gen_update_ratio == 0)
         # always compute the raw gap (cheap, needs both preds) so we log convergence
+        # NOTE: DMDgap=|fake-real| is CONFOUNDED — it depends on the flaky critic, so a
+        # rising gap does not prove divergence. The UNCONFOUNDED signal is how close the
+        # STUDENT's own output is to the teacher's prediction: |x0_student - real_pred|.
+        # DMD moves x0 toward exactly this; it doesn't involve the critic. THIS should
+        # fall if the student is truly learning the teacher, regardless of critic noise.
+        dmd_gap = float("nan"); teach_gap = float("nan")
         if in_student:
             dmd_gap = float((fake_pred - real_pred).abs().mean().detach())
+            teach_gap = float((x0_det - real_pred).abs().mean().detach())
         if in_student and _do_g:
             student.kv_cache1 = None
             student.crossattn_cache = None
@@ -621,6 +629,10 @@ def main():
             _gap_hist.append(dmd_gap)
             if len(_gap_hist) > 50:
                 _gap_hist.pop(0)
+        if in_student and teach_gap == teach_gap:
+            _tgap_hist.append(teach_gap)
+            if len(_tgap_hist) > 50:
+                _tgap_hist.pop(0)
         # MEM PROBE: count live device tensors + their MB each iter, so we can SEE
         # what grows (leak vs NEFF-cache) instead of guessing. Cheap gc walk.
         _dev_n = _dev_mb = 0
@@ -633,14 +645,16 @@ def main():
         if my_rank == ssrc or not dist.is_initialized():
             avg = sum(_gl_hist) / len(_gl_hist) if _gl_hist else float("nan")
             gap_avg = sum(_gap_hist) / len(_gap_hist) if _gap_hist else float("nan")
+            tgap_avg = sum(_tgap_hist) / len(_tgap_hist) if _tgap_hist else float("nan")
             # magnitudes of each arrow — if real~=fake from iter 0 the setup is degenerate;
             # if real stays fixed while fake drifts, the critic IS tracking the student.
             _rm = float(real_pred.abs().mean()); _fm = float(fake_pred.abs().mean())
             _phase = "warmup" if it < args.warmup else ("G-step" if _do_g else "critic-only")
-            LOGGER.info(f"it {it}/{args.iters} [{_phase}] loss_G={gl:.4f} loss_G_avg50={avg:.4f}  "
+            LOGGER.info(f"it {it}/{args.iters} [{_phase}] loss_G={gl:.4f}  "
                         f"DMDgap={dmd_gap:.4f} DMDgap_avg50={gap_avg:.4f}  "
+                        f"TEACHgap={teach_gap:.4f} TEACHgap_avg50={tgap_avg:.4f}  "
                         f"|real|={_rm:.3f} |fake|={_fm:.3f}  "
-                        f"MEM[dev_MB={_dev_mb:.0f}]  (watch DMDgap_avg50 DECREASE)")
+                        f"(TEACHgap_avg50 = unconfounded student->teacher; watch it DECREASE)")
         if in_fake and my_rank == fsrc:
             LOGGER.info(f"it {it}/{args.iters}  loss_fake={lf:.4f}  (fake tracks student; should stay low/steady)")
         if it > 0 and it % args.save_every == 0:
