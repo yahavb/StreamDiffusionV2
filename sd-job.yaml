@@ -278,7 +278,7 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607051351/model.pt"  # OUR 120-iter 2-step distilled (TEACHgap 0.58->0.37, converged)
+              value: "/var/mdl/video-distill/checkpoints/202607051515/model.iter200.pt"  # closest saved to best (iter248, TEACHgap 0.358)
                                                                    # Decisive: does the known-good few-step 1.3B
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
@@ -297,10 +297,8 @@ spec:
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
-              value: "700,500,400,200,0"  # DIAGNOSTIC: render OUR distilled ckpt at 5-step. Raw DMD
-                               # ckpt is blurry@5-step. If ours is ALSO blurry@5-step -> training didn't
-                               # break it, just hasn't learned 2-step (need more iters). If ours is
-                               # NOISE@5-step -> 120 iters DAMAGED the weights (lr too high) -> back off.
+              value: "700,0"   # 2-step: the target. Render iter200 (near best TEACHgap 0.358) — is the
+                               # plateau floor noise or already-usable @2-step?
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
