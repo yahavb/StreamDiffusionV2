@@ -278,7 +278,10 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607050916/model.pt"  # 120-iter 1-prompt overfit, TEACHgap~0.84
+              value: "/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"  # RAW warm-start DMD ckpt (UNTRAINED by us).
+                                                                   # Decisive: does the known-good few-step 1.3B
+                                                                   # render real video at 1-STEP (STEPS=0)? If noise,
+                                                                   # 1-step is impossible for 1.3B -> must go 2-step.
             - name: HEIGHT
               value: "352"          # trained res
             - name: WIDTH
