@@ -576,8 +576,19 @@ def main():
             grad = grad / (grad.abs().mean() + 1e-8)
             target = (x0_grad - grad).detach()
             loss_g = 0.5 * F.mse_loss(x0_grad, target)
-            opt_g.zero_grad(set_to_none=True); loss_g.backward(); opt_g.step()
+            opt_g.zero_grad(set_to_none=True); loss_g.backward()
+            # MEASURE (don't theorize): total grad norm reaching the student weights.
+            # ~0 => the gradient is DISCONNECTED (recompute/FSDP/checkpoint broke the
+            # graph) and no lr/iters will ever help. >0 but flat gap => step-size issue.
+            _gnorm = 0.0
+            for _p in G.model.parameters():
+                if _p.grad is not None:
+                    _gnorm += float(_p.grad.detach().float().pow(2).sum())
+            _gnorm = _gnorm ** 0.5
+            opt_g.step()
             gl = float(loss_g.detach())
+            if my_rank == ssrc:
+                LOGGER.info(f"  [grad] it {it}: student grad_norm={_gnorm:.6e}")
             del grad, target, x0_grad, loss_g   # free the fresh graph immediately
         _stage(it, "e:student-backward")
 

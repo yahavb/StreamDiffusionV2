@@ -159,11 +159,10 @@ spec:
             - name: MAX_PROMPTS
               value: "1"             # overfit ONE prompt (the pancake, prompt 1)
             - name: ITERS
-              value: "800"           # warmup 10 + ratio 5 -> ~158 G-steps on the SAME prompt
+              value: "40"            # GRAD-NORM DIAGNOSTIC: warmup 10 + ~6 G-steps is enough to
+                                     # read student grad_norm. ~0 => graph disconnected (root bug).
             - name: SAVE_EVERY
-              value: "50"            # checkpoints every 50 (50/100/150/200/.../800) — superset of
-                                     # 50/100/150/200/400/600/800; watch the full overfit curve
-                                     # (~16 ckpts x 2.6GB ~= 42GB on PVC)
+              value: "40"            # one ckpt (not the point of this run)
             - name: LR
               value: "2e-5"          # 10x the old 2e-6 (which was too small to move G -> flat gap)
             - name: WARMUP
