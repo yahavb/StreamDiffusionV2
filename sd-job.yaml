@@ -202,7 +202,11 @@ spec:
                 # can A/B checkpoints in one job. tag = the ckpt's iterNNN (or basename).
                 IFS=',' read -ra CKPTS <<< "$GENERATOR_CKPT"
                 for CK in "${CKPTS[@]}"; do
-                  TAG=$(basename "$CK" .pt | sed -E 's/.*(iter[0-9]+).*/\1/; t; s/model/ckpt/')
+                  BN=$(basename "$CK" .pt)                       # e.g. model.iter200 or model
+                  case "$BN" in
+                    *iter*) TAG="${BN##*.}" ;;                   # -> iter200
+                    *)      TAG=$(basename "$(dirname "$CK")") ;; # -> parent dir (timestamp)
+                  esac
                   render "pancake_$TAG" "$TRAIN_PROMPT" "" "$CK"
                 done
               else
