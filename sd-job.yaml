@@ -194,23 +194,26 @@ spec:
               # VALIDATE-DISTILLED: render an IN-DISTRIBUTION prompt (the exact first
               # training caption the student memorized), NOT the generic cat prompt.
               # Prompt 1 is trained most (it%10==0), so it's the fairest quality read.
+              # Always render the IN-DISTRIBUTION prompt (first training caption) — apples-to-
+              # apples with the distill runs, whether we're testing OUR ckpts or the raw
+              # config ckpt (empty GENERATOR_CKPT).
+              CAP_SRC="${CAPTIONS_SRC:-/var/mdl/video-distill/captions-20260701-062139.jsonl}"
+              TRAIN_PROMPT=$(python3 -c "import json; d=json.loads(open('$CAP_SRC').readline()); print(d.get('caption') or d.get('prompt') or d.get('text'))")
+              echo "IN-DISTRIBUTION prompt (trained): $TRAIN_PROMPT"
               if [ -n "${GENERATOR_CKPT:-}" ]; then
-                CAP_SRC="${CAPTIONS_SRC:-/var/mdl/video-distill/captions-20260701-062139.jsonl}"
-                TRAIN_PROMPT=$(python3 -c "import json; d=json.loads(open('$CAP_SRC').readline()); print(d.get('caption') or d.get('prompt') or d.get('text'))")
-                echo "IN-DISTRIBUTION prompt (trained): $TRAIN_PROMPT"
-                # GENERATOR_CKPT may be a COMMA-LIST -> render each to pancake_<tag>.mp4 so we
-                # can A/B checkpoints in one job. tag = the ckpt's iterNNN (or basename).
+                # comma-list -> render each to pancake_<tag>.mp4 for A/B in one job
                 IFS=',' read -ra CKPTS <<< "$GENERATOR_CKPT"
                 for CK in "${CKPTS[@]}"; do
-                  BN=$(basename "$CK" .pt)                       # e.g. model.iter200 or model
+                  BN=$(basename "$CK" .pt)
                   case "$BN" in
-                    *iter*) TAG="${BN##*.}" ;;                   # -> iter200
-                    *)      TAG=$(basename "$(dirname "$CK")") ;; # -> parent dir (timestamp)
+                    *iter*) TAG="${BN##*.}" ;;
+                    *)      TAG=$(basename "$(dirname "$CK")") ;;
                   esac
                   render "pancake_$TAG" "$TRAIN_PROMPT" "" "$CK"
                 done
               else
-                render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard, riding the waves at sunset, cinematic lighting, high quality, photorealistic"
+                # raw config ckpt (e.g. 14B via wan_causal_dmd_v2v_14b_neuron.yaml)
+                render pancake "$TRAIN_PROMPT"
               fi
               if [ -n "$IN_VIDEO" ]; then
                 render dog "A highly detailed futuristic cybernetic dog running through a glowing neon field, metallic plates with iridescent blue and purple neon reflections, mechanical joints and wires, glowing sensor eyes, brushed-steel body with holographic circuits, cinematic, ultra-realistic, science-fiction style" "$IN_VIDEO"
@@ -228,8 +231,8 @@ spec:
                 echo "=== [profiler] SKIPPED (validate-distilled run — just need the video) ==="
                 echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
                 mkdir -p "$FINAL_DIR"; cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy failed"
-                echo "=== DONE. VALIDATE THE VIDEOS: $FINAL_DIR/pancake_*.mp4 (in-distribution prompt, branch exp/fps-1.3b @ $GIT_SHA) ==="
-                ls -lh "$FINAL_DIR"/pancake_*.mp4 2>/dev/null
+                echo "=== DONE. VALIDATE THE VIDEOS: $FINAL_DIR/pancake*.mp4 (in-distribution prompt, branch exp/fps-1.3b @ $GIT_SHA) ==="
+                ls -lh "$FINAL_DIR"/pancake*.mp4 2>/dev/null
                 ls -lhR "$FINAL_DIR" | head -40
                 exit 0
               fi
