@@ -357,8 +357,10 @@ spec:
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: USE_NKI_KERNELS
-              value: "true"         # restored: NKI attn was NOT the blur (off rendered same). The
-                                    # blur was the RF-VAE decoder port -> now using original WAN VAE.
+              value: "false"        # RE-TEST off: VAE is now the ORIGINAL full-quality decoder (RF-VAE
+                                    # port removed). Earlier NKI-off test was masked by the blurry VAE
+                                    # port. With a clean VAE, does exact SDPA attn render sharp? If yes,
+                                    # NKI attn was a 2nd stacked approximation. If still blurry -> DiT elsewhere.
             # NKI VAE conv2d_k3 (9 full-res shifted copies -> 27-tensor aten::cat) fails
             # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
             - name: USE_NKI_VAE
