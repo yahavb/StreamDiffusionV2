@@ -4,6 +4,51 @@ Notes for the blog. Audience: ML scientists/engineers. This documents the
 memory techniques that let a DMD distillation training loop run on constrained
 per-core HBM, and the one detail that is easy to get catastrophically wrong.
 
+## Mirror checkpoints to durable storage AS THEY ARE SAVED, not at job end
+
+A subtle workflow trap that cost real time: our training job wrote checkpoints to
+fast pod-local disk (`/tmp`) and copied the whole run folder to durable storage
+(the S3-backed PVC) **only at the very end**. That is the right call for the
+*final* artifact — S3 is slow and off the training critical path. But it means
+that **mid-run, none of the intermediate checkpoints are reachable** from outside
+the pod: they are trapped in `/tmp` until the job finishes.
+
+Why this matters for a distillation/RL-style run specifically: the whole point of
+saving `iter100, iter200, …` is to **render and inspect the quality curve** — and
+the most valuable time to do that is *while the run is still going*, so you can
+kill a doomed run early or confirm an early checkpoint already crossed the quality
+threshold. If the checkpoints only land in durable storage at the end, you have
+thrown away the ability to make that decision early — you wait the full run just
+to look at iteration 100.
+
+The fix is one line of intent: **the moment a checkpoint is written to local disk,
+also copy it to durable storage — in a background thread so the ~GB write never
+stalls the training loop.**
+
+```python
+# right after torch.save(payload, iter_path)  # iter_path on fast local disk
+mirror = os.environ.get("CKPT_MIRROR_DIR", "")   # the durable (S3/PVC) dir
+if mirror:
+    import shutil, threading
+    def _cp(src, dst_dir):
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+    threading.Thread(target=_cp, args=(iter_path, mirror), daemon=True).start()
+```
+
+Guidance for scientists:
+- Keep the **local write** for speed (it's what the next `torch.save` and any
+  resume reads); ADD the durable mirror, don't replace.
+- Make the mirror **asynchronous** (background thread / async upload). A synchronous
+  multi-GB copy every save interval visibly slows a long run.
+- Write **per-iteration filenames** (`model.iterN.pt`), not just a single
+  overwritten `model.pt` — otherwise the series you wanted to compare collapses to
+  only the last checkpoint (we hit exactly this: every save overwrote the same file
+  and only the final iteration survived).
+- Net effect: at any moment during a multi-hour run you can pull `iter100`,
+  `iter200`, … from durable storage and render them on separate hardware, turning a
+  "wait 8 hours then look" loop into "watch the quality curve live and stop early."
+
 ## The end-to-end learning loop (the mechanism, plainly)
 
 Every training iteration is the same five steps. The whole thing hinges on step 3.

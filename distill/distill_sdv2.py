@@ -478,6 +478,22 @@ def main():
             iter_path = args.out.replace(".pt", f".iter{it}.pt")
             torch.save(payload, iter_path)
             LOGGER.info(f"[ckpt] wrote {args.out} + {iter_path} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
+            # MID-RUN S3 MIRROR: copy this per-iter ckpt to CKPT_MIRROR_DIR (the S3-backed
+            # PVC) IMMEDIATELY, in a background thread, so we can render/validate EARLIER
+            # checkpoints WHILE the run is still training (the job otherwise only copies at
+            # the very end). Non-blocking: the ~2.7GB S3 write must not stall the loop.
+            _mirror = os.environ.get("CKPT_MIRROR_DIR", "").strip()
+            if _mirror:
+                import shutil, threading
+                def _cp(src, dst_dir, tag):
+                    try:
+                        os.makedirs(dst_dir, exist_ok=True)
+                        shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+                        LOGGER.info(f"[ckpt-mirror] {tag} -> {dst_dir} (available mid-run)")
+                    except Exception as e:
+                        LOGGER.warning(f"[ckpt-mirror] copy failed ({tag}): {e}")
+                threading.Thread(target=_cp, args=(iter_path, _mirror, f"iter{it}"),
+                                 daemon=True).start()
 
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
