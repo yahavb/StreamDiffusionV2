@@ -295,27 +295,27 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: ""              # EMPTY -> raw 14B DMD ckpt via config (characterize 14B step-floor)
+              value: "/var/mdl/video-distill/checkpoints/202607052316/model.iter400.pt,/var/mdl/video-distill/checkpoints/202607052316/model.iter1200.pt,/var/mdl/video-distill/checkpoints/202607052316/model.iter2400.pt"  # early/mid/late of 10k run — does quality improve across the series?
                                                                    # Decisive: does the known-good few-step 1.3B
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
             - name: HEIGHT
-              value: "480"          # 480p 14B step-floor characterization (memory: 480 may break VAE compile)
+              value: "352"          # match training res
             - name: WIDTH
-              value: "832"
+              value: "640"
             # t2v from noise (cat prompt). Distilled student not trained on v2v.
             - name: INPUT_VIDEO_SRC
               value: ""
             # 1.3B student caps at TP-4 (12 heads). Single stream: NPROC==TP_DEGREE==4.
             - name: NPROC
-              value: "8"             # 14B is heavy: TP-8 (40 heads shard at TP{2,4,8})
+              value: "4"             # 1.3B student: TP-4 (12 heads)
             - name: TP_DEGREE
-              value: "8"
+              value: "4"
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
-              value: "700,500,400,200,0"   # 14B @480p, FULL 5-step first: does 480p even render
-                                           # (memory: 480 may break VAE compile)? If yes, sweep 3/2-step next.
+              value: "700,400,0"   # 3-step: match training. Render early/mid/late of the 10k run
+                                   # (iter400/1200/2400) — does quality improve across the series?
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
