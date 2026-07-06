@@ -167,7 +167,7 @@ spec:
             - name: DISTILL_FUNCTIONAL_ATTN
               value: "1"  # out-of-place attn (no KV-cache) — backward-safe under FSDP+ckpt
             - name: DISTILL_TRACE
-              value: "1"  # per-stage HBM tracer: pin WHICH stage grows + survives cleanup
+              value: "0"  # per-stage HBM tracer OFF (OOM hunt over — was spamming [trace] lines)
             - name: DISTILL_GRAD_CKPT
               value: "1"  # grad-checkpoint DiT blocks — cut 13GB rollout activation peak
             # ── SINGLE-PROMPT OVERFIT: "can the loop learn AT ALL?" test ──
