@@ -244,7 +244,8 @@ def run_inference(pipeline, args, config, verbose=False):
     anchor_vae_time = time.perf_counter() - t_vae
     timings["vae_stream"].append(anchor_vae_time)
 
-    all_videos = [anchor_video] if anchor_video is not None else []
+    # CPU (same reason as the block appends below — final cat must not run on-device)
+    all_videos = [anchor_video.to("cpu").float()] if anchor_video is not None else []
 
     # Step 2: Stream remaining frames — 1 DiT call (3 frames) + 1 VAE decode per block
     num_remaining = num_frames - num_anchor_frames
@@ -292,7 +293,13 @@ def run_inference(pipeline, args, config, verbose=False):
         timings["block_e2e"].append(block_e2e)
 
         if block_video is not None:
-            all_videos.append(block_video)
+            # Move each finished pixel block to CPU immediately. The final assembly
+            # (torch.cat of all blocks + scale) must NOT run on the Neuron device: at
+            # 480p the concatenated [1,81,3,480,640] is a ~450MB single op that the
+            # compiler tries to build as one NEFF and the compile service DIES
+            # (aten::cat ConnectToService errno=2). These are already-decoded pixels —
+            # stitching them is a host operation, not a kernel.
+            all_videos.append(block_video.to("cpu").float())
 
         # Log EVERY block (rank 0) so per-block spread + compile contamination is
         # visible in the log — this is how RF exposes its 8.09 fps steady-state vs
@@ -306,7 +313,8 @@ def run_inference(pipeline, args, config, verbose=False):
                         f"= {block_fps:.2f} fps "
                         f"({num_frame_per_block} frames)")
 
-    # Concatenate all decoded video blocks
+    # Concatenate all decoded video blocks ON CPU (blocks moved to CPU above) — avoids the
+    # giant on-device [1,81,3,480,640] cat/mul/add that crashes the Neuron compile service.
     if all_videos:
         video = torch.cat(all_videos, dim=1)[:, :num_frames]
         video = video * 0.5 + 0.5
