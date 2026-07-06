@@ -62,20 +62,26 @@ def main():
             outs.append(model.decode(zb, scale).float().cpu())
     block = torch.cat(outs, dim=2)
 
-    # align frame counts (temporal upsample may differ at block boundaries)
-    tmin = min(whole.shape[2], block.shape[2])
-    w, bl = whole[:, :, :tmin], block[:, :, :tmin]
-    diff = (w - bl).abs()
+    # ── STREAMED block decode (THE FIX): decode_stream keeps the cache across blocks ──
+    souts = []
+    with torch.no_grad():
+        for b in range(N_BLOCKS):
+            zb = z[:, :, b * NPB:(b + 1) * NPB, :, :].clone()
+            souts.append(model.decode_stream(zb, scale, first_chunk=(b == 0)).float().cpu())
+    stream = torch.cat(souts, dim=2)
+
+    def _cmp(a, tag):
+        tmin = min(whole.shape[2], a.shape[2])
+        d = (whole[:, :, :tmin] - a[:, :, :tmin]).abs()
+        print(f"  {tag:20s} shape {tuple(a.shape)}  max_diff={d.max().item():.6f}  mean={d.mean().item():.6f}")
+        return d.max().item()
+
     print("=" * 64)
-    print(f"VAE decode: WHOLE-CLIP vs BLOCK-BY-BLOCK (T_lat={T}, npb={NPB})")
-    print(f"  whole shape {tuple(whole.shape)}  block shape {tuple(block.shape)}")
-    print(f"  max_diff  = {diff.max().item():.6f}")
-    print(f"  mean_diff = {diff.mean().item():.6f}")
-    print(f"  whole range [{w.min():.3f}, {w.max():.3f}]  block range [{bl.min():.3f}, {bl.max():.3f}]")
-    verdict = ("IDENTICAL -> block streaming is NOT the blur"
-               if diff.max().item() < 0.05 else
-               "DIVERGE -> per-block decode loses temporal context = BLUR SOURCE")
-    print(f"  VERDICT: {verdict}")
+    print(f"VAE decode vs WHOLE-CLIP (T_lat={T}, npb={NPB})  whole={tuple(whole.shape)}")
+    m_block = _cmp(block, "block(clear/blk)")
+    m_stream = _cmp(stream, "stream(cache kept)")
+    print(f"  VERDICT: block {'BLUR' if m_block>=0.05 else 'ok'}; "
+          f"stream {'STILL DIVERGES' if m_stream>=0.05 else 'MATCHES whole-clip = FIXED'}")
     print("=" * 64)
 
 

@@ -140,7 +140,7 @@ class NeuronWanVAEWrapper(VAEInterface):
         cache across chunks via chunk_idx; clearing per-block destroys temporal
         continuity and softens output — that was the quality regression.)"""
         self._decode_chunk_idx = 0
-        if self._use_rf_vae and self._model is not None:
+        if self._model is not None and hasattr(self._model, "clear_cache"):
             self._model.clear_cache()
 
     def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
@@ -165,8 +165,14 @@ class NeuronWanVAEWrapper(VAEInterface):
         device = latent.device
         scale = [self._mean.to(device), (1.0 / self._std).to(device)]
         latent = rearrange(latent, 'b t c h w -> b c t h w').contiguous()
+        # STREAM the temporal cache across blocks (clear only on chunk 0), else each block
+        # decode resets the causal Conv3d cache -> wrong frames + blur at boundaries
+        # (proven: whole-clip 57 frames vs per-block 45, max_diff 2.15). decode_stream keeps
+        # the cache; reset_decode_stream() (once per clip) does the clear.
+        idx = getattr(self, "_decode_chunk_idx", 0)
         with torch.no_grad():
-            video = self._model.decode(latent, scale)
+            video = self._model.decode_stream(latent, scale, first_chunk=(idx == 0))
+        self._decode_chunk_idx = idx + 1
         video = rearrange(video, 'b c t h w -> b t c h w')
         return video
 

@@ -682,6 +682,32 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return mu
 
+    def decode_stream(self, z, scale, first_chunk=True):
+        """STREAMING decode for block-by-block inference: clears the temporal feat_cache
+        ONLY on the first chunk, then carries it across chunks so the causal Conv3d keeps
+        temporal context between blocks. Calling plain decode() per block instead resets
+        the cache every block -> wrong frame count + garbage at boundaries -> BLUR
+        (proven: whole-clip 57 frames vs per-block 45, max_diff 2.15). This is what the
+        RF-VAE port did via chunk_idx; here it's the original full-quality decoder streamed.
+        """
+        if first_chunk:
+            self.clear_cache()
+        if isinstance(scale[0], torch.Tensor):
+            z = z.contiguous() / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            z = z.contiguous() / scale[1] + scale[0]
+        iter_ = z.shape[2]
+        x = self.conv2(z)
+        frames = []
+        for i in range(iter_):
+            self._conv_idx = [0]
+            frames.append(self.decoder(
+                x[:, :, i:i + 1, :, :],
+                feat_cache=self._feat_map,
+                feat_idx=self._conv_idx))
+        return frames[0] if len(frames) == 1 else torch.cat(frames, 2)
+
     def decode(self, z, scale):
         self.clear_cache()
         # z: [b,c,t,h,w]
