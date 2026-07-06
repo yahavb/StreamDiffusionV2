@@ -1,0 +1,73 @@
+# Minimal job: run the DiT NKI kernel accuracy test (rope/cross/self-attn vs CPU) ONLY.
+# No weights, no VAE, no render — fast. Names any lossy kernel numerically.
+# Launch:
+#   kubectl delete job sd-kernel-test --ignore-not-found
+#   kubectl apply -f sd-kernel-test.yaml
+#   kubectl logs -f job/sd-kernel-test
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sd-kernel-test
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: sd-kernel-test
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
+      containers:
+        - name: sd-kernel-test
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+              BRANCH="${BRANCH:-exp/fps-1.3b}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/StreamDiffusionV2.git REPO
+              cd REPO
+              echo "┌── PROVENANCE ──"
+              echo "│ branch : $(git rev-parse --abbrev-ref HEAD) (requested: $BRANCH)"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              export RF_DEVICE_BACKEND=neuron
+              uv pip install -r requirements-neuron.txt || pip install -r requirements-neuron.txt
+              uv pip install "setuptools<81" || pip install "setuptools<81"
+
+              echo "══════════ DiT NKI kernel accuracy test (rope/cross/self-attn vs CPU) ══════════"
+              python test_dit_kernels.py || echo "[kernel-test] non-zero exit (see FAIL lines above)"
+              echo "══════════ end kernel accuracy test ══════════"
+          resources:
+            claims:
+              - name: s-lnc1-trn2
+            requests:
+              cpu: 16
+              memory: 64Gi
+            limits:
+              cpu: 16
+              memory: 64Gi
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "exp/fps-1.3b"
+            - name: NEURON_RT_NUM_CORES
+              value: "4"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN

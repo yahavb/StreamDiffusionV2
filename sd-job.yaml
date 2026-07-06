@@ -114,11 +114,6 @@ spec:
               fi
               echo "Model weights ready!"
 
-              # ─── NKI KERNEL ACCURACY TEST (vs CPU) — run BEFORE render, output to log ───
-              echo "══════════ DiT NKI kernel accuracy test (rope/cross/self-attn vs CPU) ══════════"
-              bash -c 'cd $(find /tmp -name test_dit_kernels.py -printf "%h\n" 2>/dev/null | head -1) && python test_dit_kernels.py' || echo "[kernel-test] non-zero exit (see FAIL lines above)"
-              echo "══════════ end kernel accuracy test ══════════"
-
               # ─── ONE timestamped folder for this whole run ───
               # WORK ON LOCAL DISK (/tmp) — /var/mdl is S3-backed: slow on the critical
               # path AND ffmpeg can't write mp4 trailers there (Invalid argument). Copy
