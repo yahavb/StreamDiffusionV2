@@ -155,25 +155,28 @@ spec:
               CFG="streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml"
               RES_ARG="--num_frames 81 --height 240 --width 416"
               if [ -n "${GENERATOR_CKPT:-}" ]; then
-                CKPT_ARG="--generator_ckpt $GENERATOR_CKPT"
                 CFG="streamv2v/configs/wan_causal_fps_neuron.yaml"
                 RES_ARG="--num_frames 81 --height ${HEIGHT:-352} --width ${WIDTH:-640}"
-                echo "VALIDATE-DISTILLED: ckpt=$GENERATOR_CKPT cfg=$CFG res=${HEIGHT:-352}x${WIDTH:-640} steps=$STEPS tp=$TP_DEGREE"
+                echo "VALIDATE-DISTILLED: cfg=$CFG res=${HEIGHT:-352}x${WIDTH:-640} steps=$STEPS tp=$TP_DEGREE ckpts=$GENERATOR_CKPT"
               fi
+              # BENCH_CMD without the ckpt arg; per-ckpt arg is appended in render() so we
+              # can render MULTIPLE checkpoints (GENERATOR_CKPT = comma-list) in one job.
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
                 --config $CFG \
-                --steps $STEPS --tp_degree $TP_DEGREE $CKPT_ARG \
+                --steps $STEPS --tp_degree $TP_DEGREE \
                 $RES_ARG --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
               # $3 (optional) = input video path -> v2v restyle. Omit -> t2v from noise.
               render() {
-                local NAME="$1" PROMPT="$2" VIDEO="${3:-}"
-                echo "=== rendering [$NAME]: $PROMPT  (video=${VIDEO:-none}) ==="
+                local NAME="$1" PROMPT="$2" VIDEO="${3:-}" CKPT="${4:-}"
+                echo "=== rendering [$NAME]: $PROMPT  (video=${VIDEO:-none}) (ckpt=${CKPT:-config}) ==="
                 local FRAMES_DIR="$RUN_DIR/${NAME}_frames"
                 local VID_ARG=""
                 [ -n "$VIDEO" ] && VID_ARG="--video_path $VIDEO --noise_scale 0.4"
-                $BENCH_CMD --prompt "$PROMPT" --fps 16 $VID_ARG \
+                local CK_ARG=""
+                [ -n "$CKPT" ] && CK_ARG="--generator_ckpt $CKPT"
+                $BENCH_CMD --prompt "$PROMPT" --fps 16 $VID_ARG $CK_ARG \
                   --output_path "$RUN_DIR/${NAME}.mp4" || echo "[$NAME] render FAILED"
                 if ls "$FRAMES_DIR"/frame_*.png >/dev/null 2>&1; then
                   python3 -c "import imageio,glob; fr=sorted(glob.glob('$FRAMES_DIR/frame_*.png')); w=imageio.get_writer('$RUN_DIR/${NAME}.mp4', fps=16); [w.append_data(imageio.imread(f)) for f in fr]; w.close(); print('[$NAME] wrote $RUN_DIR/${NAME}.mp4 with', len(fr), 'frames')"
@@ -195,7 +198,13 @@ spec:
                 CAP_SRC="${CAPTIONS_SRC:-/var/mdl/video-distill/captions-20260701-062139.jsonl}"
                 TRAIN_PROMPT=$(python3 -c "import json; d=json.loads(open('$CAP_SRC').readline()); print(d.get('caption') or d.get('prompt') or d.get('text'))")
                 echo "IN-DISTRIBUTION prompt (trained): $TRAIN_PROMPT"
-                render pancake "$TRAIN_PROMPT"
+                # GENERATOR_CKPT may be a COMMA-LIST -> render each to pancake_<tag>.mp4 so we
+                # can A/B checkpoints in one job. tag = the ckpt's iterNNN (or basename).
+                IFS=',' read -ra CKPTS <<< "$GENERATOR_CKPT"
+                for CK in "${CKPTS[@]}"; do
+                  TAG=$(basename "$CK" .pt | sed -E 's/.*(iter[0-9]+).*/\1/; t; s/model/ckpt/')
+                  render "pancake_$TAG" "$TRAIN_PROMPT" "" "$CK"
+                done
               else
                 render cat "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard, riding the waves at sunset, cinematic lighting, high quality, photorealistic"
               fi
@@ -215,7 +224,8 @@ spec:
                 echo "=== [profiler] SKIPPED (validate-distilled run — just need the video) ==="
                 echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
                 mkdir -p "$FINAL_DIR"; cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy failed"
-                echo "=== DONE. VALIDATE THE VIDEO: $FINAL_DIR/pancake.mp4 (in-distribution prompt, branch exp/fps-1.3b @ $GIT_SHA) ==="
+                echo "=== DONE. VALIDATE THE VIDEOS: $FINAL_DIR/pancake_*.mp4 (in-distribution prompt, branch exp/fps-1.3b @ $GIT_SHA) ==="
+                ls -lh "$FINAL_DIR"/pancake_*.mp4 2>/dev/null
                 ls -lhR "$FINAL_DIR" | head -40
                 exit 0
               fi
@@ -278,7 +288,7 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607051515/model.iter200.pt"  # closest saved to best (iter248, TEACHgap 0.358)
+              value: "/var/mdl/video-distill/checkpoints/202607051515/model.iter200.pt,/var/mdl/video-distill/checkpoints/202607051515/model.iter300.pt"  # bracket the iter247 best (0.357); comma-list -> pancake_iter200.mp4 + pancake_iter300.mp4
                                                                    # Decisive: does the known-good few-step 1.3B
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
