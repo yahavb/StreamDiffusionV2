@@ -357,17 +357,17 @@ spec:
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: USE_NKI_KERNELS
-              value: "false"        # ISOLATION: exact SDPA attn instead of approximate NKI kernels.
-                                    # RF ckpt loads 825/825 + warp correct but renders blurry in OUR
-                                    # pipeline -> suspect NKI attn softens output. Off = exact; if
-                                    # sharp -> NKI kernels are the blur. (was true)
+              value: "true"         # restored: NKI attn was NOT the blur (off rendered same). The
+                                    # blur was the RF-VAE decoder port -> now using original WAN VAE.
             # NKI VAE conv2d_k3 (9 full-res shifted copies -> 27-tensor aten::cat) fails
             # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
             - name: USE_NKI_VAE
               value: "0"
-            # Step0: use the ported rolling_forcing per-frame cached VAE decoder (fixes 480p).
+            # ORIGINAL full-quality WAN VAE (USE_RF_VAE=0). The 480p aten::cat crash is now
+            # FIXED in modules/vae.py decode() (list + single cat, not per-frame growing cat).
+            # RF-VAE port was the blur suspect; use the real VAE to get RF-quality decode.
             - name: USE_RF_VAE
-              value: "1"
+              value: "0"
             # 480p REQUIRES VAE eager: USE_VAE_COMPILE=1 reintroduced the aten::cat
             # ConnectToService crash AND gave no speedup (VAE still ~4.4s/block).
             # Tested in step1 (sd-21) — keep eager.

@@ -692,19 +692,19 @@ class WanVAE_(nn.Module):
             z = z.contiguous() / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
+        # Collect per-frame decodes in a LIST, concat ONCE at the end. The old code did
+        # `out = torch.cat([out, out_], 2)` INSIDE the loop, growing one tensor every
+        # iteration -> a new cat shape per frame -> a new NEFF per frame -> floods the
+        # Neuron compiler and crashes at 480p (aten::cat ConnectToService errno=2). One
+        # final cat is a single fixed shape. Identical math/output, full-quality WAN VAE.
+        frames = []
         for i in range(iter_):
             self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
+            frames.append(self.decoder(
+                x[:, :, i:i + 1, :, :],
+                feat_cache=self._feat_map,
+                feat_idx=self._conv_idx))
+        out = frames[0] if len(frames) == 1 else torch.cat(frames, 2)
         self.clear_cache()
         return out
 
@@ -717,19 +717,16 @@ class WanVAE_(nn.Module):
             z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
+        # Same fix as decode(): accumulate frames in a list, single cat at the end
+        # (avoids the per-frame growing-cat that crashes the Neuron compiler at 480p).
+        frames = []
         for i in range(iter_):
             self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
+            frames.append(self.decoder(
+                x[:, :, i:i + 1, :, :],
+                feat_cache=self._feat_map,
+                feat_idx=self._conv_idx))
+        out = frames[0] if len(frames) == 1 else torch.cat(frames, 2)
         return out
 
     def sample(self, imgs, deterministic=False):
