@@ -488,7 +488,9 @@ def main():
                 def _cp(src, dst_dir, tag):
                     try:
                         os.makedirs(dst_dir, exist_ok=True)
-                        shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+                        # copyfile (DATA only) not copy2 — S3-backed FUSE mounts reject the
+                        # metadata/permission copy copy2 does ("Operation not permitted").
+                        shutil.copyfile(src, os.path.join(dst_dir, os.path.basename(src)))
                         LOGGER.info(f"[ckpt-mirror] {tag} -> {dst_dir} (available mid-run)")
                     except Exception as e:
                         LOGGER.warning(f"[ckpt-mirror] copy failed ({tag}): {e}")

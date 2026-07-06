@@ -32,7 +32,9 @@ if mirror:
     import shutil, threading
     def _cp(src, dst_dir):
         os.makedirs(dst_dir, exist_ok=True)
-        shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+        # copyfile (data only), NOT copy2 — S3/object-store FUSE mounts reject the
+        # metadata+permission copy that copy2 attempts ("Operation not permitted").
+        shutil.copyfile(src, os.path.join(dst_dir, os.path.basename(src)))
     threading.Thread(target=_cp, args=(iter_path, mirror), daemon=True).start()
 ```
 
@@ -41,6 +43,10 @@ Guidance for scientists:
   resume reads); ADD the durable mirror, don't replace.
 - Make the mirror **asynchronous** (background thread / async upload). A synchronous
   multi-GB copy every save interval visibly slows a long run.
+- Use a **data-only copy** to object-store-backed mounts. `shutil.copy2` (and `cp -p`)
+  try to replicate permission bits + timestamps, which S3/FUSE mounts reject with
+  "Operation not permitted" — the mirror silently fails while local saves look fine.
+  `shutil.copyfile` (or `cp` without `-p`) copies bytes only and works.
 - Write **per-iteration filenames** (`model.iterN.pt`), not just a single
   overwritten `model.pt` — otherwise the series you wanted to compare collapses to
   only the last checkpoint (we hit exactly this: every save overwrote the same file
