@@ -34,6 +34,7 @@ import argparse
 import gc as _gc
 import json
 import logging
+import math
 import os
 import sys
 
@@ -678,7 +679,14 @@ def main():
             if _g_since_step >= accum:              # window full -> clip + step + reset
                 _gnorm = float(torch.nn.utils.clip_grad_norm_(
                     [p for p in G.model.parameters() if p.requires_grad], 10.0))
-                opt_g.step()
+                # NaN-GRAD GUARD (GR00T lesson: non-finite grads are a top Neuron failure
+                # mode). clip_grad_norm_ returns inf/nan if ANY grad is non-finite -> SKIP
+                # the step (don't poison the weights) and loudly log it.
+                if not math.isfinite(_gnorm):
+                    LOGGER.warning(f"  [grad] it {it}: NON-FINITE grad_norm={_gnorm} -> SKIP opt_g.step()")
+                    opt_g.zero_grad(set_to_none=True)
+                else:
+                    opt_g.step()
                 _g_since_step = 0
                 if my_rank == ssrc:
                     LOGGER.info(f"  [grad] it {it}: student grad_norm={_gnorm:.6e} (step, accum={accum})")
@@ -697,8 +705,12 @@ def main():
             pred_f = score(fake_score, xtf, ttf, condb, fake_cache)
             loss_f = F.mse_loss(pred_f, x0_send)
             opt_f.zero_grad(set_to_none=True); loss_f.backward()
-            torch.nn.utils.clip_grad_norm_(fake_score.model.parameters(), 10.0)  # RF: critic clip 10.0
-            opt_f.step()
+            _fnorm = float(torch.nn.utils.clip_grad_norm_(fake_score.model.parameters(), 10.0))  # RF: critic clip 10.0
+            if not math.isfinite(_fnorm):   # NaN-grad guard (skip poisoned critic step)
+                LOGGER.warning(f"  [grad] it {it}: NON-FINITE critic grad_norm={_fnorm} -> SKIP opt_f.step()")
+                opt_f.zero_grad(set_to_none=True)
+            else:
+                opt_f.step()
             lf = float(loss_f.detach())
             del pred_f, loss_f, xtf  # drop fake-group autograd graph (was leaking -> OOM)
         _stage(it, "f:fake-backward")
