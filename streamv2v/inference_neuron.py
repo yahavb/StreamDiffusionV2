@@ -86,6 +86,11 @@ def parse_args():
     # generator_ckpt override: load a DIFFERENT checkpoint than the config's (e.g. a
     # freshly-distilled model.pt) without editing the yaml. Overrides config after merge.
     parser.add_argument("--generator_ckpt", type=str, default=None)
+    # warp/shift overrides: reproduce RollingForcing's schedule faithfully in our pipeline
+    # (RF uses warp_denoising_step=true, timestep_shift=5.0). Default None = use config.
+    parser.add_argument("--warp_denoising_step", dest="warp_denoising_step",
+                        action="store_true", default=None)
+    parser.add_argument("--timestep_shift", type=float, default=None)
     return parser.parse_args()
 
 
@@ -446,11 +451,14 @@ def main():
     # invariant the loop relies on).
     if getattr(args, 'steps', None):
         parsed = [int(s) for s in str(args.steps).split(',') if s.strip() != '']
-        assert parsed[-1] == 0, f"--steps must end in 0, got {parsed}"
+        # RollingForcing with warp_denoising_step=true uses NO trailing 0 (the warp remaps
+        # timesteps; a 0 would be re-warped). So only require trailing 0 when warp is OFF.
+        if not getattr(args, 'warp_denoising_step', False):
+            assert parsed[-1] == 0, f"--steps must end in 0 (warp off), got {parsed}"
         assert all(parsed[i] > parsed[i+1] for i in range(len(parsed)-1)), \
             f"--steps must be strictly descending, got {parsed}"
         args.denoising_step_list = parsed
-        print(f"[FPS sweep] denoising_step_list overridden from --steps: {parsed}")
+        print(f"[FPS sweep] denoising_step_list overridden from --steps: {parsed} (warp={getattr(args,'warp_denoising_step',False)})")
 
     # Ensure required fields
     if not hasattr(args, 'denoising_step_list'):

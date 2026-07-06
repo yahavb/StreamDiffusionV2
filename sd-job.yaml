@@ -101,6 +101,17 @@ spec:
                 fi
                 echo "1.3B base ready: $(ls wan_models/Wan2.1-T2V-1.3B/config.json 2>/dev/null || echo MISSING)"
               fi
+              # Rolling-Forcing DMD ckpt (the GOOD-looking one) — extract the S3 tar if
+              # GENERATOR_CKPT points into checkpoints/rolling_forcing_dmd.pt.
+              if [[ "${GENERATOR_CKPT:-}" == *rolling_forcing_dmd.pt ]]; then
+                RF_TAR="/var/mdl/rolling_forcing/rolling_forcing_dmd.tar"
+                mkdir -p checkpoints
+                if [[ -f "$RF_TAR" ]]; then
+                  tar xf "$RF_TAR" -C checkpoints/ && echo "RF ckpt: $(ls -lh checkpoints/rolling_forcing_dmd.pt | awk '{print $5}')"
+                else
+                  python3 -c "from huggingface_hub import snapshot_download; snapshot_download('TencentARC/RollingForcing', allow_patterns='checkpoints/rolling_forcing_dmd.pt', local_dir='.', local_dir_use_symlinks=False)"
+                fi
+              fi
               echo "Model weights ready!"
 
               # ─── ONE timestamped folder for this whole run ───
@@ -161,9 +172,16 @@ spec:
               fi
               # BENCH_CMD without the ckpt arg; per-ckpt arg is appended in render() so we
               # can render MULTIPLE checkpoints (GENERATOR_CKPT = comma-list) in one job.
+              # WARP: reproduce RollingForcing's schedule faithfully (warp_denoising_step=true,
+              # timestep_shift=5.0). Set WARP=1 for the RF-repro test; unset for our runs.
+              WARP_ARG=""
+              if [ "${WARP:-0}" = "1" ]; then
+                WARP_ARG="--warp_denoising_step --timestep_shift ${TIMESTEP_SHIFT:-5.0}"
+                echo "WARP ON: $WARP_ARG"
+              fi
               BENCH_CMD="torchrun --nproc_per_node=$NPROC streamv2v/inference_neuron.py \
                 --config $CFG \
-                --steps $STEPS --tp_degree $TP_DEGREE \
+                --steps $STEPS --tp_degree $TP_DEGREE $WARP_ARG \
                 $RES_ARG --device neuron"
 
               # ════════════════ PART A: RENDER (v2v: restyle input video) -> mp4 + frames in RUN_DIR ═══════
@@ -295,14 +313,18 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607052316/model.iter400.pt,/var/mdl/video-distill/checkpoints/202607052316/model.iter1200.pt,/var/mdl/video-distill/checkpoints/202607052316/model.iter2400.pt"  # early/mid/late of 10k run — does quality improve across the series?
+              value: "checkpoints/rolling_forcing_dmd.pt"   # REPRO TEST: the GOOD RF ckpt in OUR pipeline
                                                                    # Decisive: does the known-good few-step 1.3B
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
             - name: HEIGHT
-              value: "352"          # match training res
+              value: "480"          # RF good-config res (latent 60x80 = 480x640)
             - name: WIDTH
               value: "640"
+            - name: WARP
+              value: "1"            # RF repro: warp_denoising_step=true
+            - name: TIMESTEP_SHIFT
+              value: "5.0"          # RF timestep_shift
             # t2v from noise (cat prompt). Distilled student not trained on v2v.
             - name: INPUT_VIDEO_SRC
               value: ""
@@ -314,8 +336,7 @@ spec:
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
-              value: "700,400,0"   # 3-step: match training. Render early/mid/late of the 10k run
-                                   # (iter400/1200/2400) — does quality improve across the series?
+              value: "1000,800,600,400,200"   # RF's exact 5-step warp schedule (NO trailing 0 w/ warp)
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
