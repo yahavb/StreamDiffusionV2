@@ -48,6 +48,15 @@ spec:
               echo "══════════ DiT NKI kernel accuracy test (rope/cross/self-attn vs CPU) ══════════"
               python test_dit_kernels.py || echo "[kernel-test] non-zero exit (see FAIL lines above)"
               echo "══════════ end kernel accuracy test ══════════"
+
+              # ─── VAE decode test needs the 1.3B VAE weights ───
+              mkdir -p wan_models
+              WAN13="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
+              [[ -f "$WAN13" ]] && { cp "$WAN13" /tmp/w.tar && tar xf /tmp/w.tar -C wan_models/ && rm -f /tmp/w.tar; } \
+                || python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', allow_patterns='Wan2.1_VAE.pth', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+              echo "══════════ VAE decode: whole-clip vs block-by-block ══════════"
+              USE_RF_VAE=0 python test_vae_decode.py || echo "[vae-decode-test] non-zero exit"
+              echo "══════════ end VAE decode test ══════════"
           resources:
             claims:
               - name: s-lnc1-trn2
@@ -57,6 +66,9 @@ spec:
             limits:
               cpu: 16
               memory: 64Gi
+          volumeMounts:
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
@@ -66,8 +78,17 @@ spec:
               value: "8"            # HW requires 1 core OR whole device (multiple of 8); 4 -> NRT_INVALID
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: github-token
                   key: GITHUB_TOKEN
+      volumes:
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
