@@ -63,7 +63,7 @@ spec:
             - name: BRANCH
               value: "exp/fps-1.3b"
             - name: NEURON_RT_NUM_CORES
-              value: "4"
+              value: "8"            # HW requires 1 core OR whole device (multiple of 8); 4 -> NRT_INVALID
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: GITHUB_TOKEN

@@ -23,7 +23,8 @@ import math
 import traceback
 
 if "NEURON_RT_NUM_CORES" not in os.environ:
-    os.environ["NEURON_RT_NUM_CORES"] = "4"
+    # HW requires 1 core OR whole device (multiple of 8). 4 -> NRT_INVALID in nrt_init().
+    os.environ["NEURON_RT_NUM_CORES"] = "8"
 
 import torch
 import torch.nn.functional as F
