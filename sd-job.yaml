@@ -292,7 +292,7 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/ckpts/wan_causal_dmd_v2v/model.pt"  # RAW DMD ckpt — find the achievable step floor BEFORE training
+              value: "/var/mdl/video-distill/checkpoints/202607051840/model.iter200.pt,/var/mdl/video-distill/checkpoints/202607051840/model.iter300.pt"  # OUR 3-step distilled, bracket best (iter248 TEACHgap 0.337)
                                                                    # Decisive: does the known-good few-step 1.3B
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
