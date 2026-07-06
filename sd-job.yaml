@@ -153,7 +153,7 @@ spec:
               # 1.3B student (--generator_ckpt) on the 1.3B config at the res it trained on.
               CKPT_ARG=""
               CFG="streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml"
-              RES_ARG="--num_frames 81 --height 240 --width 416"
+              RES_ARG="--num_frames 81 --height ${HEIGHT:-240} --width ${WIDTH:-416}"
               if [ -n "${GENERATOR_CKPT:-}" ]; then
                 CFG="streamv2v/configs/wan_causal_fps_neuron.yaml"
                 RES_ARG="--num_frames 81 --height ${HEIGHT:-352} --width ${WIDTH:-640}"
@@ -292,27 +292,27 @@ spec:
               value: "exp/fps-1.3b"
             # VALIDATE our distilled 1.3B student. Set -> loads it on the 1.3B config.
             - name: GENERATOR_CKPT
-              value: "/var/mdl/video-distill/checkpoints/202607051840/model.iter200.pt,/var/mdl/video-distill/checkpoints/202607051840/model.iter300.pt"  # OUR 3-step distilled, bracket best (iter248 TEACHgap 0.337)
+              value: ""              # EMPTY -> raw 14B DMD ckpt via config (characterize 14B step-floor)
                                                                    # Decisive: does the known-good few-step 1.3B
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
             - name: HEIGHT
-              value: "352"          # trained res
+              value: "480"          # 480p 14B step-floor characterization (memory: 480 may break VAE compile)
             - name: WIDTH
-              value: "640"
+              value: "832"
             # t2v from noise (cat prompt). Distilled student not trained on v2v.
             - name: INPUT_VIDEO_SRC
               value: ""
             # 1.3B student caps at TP-4 (12 heads). Single stream: NPROC==TP_DEGREE==4.
             - name: NPROC
-              value: "4"
+              value: "8"             # 14B is heavy: TP-8 (40 heads shard at TP{2,4,8})
             - name: TP_DEGREE
-              value: "4"
+              value: "8"
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
-              value: "700,400,0"   # 3-step. Raw DMD ckpt: blurry@5-step, noise@2-step. Is 3-step the
-                                   # reachable floor? Test RAW (untrained) first before any 3-step run.
+              value: "700,500,400,200,0"   # 14B @480p, FULL 5-step first: does 480p even render
+                                           # (memory: 480 may break VAE compile)? If yes, sweep 3/2-step next.
             - name: USE_KV_PREFIX_CACHE
               value: "1"  # #20: cache per-block KV prefix, skip per-step copy (41% DMA)            - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
