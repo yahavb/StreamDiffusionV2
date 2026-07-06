@@ -698,12 +698,27 @@ def main():
         if in_fake:
             bb = x0_send.shape[0]
             tf = _DMD_TIMESTEPS[torch.randint(0, len(_DMD_TIMESTEPS), (bb,), device=device)]
+            noise_f = torch.randn_like(x0_send)
             xtf = scheduler_fake.add_noise(x0_send.flatten(0, 1),
-                                           torch.randn_like(x0_send).flatten(0, 1),
+                                           noise_f.flatten(0, 1),
                                            tf).unflatten(0, x0_send.shape[:2])
             ttf = tf.view(bb, 1).expand(bb, x0_send.shape[1])
-            pred_f = score(fake_score, xtf, ttf, condb, fake_cache)
-            loss_f = F.mse_loss(pred_f, x0_send)
+            pred_f = score(fake_score, xtf, ttf, condb, fake_cache)  # critic's predicted x0
+            # FLOW-MATCHING critic loss (RollingForcing denoising_loss_type=flow), NOT
+            # mse(pred_x0, x0). Training the critic as a clean-x0 denoiser makes it
+            # collapse to fake_pred~=x0~=real_pred -> DMD gradient (fake-real) vanishes ->
+            # dmdnorm pinned at ~1.0 (observed). RF trains it on the FLOW/velocity so the
+            # critic learns the STUDENT'S SCORE (what DMD needs), with the correct
+            # per-timestep weighting. flow-matching: x_t=(1-sigma)x0+sigma*noise, and the
+            # target velocity = noise - x0. Predict flow from the critic's x0: flow_pred =
+            # (x_t - pred_x0)/sigma_t; compare to (x_t - x0)/sigma_t == the true flow.
+            sig = scheduler_fake.sigmas.to(device).float()
+            tsr = scheduler_fake.timesteps.to(device).float()
+            tid = torch.argmin((tsr.unsqueeze(0) - tf.float().unsqueeze(1)).abs(), dim=1)
+            sigma_t = sig[tid].reshape(bb, 1, 1, 1, 1)
+            flow_pred = (xtf - pred_f) / (sigma_t + 1e-8)
+            flow_tgt = (xtf - x0_send) / (sigma_t + 1e-8)
+            loss_f = F.mse_loss(flow_pred, flow_tgt)
             opt_f.zero_grad(set_to_none=True); loss_f.backward()
             _fnorm = float(torch.nn.utils.clip_grad_norm_(fake_score.model.parameters(), 10.0))  # RF: critic clip 10.0
             if not math.isfinite(_fnorm):   # NaN-grad guard (skip poisoned critic step)
@@ -712,7 +727,7 @@ def main():
             else:
                 opt_f.step()
             lf = float(loss_f.detach())
-            del pred_f, loss_f, xtf  # drop fake-group autograd graph (was leaking -> OOM)
+            del pred_f, loss_f, xtf, flow_pred, flow_tgt, noise_f  # drop graph (leak->OOM)
         _stage(it, "f:fake-backward")
 
         # CONVERGENCE METRIC = loss_G (DMD generator loss). It should DECREASE and
