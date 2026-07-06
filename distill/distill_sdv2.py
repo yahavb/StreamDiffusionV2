@@ -77,6 +77,8 @@ def parse_args():
                                                               # NOT 2e-5 — that was 13x too high; the real bug
                                                               # was the WRONG normalizer, not the lr.
     p.add_argument("--lr_critic", type=float, default=4e-7)   # RF critic lr (LOWER than generator)
+    p.add_argument("--grad_accum", type=int, default=16,      # effective batch = grad_accum (RF uses 64;
+                   help="accumulate N generator DMD-grads before opt_g.step() (RF lr assumes batch)")
     p.add_argument("--dfake_gen_update_ratio", type=int, default=5)  # fake_score updates per G update (critic leads)
     p.add_argument("--warmup", type=int, default=25,
                    help="freeze G for first N iters so the critic (fake_score) tracks the "
@@ -487,10 +489,21 @@ def main():
             iter_path = args.out.replace(".pt", f".iter{it}.pt")
             torch.save(payload, iter_path)
             LOGGER.info(f"[ckpt] wrote {args.out} + {iter_path} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
-            # NOTE: checkpoints stay on LOCAL /tmp during training. /var/mdl is S3-backed
-            # (FUSE), NOT a POSIX fs — do NOT copy to it from Python mid-run (metadata copies
-            # fail, and it's slow on the critical path). The job copies /tmp -> /var/mdl ONCE
-            # at the end via bash `cp`.
+            # MID-RUN MIRROR via bash `cp` (NOT python shutil — copy2 fails on S3 FUSE with
+            # metadata; plain `cp` works, same as the end-of-job copy). For LONG runs (10k/200
+            # = 50 ckpts x 2.7GB = 135GB) local /tmp would overflow, so after copying to the
+            # S3 dir we DELETE the local per-iter copy -> /tmp stays bounded, S3 holds the
+            # series. Backgrounded (&) so the ~2.7GB write is off the training critical path.
+            _mirror = os.environ.get("CKPT_MIRROR_DIR", "").strip()
+            if _mirror:
+                import subprocess
+                dst = os.path.join(_mirror, os.path.basename(iter_path))
+                # cp to S3, then rm local — all in one detached bash shell.
+                subprocess.Popen(
+                    ["bash", "-c",
+                     f"mkdir -p {_mirror} && cp '{iter_path}' '{dst}' && rm -f '{iter_path}' "
+                     f"&& echo '[ckpt-mirror] iter{it} -> {_mirror} (local freed)'"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 
@@ -526,6 +539,7 @@ def main():
     _gl_hist = []  # recent loss_G values for the running-average convergence metric
     _gap_hist = []  # recent RAW ||fake-real|| gap (CONFOUNDED by critic)
     _tgap_hist = []  # recent ||x0_student-real_pred|| = UNCONFOUNDED student->teacher gap
+    _g_since_step = 0  # grad-accumulation counter (opt_g.step() every args.grad_accum G-updates)
     for it in range(args.iters):
         _stage(it, "iter-start")
         prompt = [prompts[it % len(prompts)]]
@@ -623,16 +637,25 @@ def main():
             grad = grad / (normalizer + 1e-8)
             grad = torch.nan_to_num(grad)           # RF: clean NaNs
             target = (x0_grad - grad).detach()
-            loss_g = 0.5 * F.mse_loss(x0_grad.double(), target.double())
-            opt_g.zero_grad(set_to_none=True); loss_g.backward()
-            # RF clips generator grad to max_grad_norm_generator=10.0 (unclipped DMD grads
-            # spike on a warm-started model and degrade it). Also our grad-norm probe.
-            _gnorm = float(torch.nn.utils.clip_grad_norm_(
-                [p for p in G.model.parameters() if p.requires_grad], 10.0))
-            opt_g.step()
-            gl = float(loss_g.detach())
-            if my_rank == ssrc:
-                LOGGER.info(f"  [grad] it {it}: student grad_norm={_gnorm:.6e}")
+            # GRAD ACCUMULATION: RF's lr=1.5e-6 is calibrated for total_batch_size=64.
+            # We roll out batch-1, so a single-sample DMD gradient at that tiny lr is too
+            # noisy to converge (flat TEACHgap). Accumulate ACCUM G-updates -> effective
+            # batch ACCUM, matching RF. Scale loss by 1/ACCUM so the SUM == the mean.
+            accum = max(1, int(getattr(args, "grad_accum", 16)))
+            if _g_since_step == 0:
+                opt_g.zero_grad(set_to_none=True)   # start a fresh accumulation window
+            loss_g = 0.5 * F.mse_loss(x0_grad.double(), target.double()) / accum
+            loss_g.backward()                       # ACCUMULATE (no zero_grad per micro-step)
+            _g_since_step += 1
+            gl = float(loss_g.detach()) * accum     # report the unscaled loss
+            _gnorm = float("nan")
+            if _g_since_step >= accum:              # window full -> clip + step + reset
+                _gnorm = float(torch.nn.utils.clip_grad_norm_(
+                    [p for p in G.model.parameters() if p.requires_grad], 10.0))
+                opt_g.step()
+                _g_since_step = 0
+                if my_rank == ssrc:
+                    LOGGER.info(f"  [grad] it {it}: student grad_norm={_gnorm:.6e} (step, accum={accum})")
             del grad, target, x0_grad, loss_g   # free the fresh graph immediately
         _stage(it, "e:student-backward")
 

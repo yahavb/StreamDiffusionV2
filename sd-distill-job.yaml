@@ -85,10 +85,13 @@ spec:
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
               RUN=/tmp/distill/$TS; mkdir -p "$RUN"
               FINAL=/var/mdl/video-distill/checkpoints/$TS
-              # Checkpoints stay on LOCAL /tmp during training. /var/mdl is S3-backed (FUSE),
-              # NOT posix — copy /tmp -> /var/mdl ONCE at the very end via bash `cp` (below).
+              # MID-RUN MIRROR: trainer bash-`cp`s each per-iter ckpt to $FINAL (S3) as saved,
+              # then deletes the local copy (long runs: 10k/200=50 ckpts x 2.7GB would overflow
+              # /tmp). So checkpoints appear on S3 live AND /tmp stays bounded. mkdir so it exists.
+              mkdir -p "$FINAL"
+              export CKPT_MIRROR_DIR="$FINAL"
               exec > >(tee "$RUN/train.log") 2>&1
-              echo "RUN=$RUN  (final -> $FINAL, copied to S3 at end)"
+              echo "RUN=$RUN  (final -> $FINAL, mid-run bash-cp mirror ON)"
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 
@@ -115,6 +118,7 @@ spec:
                 --dfake_gen_update_ratio "${DFAKE_RATIO:-5}" \
                 --lr "${LR:-1.5e-6}" \
                 --lr_critic "${LR_CRITIC:-4e-7}" \
+                --grad_accum "${GRAD_ACCUM:-4}" \
                 --warmup "${WARMUP:-25}" \
                 --save_every "${SAVE_EVERY:-200}" \
                 --height 352 --width 640 \
@@ -175,13 +179,18 @@ spec:
             # from iter 0 and training only specializes it to our prompts.
             - name: STUDENT_DMD_CKPT
               value: "ckpts/wan_causal_dmd_v2v/model.pt"
+            - name: GRAD_ACCUM
+              value: "4"             # effective batch 4 (RF lr=1.5e-6 assumes a batch; batch-1 too noisy).
+                                     # opt_g.step() every dfake_ratio(5) x accum(4) = 20 iters.
             - name: ITERS
-              value: "600"           # 120 iters preserved 5-step (blurry) but noise@2-step. Push the
+              value: "10000"         # LONG run: gentle RF lr (1.5e-6) + grad-accum needs many steps.
+                                     # opt step every 20 iters -> ~500 optimizer steps. Mid-run mirror
+                                     # means we render checkpoints live + stop early if it converges.
                                      # 5->2 step jump: render each 100-ckpt to watch pancake noise->blurry.
                                      # If it crosses over, 2-step reachable + we know the budget; if it
                                      # plateaus at noise by 600, 2-step too aggressive -> switch to 3-step.
             - name: SAVE_EVERY
-              value: "100"           # 6 ckpts (100..600) — the noise->blurry crossover curve
+              value: "200"           # 6 ckpts (200..1200)
             - name: LR
               value: "1.5e-6"        # RollingForcing generator lr (proven good 1.3B quality)
             - name: LR_CRITIC
