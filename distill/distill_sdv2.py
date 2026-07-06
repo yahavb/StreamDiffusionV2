@@ -478,24 +478,10 @@ def main():
             iter_path = args.out.replace(".pt", f".iter{it}.pt")
             torch.save(payload, iter_path)
             LOGGER.info(f"[ckpt] wrote {args.out} + {iter_path} (iter {it}) full={len(sd)} tensors — drop-in for sd-job")
-            # MID-RUN S3 MIRROR: copy this per-iter ckpt to CKPT_MIRROR_DIR (the S3-backed
-            # PVC) IMMEDIATELY, in a background thread, so we can render/validate EARLIER
-            # checkpoints WHILE the run is still training (the job otherwise only copies at
-            # the very end). Non-blocking: the ~2.7GB S3 write must not stall the loop.
-            _mirror = os.environ.get("CKPT_MIRROR_DIR", "").strip()
-            if _mirror:
-                import shutil, threading
-                def _cp(src, dst_dir, tag):
-                    try:
-                        os.makedirs(dst_dir, exist_ok=True)
-                        # copyfile (DATA only) not copy2 — S3-backed FUSE mounts reject the
-                        # metadata/permission copy copy2 does ("Operation not permitted").
-                        shutil.copyfile(src, os.path.join(dst_dir, os.path.basename(src)))
-                        LOGGER.info(f"[ckpt-mirror] {tag} -> {dst_dir} (available mid-run)")
-                    except Exception as e:
-                        LOGGER.warning(f"[ckpt-mirror] copy failed ({tag}): {e}")
-                threading.Thread(target=_cp, args=(iter_path, _mirror, f"iter{it}"),
-                                 daemon=True).start()
+            # NOTE: checkpoints stay on LOCAL /tmp during training. /var/mdl is S3-backed
+            # (FUSE), NOT a POSIX fs — do NOT copy to it from Python mid-run (metadata copies
+            # fail, and it's slow on the critical path). The job copies /tmp -> /var/mdl ONCE
+            # at the end via bash `cp`.
 
     def zeros_lat(): return torch.zeros(lat_shape, dtype=dtype, device=device)
 

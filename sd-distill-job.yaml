@@ -85,13 +85,10 @@ spec:
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
               RUN=/tmp/distill/$TS; mkdir -p "$RUN"
               FINAL=/var/mdl/video-distill/checkpoints/$TS
-              # MID-RUN MIRROR: trainer copies each per-iter ckpt straight to S3 ($FINAL) as
-              # it's saved, so we can render EARLIER checkpoints while distillation continues
-              # (job otherwise only copies at the very end). mkdir now so the dir exists.
-              mkdir -p "$FINAL"
-              export CKPT_MIRROR_DIR="$FINAL"
+              # Checkpoints stay on LOCAL /tmp during training. /var/mdl is S3-backed (FUSE),
+              # NOT posix — copy /tmp -> /var/mdl ONCE at the very end via bash `cp` (below).
               exec > >(tee "$RUN/train.log") 2>&1
-              echo "RUN=$RUN  (final -> $FINAL, mid-run mirror ON)"
+              echo "RUN=$RUN  (final -> $FINAL, copied to S3 at end)"
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 

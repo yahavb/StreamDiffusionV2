@@ -4,56 +4,39 @@ Notes for the blog. Audience: ML scientists/engineers. This documents the
 memory techniques that let a DMD distillation training loop run on constrained
 per-core HBM, and the one detail that is easy to get catastrophically wrong.
 
-## Mirror checkpoints to durable storage AS THEY ARE SAVED, not at job end
+## Checkpoint I/O: write local, keep per-iteration copies, copy to object store once
 
-A subtle workflow trap that cost real time: our training job wrote checkpoints to
-fast pod-local disk (`/tmp`) and copied the whole run folder to durable storage
-(the S3-backed PVC) **only at the very end**. That is the right call for the
-*final* artifact — S3 is slow and off the training critical path. But it means
-that **mid-run, none of the intermediate checkpoints are reachable** from outside
-the pod: they are trapped in `/tmp` until the job finishes.
+Two workflow rules that cost us time when violated:
 
-Why this matters for a distillation/RL-style run specifically: the whole point of
-saving `iter100, iter200, …` is to **render and inspect the quality curve** — and
-the most valuable time to do that is *while the run is still going*, so you can
-kill a doomed run early or confirm an early checkpoint already crossed the quality
-threshold. If the checkpoints only land in durable storage at the end, you have
-thrown away the ability to make that decision early — you wait the full run just
-to look at iteration 100.
+1. **Write per-iteration filenames (`model.iterN.pt`), not just one overwritten
+   `model.pt`.** The point of saving `iter100, iter200, …` is to render and compare
+   the quality *series*. Our first version wrote the same `model.pt` every save, so
+   iter400 overwrote iter200 and only the final checkpoint survived — the series we
+   wanted to compare was gone. Keep the rolling `model.pt` (for resume) AND a
+   distinct per-iter copy.
 
-The fix is one line of intent: **the moment a checkpoint is written to local disk,
-also copy it to durable storage — in a background thread so the ~GB write never
-stalls the training loop.**
+2. **Object-store-backed mounts (S3/FUSE, e.g. an S3-backed PVC) are NOT POSIX
+   filesystems — do not treat them as one.** Two failure modes we hit:
+   - A Python metadata-preserving copy (`shutil.copy2`, or `cp -p`) to the mount
+     fails with "Operation not permitted" — S3 has no POSIX permission bits to set.
+   - Writing to it *on the training critical path* is slow, and partial-file
+     visibility/consistency is not guaranteed the way it is on local disk.
 
-```python
-# right after torch.save(payload, iter_path)  # iter_path on fast local disk
-mirror = os.environ.get("CKPT_MIRROR_DIR", "")   # the durable (S3/PVC) dir
-if mirror:
-    import shutil, threading
-    def _cp(src, dst_dir):
-        os.makedirs(dst_dir, exist_ok=True)
-        # copyfile (data only), NOT copy2 — S3/object-store FUSE mounts reject the
-        # metadata+permission copy that copy2 attempts ("Operation not permitted").
-        shutil.copyfile(src, os.path.join(dst_dir, os.path.basename(src)))
-    threading.Thread(target=_cp, args=(iter_path, mirror), daemon=True).start()
-```
+   So: checkpoints are written to **fast local disk** (`/tmp`) during the run, and
+   the whole run folder is copied to the object store **once at the end**, with a
+   plain data copy from the job shell:
 
-Guidance for scientists:
-- Keep the **local write** for speed (it's what the next `torch.save` and any
-  resume reads); ADD the durable mirror, don't replace.
-- Make the mirror **asynchronous** (background thread / async upload). A synchronous
-  multi-GB copy every save interval visibly slows a long run.
-- Use a **data-only copy** to object-store-backed mounts. `shutil.copy2` (and `cp -p`)
-  try to replicate permission bits + timestamps, which S3/FUSE mounts reject with
-  "Operation not permitted" — the mirror silently fails while local saves look fine.
-  `shutil.copyfile` (or `cp` without `-p`) copies bytes only and works.
-- Write **per-iteration filenames** (`model.iterN.pt`), not just a single
-  overwritten `model.pt` — otherwise the series you wanted to compare collapses to
-  only the last checkpoint (we hit exactly this: every save overwrote the same file
-  and only the final iteration survived).
-- Net effect: at any moment during a multi-hour run you can pull `iter100`,
-  `iter200`, … from durable storage and render them on separate hardware, turning a
-  "wait 8 hours then look" loop into "watch the quality curve live and stop early."
+   ```bash
+   # end of job, off the training critical path:
+   cp -r "$RUN"/. "$FINAL"/     # $RUN=/tmp/...  $FINAL=/var/mdl/... (S3-backed)
+   ```
+
+   (We tried an async per-save mirror-to-S3 to enable mid-run inspection; on an
+   S3-backed FUSE mount it fought both the metadata-copy restriction and the
+   critical path. The clean answer on object storage is: local during the run, one
+   bulk `cp` at the end. If you genuinely need mid-run inspection, pull the file
+   straight out of the pod — `kubectl cp <pod>:/tmp/.../model.iterN.pt .` — rather
+   than routing intermediate writes through the object store.)
 
 ## The end-to-end learning loop (the mechanism, plainly)
 
