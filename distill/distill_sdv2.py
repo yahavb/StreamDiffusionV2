@@ -471,12 +471,8 @@ def main():
         full = get_model_state_dict(
             G.model,
             options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-        # DIAG: get_model_state_dict returned 0 tensors in run 41 (empty ckpt). Log the
-        # count on EVERY student rank so we see whether the gather lands on ssrc only,
-        # all ranks, or nowhere. Cheap; runs once per save.
-        LOGGER.info(f"[ckpt-diag] rank {my_rank}: get_model_state_dict -> {len(full)} entries")
-        # FALLBACK: if the DCP gather came back empty, gather the raw (possibly DTensor)
-        # state_dict and materialize any DTensor shards to full tensors by hand.
+        # FALLBACK: get_model_state_dict returns 0 entries under our per-block fully_shard,
+        # so gather the raw state_dict and materialize DTensor shards to full tensors.
         if len(full) == 0:
             from torch.distributed.tensor import DTensor
             raw = G.model.state_dict()
@@ -485,7 +481,6 @@ def main():
                 if isinstance(v, DTensor):
                     v = v.full_tensor()
                 full[k] = v.detach().to("cpu")
-            LOGGER.info(f"[ckpt-diag] rank {my_rank}: FALLBACK raw state_dict -> {len(full)} entries")
         if dist.is_initialized():
             dist.barrier()
         if my_rank == ssrc:
@@ -550,9 +545,6 @@ def main():
                                   dtype=torch.long, device=device)
 
     # 3) training loop — ALL groups hit EVERY broadcast in the same order (no deadlock)
-    _gl_hist = []  # recent loss_G values for the running-average convergence metric
-    _gap_hist = []  # recent RAW ||fake-real|| gap (CONFOUNDED by critic)
-    _tgap_hist = []  # recent ||x0_student-real_pred|| = UNCONFOUNDED student->teacher gap
     _dmdnorm_hist = []  # recent mean(|normalized grad|) = RF's TRUE convergence metric (->0)
     _g_since_step = 0  # grad-accumulation counter (opt_g.step() every args.grad_accum G-updates)
     for it in range(args.iters):
@@ -625,23 +617,11 @@ def main():
 
         # (e) student DMD update — RECOMPUTE the forward WITH grad now (fresh graph,
         # freed right after backward). DMD gradient = (fake-real) applied to x0.
-        gl = float("nan")
-        dmd_gap = float("nan")
+        dmdnorm = float("nan")
         # WARMUP: for the first args.warmup iters, do NOT step G — let fake_score (the
-        # critic) learn to track the still-base student first. A DMD gradient from an
-        # untrained critic points nowhere; stepping G on it wastes the early budget.
-        # After warmup, G updates once every dfake_gen_update_ratio iters (critic leads).
+        # critic) learn to track the still-base student first. After warmup, G updates
+        # once every dfake_gen_update_ratio iters (critic leads).
         _do_g = (it >= args.warmup) and (it % args.dfake_gen_update_ratio == 0)
-        # always compute the raw gap (cheap, needs both preds) so we log convergence
-        # NOTE: DMDgap=|fake-real| is CONFOUNDED — it depends on the flaky critic, so a
-        # rising gap does not prove divergence. The UNCONFOUNDED signal is how close the
-        # STUDENT's own output is to the teacher's prediction: |x0_student - real_pred|.
-        # DMD moves x0 toward exactly this; it doesn't involve the critic. THIS should
-        # fall if the student is truly learning the teacher, regardless of critic noise.
-        dmd_gap = float("nan"); teach_gap = float("nan"); dmdnorm = float("nan")
-        if in_student:
-            dmd_gap = float((fake_pred - real_pred).abs().mean().detach())
-            teach_gap = float((x0_det - real_pred).abs().mean().detach())
         if in_student and _do_g:
             student.kv_cache1 = None
             student.crossattn_cache = None
@@ -674,7 +654,6 @@ def main():
             loss_g = 0.5 * F.mse_loss(x0_grad.double(), target.double()) / accum
             loss_g.backward()                       # ACCUMULATE (no zero_grad per micro-step)
             _g_since_step += 1
-            gl = float(loss_g.detach()) * accum     # report the unscaled loss
             _gnorm = float("nan")
             if _g_since_step >= accum:              # window full -> clip + step + reset
                 _gnorm = float(torch.nn.utils.clip_grad_norm_(
@@ -730,52 +709,20 @@ def main():
             del pred_f, loss_f, xtf, flow_pred, flow_tgt, noise_f  # drop graph (leak->OOM)
         _stage(it, "f:fake-backward")
 
-        # CONVERGENCE METRIC = loss_G (DMD generator loss). It should DECREASE and
-        # FLATTEN — that's convergence (student distribution -> teacher). Per-iter is
-        # noisy (random timestep each step), so also print a running average over the
-        # last 50 student updates to see the trend. (loss_fake is the fake-group's
-        # metric; on the student-root log it's nan — ignore it here.)
-        if in_student and gl == gl:  # gl==gl false when nan (non-G-update iters)
-            _gl_hist.append(gl)
-            if len(_gl_hist) > 50:
-                _gl_hist.pop(0)
-        if in_student and dmd_gap == dmd_gap:
-            _gap_hist.append(dmd_gap)
-            if len(_gap_hist) > 50:
-                _gap_hist.pop(0)
-        if in_student and teach_gap == teach_gap:
-            _tgap_hist.append(teach_gap)
-            if len(_tgap_hist) > 50:
-                _tgap_hist.pop(0)
-        if in_student and dmdnorm == dmdnorm:
+        # CONVERGENCE METRIC = dmdnorm (mean |normalized DMD grad|) -> should DECREASE to 0.
+        # Running average over the last 50 G-updates (per-iter is noisy: random timestep).
+        if in_student and dmdnorm == dmdnorm:  # false when nan (non-G-update iters)
             _dmdnorm_hist.append(dmdnorm)
             if len(_dmdnorm_hist) > 50:
                 _dmdnorm_hist.pop(0)
-        # MEM PROBE: count live device tensors + their MB each iter, so we can SEE
-        # what grows (leak vs NEFF-cache) instead of guessing. Cheap gc walk.
-        _dev_n = _dev_mb = 0
-        for _o in _gc.get_objects() if (it % 2 == 0) else []:
-            try:
-                if torch.is_tensor(_o) and _o.device.type == "neuron":
-                    _dev_n += 1; _dev_mb += _o.numel() * _o.element_size() / 1e6
-            except Exception:
-                pass
         if my_rank == ssrc or not dist.is_initialized():
-            avg = sum(_gl_hist) / len(_gl_hist) if _gl_hist else float("nan")
-            gap_avg = sum(_gap_hist) / len(_gap_hist) if _gap_hist else float("nan")
-            tgap_avg = sum(_tgap_hist) / len(_tgap_hist) if _tgap_hist else float("nan")
             dmdnorm_avg = sum(_dmdnorm_hist) / len(_dmdnorm_hist) if _dmdnorm_hist else float("nan")
-            # magnitudes of each arrow — if real~=fake from iter 0 the setup is degenerate;
-            # if real stays fixed while fake drifts, the critic IS tracking the student.
-            _rm = float(real_pred.abs().mean()); _fm = float(fake_pred.abs().mean())
             _phase = "warmup" if it < args.warmup else ("G-step" if _do_g else "critic-only")
-            LOGGER.info(f"it {it}/{args.iters} [{_phase}] loss_G={gl:.4f}  "
-                        f"dmdnorm={dmdnorm:.4f} dmdnorm_avg50={dmdnorm_avg:.4f}  "  # RF metric ->0
-                        f"DMDgap={dmd_gap:.4f} TEACHgap_avg50={tgap_avg:.4f}  "
-                        f"|real|={_rm:.3f} |fake|={_fm:.3f}  "
-                        f"(TEACHgap_avg50 = unconfounded student->teacher; watch it DECREASE)")
+            # dmdnorm_avg50 is the RF convergence metric — should DECREASE toward 0.
+            LOGGER.info(f"it {it}/{args.iters} [{_phase}] "
+                        f"dmdnorm={dmdnorm:.4f} dmdnorm_avg50={dmdnorm_avg:.4f}")
         if in_fake and my_rank == fsrc:
-            LOGGER.info(f"it {it}/{args.iters}  loss_fake={lf:.4f}  (fake tracks student; should stay low/steady)")
+            LOGGER.info(f"it {it}/{args.iters}  loss_fake={lf:.4f}")
         if it > 0 and it % args.save_every == 0:
             save_ckpt(it)
 
