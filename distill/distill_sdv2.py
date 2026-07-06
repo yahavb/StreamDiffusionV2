@@ -79,6 +79,8 @@ def parse_args():
     p.add_argument("--lr_critic", type=float, default=4e-7)   # RF critic lr (LOWER than generator)
     p.add_argument("--grad_accum", type=int, default=16,      # effective batch = grad_accum (RF uses 64;
                    help="accumulate N generator DMD-grads before opt_g.step() (RF lr assumes batch)")
+    p.add_argument("--guidance_scale", type=float, default=3.0,  # RF CFG on teacher: real=cond+(cond-uncond)*s
+                   help="classifier-free guidance scale for the teacher (sharpens real direction; RF=3.0)")
     p.add_argument("--dfake_gen_update_ratio", type=int, default=5)  # fake_score updates per G update (critic leads)
     p.add_argument("--warmup", type=int, default=25,
                    help="freeze G for first N iters so the critic (fake_score) tracks the "
@@ -395,6 +397,17 @@ def main():
     lat_shape = (1, npb, 16, args.height // 8, args.width // 8)
     emb_shape = (1, 512, 4096)
 
+    # CFG: unconditional (negative-prompt) embedding, on ALL ranks (teacher needs it to
+    # sharpen the real direction). guidance_scale from RollingForcing (3.0). Without this
+    # the teacher gives a weak plain-conditional target -> blurry student (the fix).
+    guidance_scale = float(getattr(args, "guidance_scale", 3.0))
+    uncond_embed = None
+    if embeds_cache is not None and "__uncond__" in embeds_cache:
+        uncond_embed = embeds_cache["__uncond__"].to(device=device, dtype=dtype)
+    _cfg_on = uncond_embed is not None and guidance_scale > 0
+    if my_rank == 0:
+        LOGGER.info(f"CFG teacher guidance: {'ON scale=%.1f' % guidance_scale if _cfg_on else 'OFF (no __uncond__ embed)'}")
+
     def bcast(t, src):
         """global broadcast; EVERY rank must call in lockstep. returns src's tensor."""
         t = t.contiguous()
@@ -539,6 +552,7 @@ def main():
     _gl_hist = []  # recent loss_G values for the running-average convergence metric
     _gap_hist = []  # recent RAW ||fake-real|| gap (CONFOUNDED by critic)
     _tgap_hist = []  # recent ||x0_student-real_pred|| = UNCONFOUNDED student->teacher gap
+    _dmdnorm_hist = []  # recent mean(|normalized grad|) = RF's TRUE convergence metric (->0)
     _g_since_step = 0  # grad-accumulation counter (opt_g.step() every args.grad_accum G-updates)
     for it in range(args.iters):
         _stage(it, "iter-start")
@@ -584,11 +598,19 @@ def main():
         embeds = bcast(embeds, ssrc); x0_send = bcast(x0_send, ssrc)
         condb = {"prompt_embeds": embeds}
 
-        # (c) teacher scores x_t (no student graph alive), broadcasts real_pred back
+        # (c) teacher scores x_t (no student graph alive), broadcasts real_pred back.
+        # CFG (RollingForcing): real = cond + (cond - uncond) * guidance_scale. This
+        # SHARPENS the teacher's real direction — the missing piece behind our blur.
         real_pred = zeros_lat()
         if in_teacher:
             with torch.no_grad():
-                real_pred = score(real_score, x_t, tt, condb, teacher_cache)
+                real_cond = score(real_score, x_t, tt, condb, teacher_cache)
+                if _cfg_on:
+                    uncondb = {"prompt_embeds": uncond_embed}
+                    real_uncond = score(real_score, x_t, tt, uncondb, teacher_cache)
+                    real_pred = real_cond + (real_cond - real_uncond) * guidance_scale
+                else:
+                    real_pred = real_cond
         real_pred = bcast(real_pred, tsrc)
         _stage(it, "c:teacher-score")
 
@@ -615,7 +637,7 @@ def main():
         # STUDENT's own output is to the teacher's prediction: |x0_student - real_pred|.
         # DMD moves x0 toward exactly this; it doesn't involve the critic. THIS should
         # fall if the student is truly learning the teacher, regardless of critic noise.
-        dmd_gap = float("nan"); teach_gap = float("nan")
+        dmd_gap = float("nan"); teach_gap = float("nan"); dmdnorm = float("nan")
         if in_student:
             dmd_gap = float((fake_pred - real_pred).abs().mean().detach())
             teach_gap = float((x0_det - real_pred).abs().mean().detach())
@@ -636,6 +658,10 @@ def main():
                 dim=list(range(1, x0_grad.dim())), keepdim=True)
             grad = grad / (normalizer + 1e-8)
             grad = torch.nan_to_num(grad)           # RF: clean NaNs
+            # RF's TRUE convergence metric: dmdtrain_gradient_norm = mean(|normalized grad|).
+            # As student->teacher, (fake-real)->0 so THIS -> 0. Unlike our confounded gaps,
+            # this is the real signal RF watches. Watch dmdnorm_avg50 DECREASE toward 0.
+            dmdnorm = float(torch.mean(torch.abs(grad)).detach())
             target = (x0_grad - grad).detach()
             # GRAD ACCUMULATION: RF's lr=1.5e-6 is calibrated for total_batch_size=64.
             # We roll out batch-1, so a single-sample DMD gradient at that tiny lr is too
@@ -694,6 +720,10 @@ def main():
             _tgap_hist.append(teach_gap)
             if len(_tgap_hist) > 50:
                 _tgap_hist.pop(0)
+        if in_student and dmdnorm == dmdnorm:
+            _dmdnorm_hist.append(dmdnorm)
+            if len(_dmdnorm_hist) > 50:
+                _dmdnorm_hist.pop(0)
         # MEM PROBE: count live device tensors + their MB each iter, so we can SEE
         # what grows (leak vs NEFF-cache) instead of guessing. Cheap gc walk.
         _dev_n = _dev_mb = 0
@@ -707,13 +737,14 @@ def main():
             avg = sum(_gl_hist) / len(_gl_hist) if _gl_hist else float("nan")
             gap_avg = sum(_gap_hist) / len(_gap_hist) if _gap_hist else float("nan")
             tgap_avg = sum(_tgap_hist) / len(_tgap_hist) if _tgap_hist else float("nan")
+            dmdnorm_avg = sum(_dmdnorm_hist) / len(_dmdnorm_hist) if _dmdnorm_hist else float("nan")
             # magnitudes of each arrow — if real~=fake from iter 0 the setup is degenerate;
             # if real stays fixed while fake drifts, the critic IS tracking the student.
             _rm = float(real_pred.abs().mean()); _fm = float(fake_pred.abs().mean())
             _phase = "warmup" if it < args.warmup else ("G-step" if _do_g else "critic-only")
             LOGGER.info(f"it {it}/{args.iters} [{_phase}] loss_G={gl:.4f}  "
-                        f"DMDgap={dmd_gap:.4f} DMDgap_avg50={gap_avg:.4f}  "
-                        f"TEACHgap={teach_gap:.4f} TEACHgap_avg50={tgap_avg:.4f}  "
+                        f"dmdnorm={dmdnorm:.4f} dmdnorm_avg50={dmdnorm_avg:.4f}  "  # RF metric ->0
+                        f"DMDgap={dmd_gap:.4f} TEACHgap_avg50={tgap_avg:.4f}  "
                         f"|real|={_rm:.3f} |fake|={_fm:.3f}  "
                         f"(TEACHgap_avg50 = unconfounded student->teacher; watch it DECREASE)")
         if in_fake and my_rank == fsrc:

@@ -119,6 +119,7 @@ spec:
                 --lr "${LR:-1.5e-6}" \
                 --lr_critic "${LR_CRITIC:-4e-7}" \
                 --grad_accum "${GRAD_ACCUM:-4}" \
+                --guidance_scale "${GUIDANCE_SCALE:-3.0}" \
                 --warmup "${WARMUP:-25}" \
                 --save_every "${SAVE_EVERY:-200}" \
                 --height 352 --width 640 \

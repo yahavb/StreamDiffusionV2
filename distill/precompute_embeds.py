@@ -47,16 +47,29 @@ def main():
         os.path.join(args.model_path, "models_t5_umt5-xxl-enc-bf16.pth"),
         map_location="cpu", weights_only=False))
 
-    embeds = {}
-    for i, pr in enumerate(prompts):
-        ids, mask = tok([pr], return_mask=True, add_special_tokens=True)
+    # CFG needs an UNCONDITIONAL (negative-prompt) embedding too. RollingForcing uses a
+    # WAN negative prompt at guidance_scale=3.0 to sharpen the teacher's "real" direction
+    # (the missing CFG was our blur cause). Encode it under a reserved key "__uncond__".
+    RF_NEG = ("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
+              "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
+              "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
+              "杂乱的背景，三条腿，背景人很多，倒着走")
+
+    def _encode(text):
+        ids, mask = tok([text], return_mask=True, add_special_tokens=True)
         seq_len = mask.gt(0).sum(dim=1).long()
         with torch.no_grad():
             ctx = enc(ids, mask).to(torch.bfloat16).contiguous()
         for b in range(ctx.shape[0]):
             ctx[b, seq_len[b]:] = 0.0
-        embeds[pr] = ctx[0:1].cpu()   # [1,512,4096]
+        return ctx[0:1].cpu()   # [1,512,4096]
+
+    embeds = {}
+    for i, pr in enumerate(prompts):
+        embeds[pr] = _encode(pr)
         print(f"  [{i+1}/{len(prompts)}] {pr[:50]}...")
+    embeds["__uncond__"] = _encode(RF_NEG)   # negative-prompt embed for CFG
+    print("  [uncond] encoded RF negative prompt for CFG")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save(embeds, args.out)
