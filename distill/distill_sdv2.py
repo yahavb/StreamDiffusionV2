@@ -73,8 +73,10 @@ def parse_args():
                    help="student few-step schedule (fps lever), e.g. '700,0' (2-step), "
                         "'0' (1-step). Overrides config denoising_step_list. MUST end in 0.")
     p.add_argument("--iters", type=int, default=2000)
-    p.add_argument("--lr", type=float, default=2e-5)          # G lr. 2e-6 was ~50x too small
-                                                              # (AdamW step~=lr; student couldn't move -> flat gap)
+    p.add_argument("--lr", type=float, default=1.5e-6)        # RollingForcing generator lr (proven good 1.3B).
+                                                              # NOT 2e-5 — that was 13x too high; the real bug
+                                                              # was the WRONG normalizer, not the lr.
+    p.add_argument("--lr_critic", type=float, default=4e-7)   # RF critic lr (LOWER than generator)
     p.add_argument("--dfake_gen_update_ratio", type=int, default=5)  # fake_score updates per G update (critic leads)
     p.add_argument("--warmup", type=int, default=25,
                    help="freeze G for first N iters so the critic (fake_score) tracks the "
@@ -372,8 +374,15 @@ def main():
             trainable=False, tp_degree=tp)
 
     # G optimizer on student group; fake optimizer on fake group (each net its own group)
-    opt_g = torch.optim.AdamW([p for p in G.model.parameters() if p.requires_grad], lr=args.lr) if in_student else None
-    opt_f = torch.optim.AdamW(fake_score.model.parameters(), lr=args.lr) if in_fake else None
+    # RollingForcing recipe: generator lr=1.5e-6, critic lr=4e-7 (LOWER than gen),
+    # betas=(0.0, 0.999). Our old lr=2e-5 (same for both) was 13x too high on the gen
+    # AND too high on the critic -> degraded a warm-started model. Match RF.
+    lr_g = args.lr
+    lr_critic = getattr(args, "lr_critic", None) or (args.lr * 0.27)  # 4e-7/1.5e-6 ratio
+    opt_g = torch.optim.AdamW([p for p in G.model.parameters() if p.requires_grad],
+                              lr=lr_g, betas=(0.0, 0.999)) if in_student else None
+    opt_f = torch.optim.AdamW(fake_score.model.parameters(),
+                              lr=lr_critic, betas=(0.0, 0.999)) if in_fake else None
     scheduler = student.scheduler if in_student else None
     # fake group needs a scheduler too (add_noise for its diffusion loss); the wrapper
     # builds one on .scheduler.
@@ -603,19 +612,23 @@ def main():
                 text_prompts=prompt, device=device, dtype=dtype,
                 noise=_rollout_noise, current_start=0, current_end=frame_seq * npb,
                 batch_denoise=False)
+            # DMD generator gradient — EXACT RollingForcing recipe (proven good 1.3B quality):
+            #   grad = (fake - real) / normalizer,  normalizer = |x0 - real|.mean PER-SAMPLE
+            # Our old bug: normalized by grad.abs().mean() (the gradient's OWN magnitude),
+            # which erased the signal's scale vs the student's distance from the teacher ->
+            # bad quality. RF divides by how far the student is from real, per-sample.
             grad = (fake_pred - real_pred)
-            grad = grad / (grad.abs().mean() + 1e-8)
+            normalizer = torch.abs(x0_grad - real_pred).mean(
+                dim=list(range(1, x0_grad.dim())), keepdim=True)
+            grad = grad / (normalizer + 1e-8)
+            grad = torch.nan_to_num(grad)           # RF: clean NaNs
             target = (x0_grad - grad).detach()
-            loss_g = 0.5 * F.mse_loss(x0_grad, target)
+            loss_g = 0.5 * F.mse_loss(x0_grad.double(), target.double())
             opt_g.zero_grad(set_to_none=True); loss_g.backward()
-            # MEASURE (don't theorize): total grad norm reaching the student weights.
-            # ~0 => the gradient is DISCONNECTED (recompute/FSDP/checkpoint broke the
-            # graph) and no lr/iters will ever help. >0 but flat gap => step-size issue.
-            _gnorm = 0.0
-            for _p in G.model.parameters():
-                if _p.grad is not None:
-                    _gnorm += float(_p.grad.detach().float().pow(2).sum())
-            _gnorm = _gnorm ** 0.5
+            # RF clips generator grad to max_grad_norm_generator=10.0 (unclipped DMD grads
+            # spike on a warm-started model and degrade it). Also our grad-norm probe.
+            _gnorm = float(torch.nn.utils.clip_grad_norm_(
+                [p for p in G.model.parameters() if p.requires_grad], 10.0))
             opt_g.step()
             gl = float(loss_g.detach())
             if my_rank == ssrc:
@@ -634,7 +647,9 @@ def main():
             ttf = tf.view(bb, 1).expand(bb, x0_send.shape[1])
             pred_f = score(fake_score, xtf, ttf, condb, fake_cache)
             loss_f = F.mse_loss(pred_f, x0_send)
-            opt_f.zero_grad(set_to_none=True); loss_f.backward(); opt_f.step()
+            opt_f.zero_grad(set_to_none=True); loss_f.backward()
+            torch.nn.utils.clip_grad_norm_(fake_score.model.parameters(), 10.0)  # RF: critic clip 10.0
+            opt_f.step()
             lf = float(loss_f.detach())
             del pred_f, loss_f, xtf  # drop fake-group autograd graph (was leaking -> OOM)
         _stage(it, "f:fake-backward")

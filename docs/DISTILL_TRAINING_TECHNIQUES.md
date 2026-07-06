@@ -38,6 +38,45 @@ Two workflow rules that cost us time when violated:
    straight out of the pod — `kubectl cp <pod>:/tmp/.../model.iterN.pt .` — rather
    than routing intermediate writes through the object store.)
 
+## The DMD normalizer is the whole ball game (the bug that cost days)
+
+DMD's generator gradient is `grad = (fake_score − real_score) / normalizer`, and the
+loss is `0.5·MSE(x0, (x0 − grad).detach())`. The **normalizer choice is not cosmetic —
+it sets what "one step" means**, and getting it wrong silently produces bad quality with
+a metric that still looks like it's "converging."
+
+- **Correct (RollingForcing, proven good 1.3B quality):**
+  `normalizer = |x0_student − real_pred|.mean(per-sample, over all non-batch dims)`.
+  This scales the correction by *how far this specific sample is from the teacher's
+  prediction* — near-teacher samples take small steps, far ones take large steps.
+- **What we had (wrong):** `normalizer = grad.abs().mean()` — the gradient's own global
+  magnitude. This forces every step to unit magnitude regardless of how far the student
+  is from the teacher, erasing the per-sample scale the method depends on. Result: the
+  student "moves" but not in a way that improves quality; rendered video stayed bad.
+
+Why this misled us for days: with the wrong normalizer, raising the learning rate made
+things *worse* (bigger unit-magnitude steps in a mis-scaled direction), which we
+misread as "step-size is delicate." The real fix was the normalizer, not the lr — and
+once corrected, the lr that works is the small `1.5e-6`, close to our *original* guess
+that we had wrongly abandoned.
+
+Companion details from the same reference recipe, all of which matter:
+- **Clip gradients** (generator and critic) to norm 10.0. Unclipped DMD grads spike on a
+  warm-started model and degrade it.
+- **`torch.nan_to_num(grad)`** before using it — the per-sample normalizer can divide by
+  ~0 on a sample already at the teacher.
+- **Critic lr LOWER than generator** (RF: gen `1.5e-6`, critic `4e-7`). The critic
+  should track, not race ahead.
+- **`betas=(0.0, 0.999)`** — zero first-moment (no momentum) on both optimizers; DMD
+  gradients are noisy and momentum smears the direction.
+- **Gradient accumulation to a real batch** (RF `total_batch_size=64`). A batch of 1 is
+  a very noisy DMD gradient; the reference accumulates to 64.
+
+Lesson for scientists: when reproducing a distillation method, **copy the loss
+normalization and optimizer hyperparameters verbatim from a known-good implementation
+before tuning anything.** A plausible-looking substitute normalizer is the kind of bug
+that produces a moving loss curve and broken outputs — the worst kind to debug.
+
 ## The end-to-end learning loop (the mechanism, plainly)
 
 Every training iteration is the same five steps. The whole thing hinges on step 3.

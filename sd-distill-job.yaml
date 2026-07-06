@@ -113,7 +113,8 @@ spec:
                 --tp_degree "${TP_DEGREE:-8}" \
                 --max_prompts "${MAX_PROMPTS:-10}" \
                 --dfake_gen_update_ratio "${DFAKE_RATIO:-5}" \
-                --lr "${LR:-2e-5}" \
+                --lr "${LR:-1.5e-6}" \
+                --lr_critic "${LR_CRITIC:-4e-7}" \
                 --warmup "${WARMUP:-25}" \
                 --save_every "${SAVE_EVERY:-200}" \
                 --height 352 --width 640 \
@@ -182,7 +183,9 @@ spec:
             - name: SAVE_EVERY
               value: "100"           # 6 ckpts (100..600) — the noise->blurry crossover curve
             - name: LR
-              value: "2e-5"
+              value: "1.5e-6"        # RollingForcing generator lr (proven good 1.3B quality)
+            - name: LR_CRITIC
+              value: "4e-7"          # RF critic lr (lower than generator)
             - name: WARMUP
               value: "10"            # short warmup — 1 prompt, critic tracks fast
             - name: DFAKE_RATIO
