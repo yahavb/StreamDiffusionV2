@@ -271,6 +271,13 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         self.denoising_steps = len(self.denoising_step_list)
 
+        # ── ROLLING-FORCING rolling-window schedule (ported from RF dit_pipeline.py) ──
+        # RF's sharpness comes from co-denoising a sliding window of `nds` blocks, each at
+        # a DIFFERENT noise level (a diagonal schedule), in one forward. These patterns are
+        # the per-frame timesteps for each window phase. Built once here; the loop uses them.
+        self.timestep_patterns = self._build_timestep_patterns()   # [num_patterns, max_frames]
+        self.sigma_patterns = self._build_sigma_patterns()
+
         # State
         self.conditional_dict = None
         self.kv_cache1 = None
@@ -284,9 +291,42 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                      self.num_transformer_blocks, self.num_heads,
                      self.frame_seq_length, self.kv_cache_length)
 
+    def _timestep_to_sigma(self, timestep_val):
+        """Map a timestep to its flow-matching sigma (RF dit_pipeline._timestep_to_sigma)."""
+        idx = torch.argmin((self.scheduler.timesteps - timestep_val).abs())
+        return self.scheduler.sigmas[idx].item()
+
+    def _build_timestep_patterns(self):
+        """Per-frame timestep vectors for each rolling-window phase (RF-faithful).
+        steady = the diagonal: each nfpb-frame block at a descending noise level, e.g.
+        nds=5,nfpb=3 -> [0,0,0, 200,200,200, 400,400,400, 500,500,500, 700,700,700]
+        (values are the WARPED timesteps in denoising_step_list). Edge phases (window
+        entering/leaving) get prefix/suffix-truncated patterns padded with 0."""
+        nds = len(self.denoising_step_list)
+        nfpb = self.num_frame_per_block
+        max_frames = nds * nfpb
+        steady = []
+        for ts in reversed(self.denoising_step_list.tolist()):
+            steady.extend([float(ts)] * nfpb)
+        patterns = [steady]
+        for i in range(1, nds):
+            cnf = i * nfpb
+            patterns.append(steady[-cnf:] + [0.0] * (max_frames - cnf))
+        for i in range(1, nds):
+            cnf = i * nfpb
+            patterns.append(steady[:cnf] + [0.0] * (max_frames - cnf))
+        return torch.tensor(patterns, dtype=torch.float32, device=self.device)
+
+    def _build_sigma_patterns(self):
+        sp = torch.zeros_like(self.timestep_patterns)
+        for i, pattern in enumerate(self.timestep_patterns):
+            for j, t in enumerate(pattern.tolist()):
+                sp[i, j] = self._timestep_to_sigma(t)
+        return sp
+
     def _initialize_kv_cache(self, batch_size, dtype, device):
         """Initialize KV cache with Python int indices (Neuron-safe).
-        
+
         With TP-4, each rank only stores num_heads_per_rank heads.
         """
         kv_cache = []
