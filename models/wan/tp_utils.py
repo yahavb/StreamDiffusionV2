@@ -125,38 +125,39 @@ def init_sp_groups(tp_degree: int = 4, sp_degree: int = 4):
     _WORLD_GROUP = dist.group.WORLD
     _DP_GROUP_ID, _DP_NUM_GROUPS = 0, 1
 
-    # LAYOUT (Neuron requires CONTIGUOUS collective groups — strided [0,4,8,12] fails ENC
-    # 'no_hier no_mesh', proven by isolation test). So:
-    #   SP groups CONTIGUOUS: [0,1,2,3],[4,5,6,7],...  (sequence all_gather lives here)
-    #   TP groups STRIDED   : [0,4,8,12],[1,5,9,13],...  (head shard / o all-reduce)
-    # global_rank = tp_rank * sp_degree + sp_rank.  (was the reverse.)
-    # NOTE: TP's all_reduce is also a collective on a strided group — the RowParallel o
-    # all-reduce must therefore ALSO work on strided; if ENC rejects it too, TP must stay
-    # contiguous and SP strided is impossible -> would need a different SP collective. But
-    # all_reduce (vs all_gather) may have hierarchical support; validated at runtime.
-    sp_rank = rank % sp_degree
-    tp_rank = rank // sp_degree
-    _TP_GROUP_BASE = (rank // sp_degree) * sp_degree   # base of this rank's contiguous SP block
+    # LAYOUT = RF's EXACT scheme (verified in rolling_forcing/models/dit_attention.py):
+    # Neuron collectives run ONLY on CONTIGUOUS groups. RF's every collective is on either
+    # "world" (all 16, contiguous) for all_gather, or "attn-tp" (contiguous [0-3]) for
+    # reduce_scatter. The SP group is NEVER used in a collective — sp_rank is purely a
+    # SLICING index. So:
+    #   TP groups CONTIGUOUS: [0,1,2,3],[4,5,6,7],...  (reduce_scatter over attn-tp)
+    #   SP = index only (sp_rank = which contiguous TP-block this rank is in): no collective
+    #   the big K/V all_gather is over WORLD (contiguous [0..15]).
+    # global_rank = sp_rank * tp_degree + tp_rank.
+    sp_rank = rank // tp_degree
+    tp_rank = rank % tp_degree
+    _TP_GROUP_BASE = (rank // tp_degree) * tp_degree
 
-    # SP groups: CONTIGUOUS blocks of sp_degree
-    for tp_i in range(tp_degree):
-        ranks = list(range(tp_i * sp_degree, (tp_i + 1) * sp_degree))
-        g = dist.new_group(ranks)
-        if rank in ranks:
-            _SP_GROUP = g
-            _SP_RANK = rank % sp_degree
-            _SP_WORLD_SIZE = sp_degree
-    # TP groups: STRIDED stride=sp_degree
+    # TP groups: CONTIGUOUS blocks of tp_degree
     for sp_i in range(sp_degree):
-        ranks = list(range(sp_i, world_size, sp_degree))
+        ranks = list(range(sp_i * tp_degree, (sp_i + 1) * tp_degree))
         g = dist.new_group(ranks)
         if rank in ranks:
             _TP_GROUP = g
-            _TP_RANK = rank // sp_degree
+            _TP_RANK = rank % tp_degree
             _TP_WORLD_SIZE = tp_degree
+    # SP groups: strided — created for completeness but NOT used in any collective (RF uses
+    # sp_rank only as a slice index; all real collectives are world/attn-tp = contiguous).
+    for tp_i in range(tp_degree):
+        ranks = list(range(tp_i, world_size, tp_degree))
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            _SP_GROUP = g
+            _SP_RANK = rank // tp_degree
+            _SP_WORLD_SIZE = sp_degree
 
     print(f"[SP] tp_rank={_TP_RANK}/{_TP_WORLD_SIZE} sp_rank={_SP_RANK}/{_SP_WORLD_SIZE} "
-          f"global={rank}/{world_size} (SP contiguous, TP strided)")
+          f"global={rank}/{world_size} (TP contiguous, SP=index-only; collectives on world/attn-tp)")
 
 
 def get_sp_group() -> Optional[dist.ProcessGroup]:

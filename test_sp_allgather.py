@@ -40,6 +40,35 @@ def main():
             contig_group = g
     log(rank, f"world={world} tp={tp} sp={sp}")
 
+    # RF's ACTUAL collective groups: world (all 16) all_gather + contiguous attn-tp
+    # reduce_scatter. Validate both work (they should — both contiguous).
+    world_grp = dist.group.WORLD
+    try:
+        s_local, width = 1260, 384
+        inp = torch.randn(s_local, width, dtype=torch.bfloat16, device=dev).contiguous()
+        out = torch.empty(world * s_local, width, dtype=torch.bfloat16, device=dev)
+        dist.all_gather_into_tensor(out, inp, group=world_grp)
+        torch.neuron.synchronize()
+        log(rank, "OK   WORLD all_gather (all 16)")
+    except Exception as e:
+        log(rank, f"FAIL WORLD all_gather: {str(e)[:70]}")
+    try:
+        # reduce_scatter over contiguous attn-tp (contig_group here = size sp; use the
+        # real contiguous TP block [0-3])
+        tp_block = None
+        for i in range(sp):
+            r = list(range(i * tp, (i + 1) * tp))
+            g = dist.new_group(r)
+            if rank in r:
+                tp_block = g
+        inp = torch.randn(tp * 512, 128, dtype=torch.bfloat16, device=dev).contiguous()
+        out = torch.empty(512, 128, dtype=torch.bfloat16, device=dev)
+        dist.reduce_scatter_tensor(out, inp, group=tp_block)
+        torch.neuron.synchronize()
+        log(rank, "OK   attn-tp reduce_scatter (contig [0-3])")
+    except Exception as e:
+        log(rank, f"FAIL attn-tp reduce_scatter: {str(e)[:70]}")
+
     for gname, grp in [("STRIDED", strided_group), ("CONTIG", contig_group)]:
         # all_gather
         try:
