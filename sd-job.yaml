@@ -328,6 +328,9 @@ spec:
             - name: UPDATE_CACHE_EVERY_STEP
               value: "0"            # A/B RESULT: every-step cache = SAME blur -> cache timing is NOT
                                     # the cause. Reverted (last-only is faster). Blur = anchor/merged mode.
+            - name: USE_ROLLING_WINDOW
+              value: "1"            # RF-faithful sliding-window co-denoise (the real blur fix): denoise
+                                    # the whole clip with the diagonal schedule, not per-block independent.
             # t2v from noise (cat prompt). Distilled student not trained on v2v.
             - name: INPUT_VIDEO_SRC
               value: ""

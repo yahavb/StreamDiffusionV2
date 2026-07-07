@@ -236,6 +236,31 @@ def run_inference(pipeline, args, config, verbose=False):
     # across blocks (clear once here, NOT per block — per-block clearing softens output).
     pipeline.reset_decode_stream()
 
+    # ─── ROLLING-WINDOW path (RF-faithful co-denoise) ───────────────────────────────
+    # USE_ROLLING_WINDOW=1: denoise the WHOLE clip with RF's sliding-window co-denoise
+    # (generate_rolling_window), then VAE-decode block-by-block. This replaces the
+    # per-block independent anchor+stream loop (the blur cause). prepare() above already
+    # encoded the prompt into pipeline.conditional_dict.
+    if os.environ.get("USE_ROLLING_WINDOW", "").lower() in ("1", "true"):
+        full_noise = torch.randn(1, num_frames, 16, args.height // 8, args.width // 8,
+                                 dtype=dtype, device=device)
+        t_gen = time.perf_counter()
+        latents = pipeline.generate_rolling_window(full_noise)   # [1, num_frames, C, H, W]
+        if hasattr(torch, 'neuron'):
+            torch.neuron.synchronize()
+        LOGGER.info(f"[rolling-window] full-clip denoise: {(time.perf_counter()-t_gen):.1f}s "
+                    f"for {num_frames} frames")
+        rw_videos = []
+        for b in range(0, num_frames, num_frame_per_block):
+            blk_lat = latents[:, b:b + num_frame_per_block]
+            bv = pipeline.decode_latents(blk_lat)
+            if hasattr(torch, 'neuron'):
+                torch.neuron.synchronize()
+            if bv is not None:
+                rw_videos.append(bv.to("cpu").float())
+        video = torch.cat(rw_videos, dim=1)[:, :num_frames] * 0.5 + 0.5 if rw_videos else None
+        return video, None, timings
+
     # VAE decode anchor immediately
     t_vae = time.perf_counter()
     anchor_video = pipeline.decode_latents(anchor_pred)

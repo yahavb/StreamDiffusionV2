@@ -590,6 +590,119 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
         return denoised_pred
 
+    def generate_rolling_window(self, noise):
+        """ROLLING-FORCING end-to-end denoise (ported from RF dit_pipeline._run), using
+        our EXISTING (non-merged) forward. RF's sharpness comes from co-denoising a sliding
+        window of `nds` blocks together, each block at a DIFFERENT noise level (the diagonal
+        timestep_patterns), renoising between phases. This replaces the per-block
+        anchor+stream loop when USE_ROLLING_WINDOW=1.
+
+        noise: [1, num_frames, C, H, W] pure noise (num_frames % nfpb == 0).
+        returns: [1, num_frames, C, H, W] denoised latents.
+        """
+        b, num_frames, C, H, W = noise.shape
+        assert b == 1, "rolling window assumes batch 1"
+        assert num_frames % self.num_frame_per_block == 0
+        nfpb = self.num_frame_per_block
+        nds = len(self.denoising_step_list)
+        fseq = self.frame_seq_length
+        num_blocks = num_frames // nfpb
+        max_frames = nds * nfpb
+        device, dtype = noise.device, noise.dtype
+
+        # caches fresh for the whole clip
+        self._initialize_kv_cache(b, dtype, device)
+        self._initialize_crossattn_cache(b, dtype, device)
+        if self.shared_buffers is None:
+            self._initialize_shared_buffers(b, dtype, device)
+
+        self.timestep_patterns = self.timestep_patterns.to(device)
+
+        # sliding-window bookkeeping (RF _run)
+        rolling = nds
+        window_num = num_blocks + rolling - 1
+        win_start, win_end, pat_idx = [], [], []
+        for wi in range(window_num):
+            sb = max(0, wi - rolling + 1)
+            eb = min(num_blocks - 1, wi)
+            win_start.append(sb); win_end.append(eb)
+            nb = eb - sb + 1
+            if nb == nds:
+                pat_idx.append(0)
+            elif sb == 0:
+                pat_idx.append(nb)
+            else:
+                pat_idx.append(nds - 1 + nb)
+
+        # per-step sigma for renoise (block_sigma_list)
+        block_sigma = [self._timestep_to_sigma(float(s)) for s in self.denoising_step_list.tolist()]
+
+        # noisy_cache holds the current (partially-denoised, re-noised) latents per frame
+        noisy_cache = torch.zeros([b, num_frames + max_frames, C, H, W], dtype=dtype, device=device)
+        output = torch.zeros([b, num_frames + max_frames - nfpb, C, H, W], dtype=dtype, device=device)
+
+        for phase in range(window_num):
+            sb, eb = win_start[phase], win_end[phase]
+            cur_start_f = sb * nfpb
+            cur_end_f = (eb + 1) * nfpb
+            cur_nf = cur_end_f - cur_start_f
+
+            # assemble this window's input: prior partially-denoised frames + fresh noise
+            # for the newest block (RF copies noise into the tail slot).
+            win_in = noisy_cache[:, cur_start_f:cur_start_f + max_frames].clone()
+            if cur_nf == max_frames or cur_start_f == 0:
+                off = cur_nf - nfpb
+                win_in[:, off:off + nfpb] = noise[:, cur_end_f - nfpb:cur_end_f]
+
+            # per-frame timesteps for this phase (diagonal); slice to the active frames
+            ts_full = self.timestep_patterns[pat_idx[phase]]         # [max_frames]
+            ts = ts_full[:cur_nf].to(torch.int64).unsqueeze(0)        # [1, cur_nf]
+
+            active = win_in[:, :cur_nf].contiguous()
+            self._reset_kv_indices()
+            denoised = self.generator(
+                noisy_image_or_video=active,
+                conditional_dict=self.conditional_dict,
+                timestep=ts,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=cur_start_f * fseq,
+                current_end=cur_end_f * fseq,
+                updating_cache=True,
+                shared_buffers=self.shared_buffers,
+            )
+
+            output[:, cur_start_f:cur_start_f + cur_nf] = denoised
+
+            # renoise each block to its NEXT (lower) noise level for the next phase
+            nb = eb - sb + 1
+            step_base = (nb - 1) if (sb == 0 and nb < nds) else (nds - 1)
+            for local in range(nb):
+                step_index = step_base - local
+                if step_index >= nds - 1:
+                    continue  # fully denoised block — no renoise
+                blk = denoised[:, local * nfpb:(local + 1) * nfpb].flatten(0, 1)
+                sig_next = block_sigma[step_index + 1]
+                renoised = self.scheduler.add_noise(
+                    blk, torch.randn_like(blk),
+                    self.denoising_step_list[step_index + 1] * torch.ones(
+                        [blk.shape[0]], device=device, dtype=torch.long))
+                bidx = sb + local
+                noisy_cache[:, bidx * nfpb:(bidx + 1) * nfpb] = renoised.unflatten(0, (b, nfpb))
+
+        # the first num_frames of output are the finished frames (RF returns output[:, :num_frames])
+        return output[:, :num_frames]
+
+    def _reset_kv_indices(self):
+        """Reset the per-block KV cache write indices (fresh attention read each phase)."""
+        if self.kv_cache1 is not None:
+            for c in self.kv_cache1:
+                c["global_end_index"] = 0
+                c["local_end_index"] = 0
+        if self.crossattn_cache is not None:
+            for c in self.crossattn_cache:
+                c["is_init"] = False
+
     def decode_latents(self, latents):
         """Decode latents to pixel space using VAE.
 
