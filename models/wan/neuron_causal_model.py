@@ -131,12 +131,18 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
                                           get_world_group, get_tp_rank, get_tp_world_size)
         _spw = get_sp_world_size()
         _sprank = get_sp_rank()
+        _wg0 = get_world_group()
+        _world0 = _dist.get_world_size(_wg0) if _wg0 is not None else 1
+        _wrank0 = _dist.get_rank(_wg0) if _wg0 is not None else 0
         _sp_active = (_spw > 1) and (mode == "merged")
         if _sp_active:
+            # Shard x over the FULL WORLD (all 16), like RF — each rank holds L/world
+            # tokens (activations light). forward_merged gathers back to full over world.
+            # (Sharding by sp_degree(4) instead held 4x the activations -> 16.4GB OOM.)
             L = x.shape[1]
-            assert L % _spw == 0, f"seq {L} not divisible by sp_degree {_spw}"
-            _shard = L // _spw
-            x = x[:, _sprank * _shard:(_sprank + 1) * _shard].contiguous()
+            assert L % _world0 == 0, f"seq {L} not divisible by world {_world0}"
+            _shard = L // _world0
+            x = x[:, _wrank0 * _shard:(_wrank0 + 1) * _shard].contiguous()
 
         e = self.time_embedding(
             self._sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
@@ -170,22 +176,13 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             })
             x = block(x, **kwargs)
 
-        # SP: gather the sequence shards back. Collectives must be on CONTIGUOUS groups on
-        # Neuron -> gather over WORLD (all ranks, contiguous), then take the spw unique
-        # sp-ordered shards (TP-siblings share a shard, so world-gather duplicates tpw x).
+        # SP: gather the world-sharded sequence back to full over WORLD (contiguous). x was
+        # sharded L/world, each shard unique -> plain world gather reconstructs full, no dedup.
         if _sp_active:
-            from models.wan.tp_utils import get_tp_rank, get_tp_world_size
-            _wg2 = get_world_group()
-            _wsz = _dist.get_world_size(_wg2)
-            _tpr, _tpw = get_tp_rank(), get_tp_world_size()
             B, shard_len, C = x.shape
-            g = torch.empty(_wsz * shard_len, C, dtype=x.dtype, device=x.device)
-            _dist.all_gather_into_tensor(g, x.reshape(-1, C).contiguous(), group=_wg2)
-            # unique sp-ordered shards for our tp position: ranks {sp*tpw + _tpr}
-            import torch as _t
-            idx = _t.cat([_t.arange(shard_len, device=x.device) + (sp * _tpw + _tpr) * shard_len
-                          for sp in range(_spw)])
-            x = g[idx].reshape(B, _spw * shard_len, C)
+            g = torch.empty(_world0 * shard_len, C, dtype=x.dtype, device=x.device)
+            _dist.all_gather_into_tensor(g, x.reshape(-1, C).contiguous(), group=_wg0)
+            x = g.reshape(B, _world0 * shard_len, C)
 
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = x.flatten(1, 2)

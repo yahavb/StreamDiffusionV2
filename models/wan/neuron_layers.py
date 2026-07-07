@@ -729,24 +729,18 @@ class CausalWanSelfAttention(nn.Module):
         k = self.norm_k(self.k(x)).reshape(s_local, n_full * d)
         v = self.v(x).reshape(s_local, n_full * d)
 
-        # (2) all-gather over WORLD (contiguous). Each rank contributed s_local tokens;
-        # world gather -> s_local*world rows. But TP-sibling ranks hold the SAME seq shard
-        # (different only by having full q/k/v — identical here). So gathering over world
-        # duplicates each seq shard tpw times. We want the s_full = spw*s_local unique
-        # seq. Take the sp-ordered unique rows: rows from ranks with the same tp position.
-        s_full = spw * s_local
+        # (2) all-gather over WORLD (contiguous). x was world-sharded (each rank holds
+        # L/world unique tokens), so gathering over world reconstructs the FULL seq
+        # directly — NO dedup (every shard is unique). world rank order = row order.
+        wrank = _d.get_rank(wg)
+        s_full = world * s_local           # = L (full window)
         def _gather_world(t):
-            out = torch.empty(world * s_local, n_full * d, dtype=t.dtype, device=t.device)
+            out = torch.empty(s_full, n_full * d, dtype=t.dtype, device=t.device)
             _d.all_gather_into_tensor(out, t.contiguous(), group=wg)
-            return out  # [world*s_local, n_full*d], row block r = global rank r's shard
-        qg, kg, vg = _gather_world(q), _gather_world(k), _gather_world(v)
-        # global rank = sp_rank*tpw + tp_rank -> the spw unique seq shards are at ranks
-        # {sp*tpw + tp_rank : sp in 0..spw-1} for our tp_rank. Gather those rows in sp order.
-        idx = torch.cat([torch.arange(s_local, device=x.device) + (sp * tpw + tp_rank) * s_local
-                         for sp in range(spw)])
-        qf = qg[idx].view(1, s_full, n_full, d)
-        kf = kg[idx].view(1, s_full, n_full, d)
-        vf = vg[idx].view(1, s_full, n_full, d)
+            return out
+        qf = _gather_world(q).view(1, s_full, n_full, d)
+        kf = _gather_world(k).view(1, s_full, n_full, d)
+        vf = _gather_world(v).view(1, s_full, n_full, d)
 
         # (3) slice OUR heads (tp_rank), RoPE on the full frame-aligned grid
         hpr = n_full // tpw
@@ -758,10 +752,9 @@ class CausalWanSelfAttention(nn.Module):
         rq_full = self._nki_rope_apply(qf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
         rk_full = self._nki_rope_apply(kf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
 
-        # (4) attend OUR query seq slice (sp_rank) vs full K/V for our heads. Use the NKI
-        # FLASH kernel (memory-efficient, no full score matrix) — plain SDPA OOM'd (512MB
-        # scratchpad for the 25200-token window). Same kernel/layout as the regular path.
-        rq = rq_full[:, sp_rank * s_local:(sp_rank + 1) * s_local]   # [1, s_local, hpr, d]
+        # (4) attend OUR world-shard of queries (rows [wrank*s_local:...]) vs full K/V for
+        # our heads. NKI FLASH kernel (memory-efficient). o then all-reduces over TP.
+        rq = rq_full[:, wrank * s_local:(wrank + 1) * s_local]   # [1, s_local, hpr, d]
         if rq.device.type == "neuron" and self._nki_available:
             q_kern = rq[0].permute(1, 2, 0).contiguous()             # [hpr, d, s_local]
             k_kern = rk_full[0].permute(1, 2, 0).contiguous()        # [hpr, d, s_full]
