@@ -708,19 +708,28 @@ class CausalWanAttentionBlock(nn.Module):
     def forward(self, x, e, grid_sizes, freqs_cos, freqs_sin, context,
                 context_lens, updating_cache=False, kv_cache=None,
                 crossattn_cache=None, current_start=0, cache_start=None,
-                num_valid_frames=None, shared_buffers=None):
+                num_valid_frames=None, shared_buffers=None,
+                mode="denoise", cache_update_start=None,
+                cu_shared_buffers=None, nfpb_cu=None):
         num_frames = e.shape[1]
         frame_seqlen = x.shape[1] // num_frames
         e0, e1, e2, e3, e4, e5 = self._modulation_chunk(self.modulation, e)
 
         norm_ones = torch.ones_like(e1)
-        y = self.self_attn(
-            self._modulated_norm_shift(
-                self._modulated_norm_scale(self.norm1(x), e1, norm_ones, num_frames, frame_seqlen),
-                e0),
-            grid_sizes, freqs_cos, freqs_sin, kv_cache, current_start,
-            cache_start, updating_cache=updating_cache,
-            num_valid_frames=num_valid_frames, shared_buffers=shared_buffers)
+        attn_in = self._modulated_norm_shift(
+            self._modulated_norm_scale(self.norm1(x), e1, norm_ones, num_frames, frame_seqlen),
+            e0)
+        if mode == "merged":
+            y = self.self_attn.forward_merged(
+                attn_in, grid_sizes, freqs_cos, freqs_sin, kv_cache,
+                cache_update_start, current_start,
+                cu_shared_buffers, shared_buffers,
+                num_valid_frames_dn=num_valid_frames, nfpb_cu=nfpb_cu)
+        else:
+            y = self.self_attn(
+                attn_in, grid_sizes, freqs_cos, freqs_sin, kv_cache, current_start,
+                cache_start, updating_cache=updating_cache,
+                num_valid_frames=num_valid_frames, shared_buffers=shared_buffers)
         x = self._modulated_residual(x, y, e2, num_frames, frame_seqlen)
 
         x = x + self.cross_attn(self.norm3(x), context, context_lens,

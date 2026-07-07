@@ -94,7 +94,9 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
     def _forward_inference(self, x, t, context, updating_cache=False,
                            kv_cache=None, crossattn_cache=None,
                            current_start=0, cache_start=None,
-                           num_valid_frames=None, shared_buffers=None):
+                           num_valid_frames=None, shared_buffers=None,
+                           mode="denoise", cache_update_start=None,
+                           cu_shared_buffers=None, nfpb_cu=None):
         assert self.model_type == 't2v'
         assert x.shape[0] == 1
         # Inference asserts no-grad (the rolling KV cache uses in-place .copy_ writes,
@@ -117,6 +119,21 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         grid_sizes = tuple(int(d) for d in x.shape[2:])
         x = x.flatten(2).transpose(1, 2)
 
+        # ── SEQUENCE PARALLEL (RF merged attention): shard the token seq across the
+        # world so each rank holds L/world_size tokens. Attention gathers full K/V
+        # internally. Gated on SP active (world_size>1) — non-SP path untouched. ──
+        from models.wan.tp_utils import get_world_group
+        import torch.distributed as _dist
+        _wg = get_world_group()
+        _world = _dist.get_world_size(_wg) if (_wg is not None) else 1
+        _wrank = _dist.get_rank(_wg) if (_wg is not None) else 0
+        _sp_active = _world > 1
+        if _sp_active:
+            L = x.shape[1]
+            assert L % _world == 0, f"seq {L} not divisible by world {_world}"
+            _shard = L // _world
+            x = x[:, _wrank * _shard:(_wrank + 1) * _shard].contiguous()
+
         e = self.time_embedding(
             self._sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
         e0 = self.time_projection(e).unflatten(
@@ -133,6 +150,8 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             updating_cache=updating_cache,
             num_valid_frames=num_valid_frames,
             shared_buffers=shared_buffers,
+            mode=mode, cache_update_start=cache_update_start,
+            cu_shared_buffers=cu_shared_buffers, nfpb_cu=nfpb_cu,
         )
 
         # Activation checkpointing is handled by FSDP's apply_activation_checkpointing
@@ -146,6 +165,13 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
                 "cache_start": cache_start,
             })
             x = block(x, **kwargs)
+
+        # SP: all-gather the sharded sequence back to full before head/unpatchify.
+        if _sp_active:
+            B, shard_len, C = x.shape
+            full = torch.empty(B * _world * shard_len, C, dtype=x.dtype, device=x.device)
+            _dist.all_gather_into_tensor(full, x.reshape(-1, C), group=_wg)
+            x = full.reshape(B, _world * shard_len, C)
 
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = x.flatten(1, 2)
