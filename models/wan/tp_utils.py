@@ -502,20 +502,30 @@ def shard_model_tp(model, tp_rank: int, tp_degree: int):
         # --- Self-Attention ---
         self_attn = block.self_attn
 
-        # Q, K, V: column-parallel (split output dim = split heads)
-        self_attn.q = shard_linear_column(self_attn.q, tp_rank, tp_degree)
-        self_attn.k = shard_linear_column(self_attn.k, tp_rank, tp_degree)
-        self_attn.v = shard_linear_column(self_attn.v, tp_rank, tp_degree)
-
-        # O: row-parallel (split input dim = each rank has local heads)
-        self_attn.o = shard_linear_row(self_attn.o, tp_rank, tp_degree)
-
-        # QK norms: shard to match local head count
-        self_attn.norm_q = shard_qkv_norm(self_attn.norm_q, tp_rank, tp_degree)
-        self_attn.norm_k = shard_qkv_norm(self_attn.norm_k, tp_rank, tp_degree)
-
-        # Update num_heads to local count
-        self_attn.num_heads = heads_per_rank
+        # SP merged-mode (RF-faithful): self-attn q/k/v stay FULL (unsharded) — every rank
+        # computes all heads, gathers seq over WORLD, slices its heads by tp_rank inside
+        # forward_merged. Only o is row-parallel (reduce_scatter over the contiguous TP
+        # group). This matches RF dit_attention (q/k/v = full nn.Linear(dim,dim), o sharded).
+        # Non-SP: keep the original column-parallel head sharding.
+        import os as _os
+        _sp_mode = int(_os.environ.get("SP_DEGREE", "1")) > 1
+        if _sp_mode:
+            # q/k/v/norms FULL; only o sharded (row-parallel).
+            self_attn.o = shard_linear_row(self_attn.o, tp_rank, tp_degree)
+            # num_heads stays full; mark that this attn runs merged/full-qkv.
+            self_attn._sp_full_qkv = True
+        else:
+            # Q, K, V: column-parallel (split output dim = split heads)
+            self_attn.q = shard_linear_column(self_attn.q, tp_rank, tp_degree)
+            self_attn.k = shard_linear_column(self_attn.k, tp_rank, tp_degree)
+            self_attn.v = shard_linear_column(self_attn.v, tp_rank, tp_degree)
+            # O: row-parallel (split input dim = each rank has local heads)
+            self_attn.o = shard_linear_row(self_attn.o, tp_rank, tp_degree)
+            # QK norms: shard to match local head count
+            self_attn.norm_q = shard_qkv_norm(self_attn.norm_q, tp_rank, tp_degree)
+            self_attn.norm_k = shard_qkv_norm(self_attn.norm_k, tp_rank, tp_degree)
+            # Update num_heads to local count
+            self_attn.num_heads = heads_per_rank
 
         # --- Cross-Attention ---
         cross_attn = block.cross_attn

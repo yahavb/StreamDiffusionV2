@@ -705,50 +705,68 @@ class CausalWanSelfAttention(nn.Module):
         optimization); it co-attends the whole window (global attention, which is what
         local_attn_size=-1 means). Requires 16-rank TP4xSP4 + 60x112 to run.
         """
-        from models.wan.tp_utils import get_sp_group, get_sp_world_size
-        b, s_local, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        # RF-faithful SP merged attention (all collectives on CONTIGUOUS groups — proven
+        # required on Neuron). q/k/v are FULL here (shard_model_tp left them unsharded in
+        # SP mode). Steps: (1) local x is this rank's SEQUENCE shard (model-forward split
+        # it over the world); compute full q/k/v. (2) all-gather over WORLD -> full seq,
+        # full heads on every rank. (3) slice OUR heads (tp_rank) and RoPE on full grid.
+        # (4) slice OUR query seq (sp_rank), attend vs full K/V for our heads. (5) o then
+        # all-reduce over the contiguous TP group -> combine heads (RowParallel does this).
+        import torch.distributed as _d
+        from models.wan.tp_utils import (get_sp_rank, get_sp_world_size, get_tp_rank,
+                                          get_tp_world_size, get_world_group)
+        b, s_local = x.shape[0], x.shape[1]
         assert b == 1
+        n_full, d = self.num_heads, self.head_dim   # full heads (SP mode: q/k/v unsharded)
         f_full, h, w = grid_sizes
         frame_seqlen = h * w
-        sp_group = get_sp_group()
-        spw = get_sp_world_size()
-        sp_rank = _dist_get_rank(sp_group)
+        wg = get_world_group()
+        world = _d.get_world_size(wg)
+        sp_rank, spw = get_sp_rank(), get_sp_world_size()
+        tp_rank, tpw = get_tp_rank(), get_tp_world_size()
 
-        # local q/k/v for this rank's heads (TP) + its sequence shard (SP)
-        q = self.norm_q(self.q(x)).view(b, s_local, n * d)
-        k = self.norm_k(self.k(x)).view(b, s_local, n * d)
-        v = self.v(x).view(b, s_local, n * d)
+        q = self.norm_q(self.q(x)).reshape(s_local, n_full * d)
+        k = self.norm_k(self.k(x)).reshape(s_local, n_full * d)
+        v = self.v(x).reshape(s_local, n_full * d)
 
-        # GATHER q/k/v to the FULL window over the SP group FIRST, then RoPE on the full
-        # frame-aligned grid (grid_sizes = the whole window). This avoids sub-frame RoPE:
-        # a per-rank shard can be a fraction of a frame (5040/4=1260 < frame 1680), which
-        # the frame-based RoPE grid can't represent. RF does the same (gather then RoPE).
+        # (2) all-gather over WORLD (contiguous). Each rank contributed s_local tokens;
+        # world gather -> s_local*world rows. But TP-sibling ranks hold the SAME seq shard
+        # (different only by having full q/k/v — identical here). So gathering over world
+        # duplicates each seq shard tpw times. We want the s_full = spw*s_local unique
+        # seq. Take the sp-ordered unique rows: rows from ranks with the same tp position.
         s_full = spw * s_local
-        if spw > 1:
-            qf = torch.empty(s_full, n * d, dtype=q.dtype, device=q.device)
-            kf = torch.empty(s_full, n * d, dtype=k.dtype, device=k.device)
-            vf = torch.empty(s_full, n * d, dtype=v.dtype, device=v.device)
-            _dist_all_gather(qf, q.reshape(s_local, n * d), sp_group)
-            _dist_all_gather(kf, k.reshape(s_local, n * d), sp_group)
-            _dist_all_gather(vf, v.reshape(s_local, n * d), sp_group)
-        else:
-            qf, kf, vf = q.reshape(s_local, n * d), k.reshape(s_local, n * d), v.reshape(s_local, n * d)
-        qf = qf.view(1, s_full, n, d)
-        kf = kf.view(1, s_full, n, d)
-        vf = vf.view(1, s_full, n, d)
+        def _gather_world(t):
+            out = torch.empty(world * s_local, n_full * d, dtype=t.dtype, device=t.device)
+            _d.all_gather_into_tensor(out, t.contiguous(), group=wg)
+            return out  # [world*s_local, n_full*d], row block r = global rank r's shard
+        qg, kg, vg = _gather_world(q), _gather_world(k), _gather_world(v)
+        # global rank = sp_rank*tpw + tp_rank -> the spw unique seq shards are at ranks
+        # {sp*tpw + tp_rank : sp in 0..spw-1} for our tp_rank. Gather those rows in sp order.
+        idx = torch.cat([torch.arange(s_local, device=x.device) + (sp * tpw + tp_rank) * s_local
+                         for sp in range(spw)])
+        qf = qg[idx].view(1, s_full, n_full, d)
+        kf = kg[idx].view(1, s_full, n_full, d)
+        vf = vg[idx].view(1, s_full, n_full, d)
 
+        # (3) slice OUR heads (tp_rank), RoPE on the full frame-aligned grid
+        hpr = n_full // tpw
+        hs, he = tp_rank * hpr, (tp_rank + 1) * hpr
+        qf = qf[:, :, hs:he, :].contiguous()
+        kf = kf[:, :, hs:he, :].contiguous()
+        vf = vf[:, :, hs:he, :].contiguous()
         sf_t = torch.tensor(current_start // frame_seqlen, device=x.device)
         rq_full = self._nki_rope_apply(qf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
         rk_full = self._nki_rope_apply(kf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
 
-        # SP: this rank attends only its slice of the (full) queries against the full K/V.
+        # (4) attend OUR query seq slice (sp_rank) vs full K/V for our heads
         rq = rq_full[:, sp_rank * s_local:(sp_rank + 1) * s_local]
-        q_attn = rq.permute(0, 2, 1, 3)          # [1, n, s_local, d]
-        k_attn = rk_full.permute(0, 2, 1, 3)     # [1, n, s_full, d]
+        q_attn = rq.permute(0, 2, 1, 3)
+        k_attn = rk_full.permute(0, 2, 1, 3)
         v_attn = vf.permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(q_attn, k_attn, v_attn)
-        out = attn_out.permute(0, 2, 1, 3).flatten(2)   # [1, s_local, n*d]
-        return self.o(out)                        # RowParallel all-reduce over TP -> combine heads
+        out = attn_out.permute(0, 2, 1, 3).flatten(2)   # [1, s_local, hpr*d]
+        # (5) o is RowParallel over the contiguous TP group -> all-reduce combines heads
+        return self.o(out)
 
 
 # ── Attention Block ─────────────────────────────────────────────────────

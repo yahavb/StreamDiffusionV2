@@ -169,12 +169,22 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             })
             x = block(x, **kwargs)
 
-        # SP: all-gather the sequence shards back (over the SP group) before head/unpatchify.
+        # SP: gather the sequence shards back. Collectives must be on CONTIGUOUS groups on
+        # Neuron -> gather over WORLD (all ranks, contiguous), then take the spw unique
+        # sp-ordered shards (TP-siblings share a shard, so world-gather duplicates tpw x).
         if _sp_active:
+            from models.wan.tp_utils import get_tp_rank, get_tp_world_size
+            _wg2 = get_world_group()
+            _wsz = _dist.get_world_size(_wg2)
+            _tpr, _tpw = get_tp_rank(), get_tp_world_size()
             B, shard_len, C = x.shape
-            full = torch.empty(B * _spw * shard_len, C, dtype=x.dtype, device=x.device)
-            _dist.all_gather_into_tensor(full, x.reshape(-1, C).contiguous(), group=get_sp_group())
-            x = full.reshape(B, _spw * shard_len, C)
+            g = torch.empty(_wsz * shard_len, C, dtype=x.dtype, device=x.device)
+            _dist.all_gather_into_tensor(g, x.reshape(-1, C).contiguous(), group=_wg2)
+            # unique sp-ordered shards for our tp position: ranks {sp*tpw + _tpr}
+            import torch as _t
+            idx = _t.cat([_t.arange(shard_len, device=x.device) + (sp * _tpw + _tpr) * shard_len
+                          for sp in range(_spw)])
+            x = g[idx].reshape(B, _spw * shard_len, C)
 
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = x.flatten(1, 2)
