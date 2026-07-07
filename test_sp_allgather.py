@@ -41,6 +41,7 @@ def main():
     log(rank, f"world={world} tp={tp} sp={sp}")
 
     for gname, grp in [("STRIDED", strided_group), ("CONTIG", contig_group)]:
+        # all_gather
         try:
             s_local, width = 1260, 384
             inp = torch.randn(s_local, width, dtype=torch.bfloat16, device=dev).contiguous()
@@ -49,7 +50,15 @@ def main():
             torch.neuron.synchronize()
             log(rank, f"OK   {gname} all_gather")
         except Exception as e:
-            log(rank, f"FAIL {gname}: {str(e)[:80]}")
+            log(rank, f"FAIL {gname} all_gather: {str(e)[:70]}")
+        # all_reduce (TP's o RowParallel uses this — must also work on strided if TP strided)
+        try:
+            t = torch.randn(1024, 512, dtype=torch.bfloat16, device=dev).contiguous()
+            dist.all_reduce(t, group=grp)
+            torch.neuron.synchronize()
+            log(rank, f"OK   {gname} all_reduce")
+        except Exception as e:
+            log(rank, f"FAIL {gname} all_reduce: {str(e)[:70]}")
     dist.destroy_process_group()
     return
     sp_group = strided_group; sp_rank = rank // tp  # (unreached; kept for old code below)
