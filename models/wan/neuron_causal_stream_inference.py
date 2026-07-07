@@ -426,6 +426,13 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             for i in range(self.num_transformer_blocks):
                 self.crossattn_cache[i]["is_init"] = False
 
+        # ROLLING-WINDOW mode: generate_rolling_window does the WHOLE clip (incl. first
+        # block) via merged attention. prepare() here only encodes the prompt + inits
+        # caches — SKIP the anchor denoise (its regular head-sharded attention path is
+        # incompatible with SP full-qkv weights -> the [5040,3,128] vs [5040,12,128] crash).
+        if os.environ.get("USE_ROLLING_WINDOW", "").lower() in ("1", "true"):
+            return None
+
         # Run anchor block denoising
         current_start_int = int(current_start)
         current_end_int = int(current_end) if current_end is not None else self.frame_seq_length
