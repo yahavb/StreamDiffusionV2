@@ -123,7 +123,12 @@ def init_sp_groups(tp_degree: int = 4, sp_degree: int = 4):
         f"sp_degree({sp_degree})")
 
     _WORLD_GROUP = dist.group.WORLD
-    _DP_GROUP_ID, _DP_NUM_GROUPS, _TP_GROUP_BASE = 0, 1, 0
+    # TP_GROUP_BASE = global rank of THIS rank's TP group's local-rank-0 (contiguous TP
+    # groups). Needed so t5_rank/vae_rank (base + offset) and the T5 broadcast src land
+    # inside this rank's own TP group. (Was wrongly hardcoded 0 -> src=2 not in group
+    # [12,13,14,15] etc.)
+    _DP_GROUP_ID, _DP_NUM_GROUPS = 0, 1
+    _TP_GROUP_BASE = (rank // tp_degree) * tp_degree
 
     # TP groups: contiguous
     for sp_i in range(sp_degree):
