@@ -33,8 +33,13 @@ width: 832
 num_frames: 81
 
 num_frame_per_block: 3
-num_kv_cache: 6
-num_sink_tokens: 3
+# MATCH RollingForcing's inference cache: RF hardcodes kv_cache_size = 1560*24 = 24 FRAMES
+# of context, NO sink tokens (its local_attn_size windowing is commented out). RF's ckpt
+# was TRAINED with that. We were running num_kv_cache=6 + 3 sink tokens -> the model
+# attended over 6 frames when trained for 24 -> wrong temporal context = BLUR (kernels +
+# VAE already proven correct). Match RF: 24-frame window, no sinks.
+num_kv_cache: 24
+num_sink_tokens: 0
 adapt_sink_threshold: 0.2
 
 tp_degree: 4
