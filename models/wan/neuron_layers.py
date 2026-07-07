@@ -758,13 +758,36 @@ class CausalWanSelfAttention(nn.Module):
         rq_full = self._nki_rope_apply(qf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
         rk_full = self._nki_rope_apply(kf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
 
-        # (4) attend OUR query seq slice (sp_rank) vs full K/V for our heads
-        rq = rq_full[:, sp_rank * s_local:(sp_rank + 1) * s_local]
-        q_attn = rq.permute(0, 2, 1, 3)
-        k_attn = rk_full.permute(0, 2, 1, 3)
-        v_attn = vf.permute(0, 2, 1, 3)
-        attn_out = F.scaled_dot_product_attention(q_attn, k_attn, v_attn)
-        out = attn_out.permute(0, 2, 1, 3).flatten(2)   # [1, s_local, hpr*d]
+        # (4) attend OUR query seq slice (sp_rank) vs full K/V for our heads. Use the NKI
+        # FLASH kernel (memory-efficient, no full score matrix) — plain SDPA OOM'd (512MB
+        # scratchpad for the 25200-token window). Same kernel/layout as the regular path.
+        rq = rq_full[:, sp_rank * s_local:(sp_rank + 1) * s_local]   # [1, s_local, hpr, d]
+        if rq.device.type == "neuron" and self._nki_available:
+            q_kern = rq[0].permute(1, 2, 0).contiguous()             # [hpr, d, s_local]
+            k_kern = rk_full[0].permute(1, 2, 0).contiguous()        # [hpr, d, s_full]
+            v_kern = vf[0].permute(1, 0, 2).contiguous()             # [hpr, s_full, d]
+            k_valid = k_kern.shape[2]
+            P = 128
+            pad_q = (P - q_kern.shape[2] % P) % P
+            if pad_q > 0:
+                q_kern = F.pad(q_kern, (0, pad_q))
+            # K/V seqlen must be a multiple of ATTN_SEQLEN_MULTIPLE for the kernel.
+            seqlen_k = ((k_valid + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+            if seqlen_k > k_valid:
+                k_kern = F.pad(k_kern, (0, seqlen_k - k_valid))
+                v_kern = F.pad(v_kern, (0, 0, 0, seqlen_k - k_valid))
+            mask = torch.zeros((P, seqlen_k), dtype=torch.bfloat16, device=q_kern.device)
+            if k_valid < seqlen_k:
+                mask[:, k_valid:] = float('-inf')
+            num_sections = seqlen_k // ATTN_SEQLEN_MULTIPLE
+            out = self._self_attn_kernel(
+                q_kern, k_kern, v_kern, self.identity, mask,
+                softmax_scale=self.softmax_scale, num_sections=num_sections)
+            out = out[:s_local].unsqueeze(0).flatten(2)   # [1, s_local, hpr*d]
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                rq.permute(0, 2, 1, 3), rk_full.permute(0, 2, 1, 3), vf.permute(0, 2, 1, 3))
+            out = attn_out.permute(0, 2, 1, 3).flatten(2)
         # (5) o is RowParallel over the contiguous TP group -> all-reduce combines heads
         return self.o(out)
 
