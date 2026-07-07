@@ -164,10 +164,10 @@ spec:
               # 1.3B student (--generator_ckpt) on the 1.3B config at the res it trained on.
               CKPT_ARG=""
               CFG="streamv2v/configs/wan_causal_dmd_v2v_14b_neuron.yaml"
-              RES_ARG="--num_frames 81 --height ${HEIGHT:-240} --width ${WIDTH:-416}"
+              RES_ARG="--num_frames ${NUM_FRAMES:-81} --height ${HEIGHT:-240} --width ${WIDTH:-416}"
               if [ -n "${GENERATOR_CKPT:-}" ]; then
                 CFG="streamv2v/configs/wan_causal_fps_neuron.yaml"
-                RES_ARG="--num_frames 81 --height ${HEIGHT:-352} --width ${WIDTH:-640}"
+                RES_ARG="--num_frames ${NUM_FRAMES:-81} --height ${HEIGHT:-352} --width ${WIDTH:-640}"
                 echo "VALIDATE-DISTILLED: cfg=$CFG res=${HEIGHT:-352}x${WIDTH:-640} steps=$STEPS tp=$TP_DEGREE ckpts=$GENERATOR_CKPT"
               fi
               # BENCH_CMD without the ckpt arg; per-ckpt arg is appended in render() so we
@@ -331,6 +331,9 @@ spec:
             - name: USE_ROLLING_WINDOW
               value: "1"            # RF-faithful sliding-window co-denoise (the real blur fix): denoise
                                     # the whole clip with the diagonal schedule, not per-block independent.
+            - name: NUM_FRAMES
+              value: "15"           # SMALL first: one full 15-frame window. Verify rolling-window
+                                    # produces SHARP output before solving the 81-frame HBM/SP scaling.
             # t2v from noise (cat prompt). Distilled student not trained on v2v.
             - name: INPUT_VIDEO_SRC
               value: ""
