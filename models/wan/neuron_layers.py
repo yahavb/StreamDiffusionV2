@@ -60,6 +60,17 @@ USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "true").lower() == "true"
 # checkpoint recompute can flip -> fwd/recompute tensor-count mismatch).
 _DISTILL_FUNCTIONAL_ATTN = os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true")
 
+
+def _dist_get_rank(group):
+    import torch.distributed as _d
+    return _d.get_rank(group) if (group is not None and _d.is_initialized()) else 0
+
+
+def _dist_all_gather(out, inp, group):
+    """all_gather_into_tensor over `group`: out[r*numel:(r+1)*numel] = each rank's inp."""
+    import torch.distributed as _d
+    _d.all_gather_into_tensor(out, inp.contiguous(), group=group)
+
 NKI_AVAILABLE = False
 wan_cross_attn = None
 ROPE_NKI_AVAILABLE = False
@@ -675,6 +686,69 @@ class CausalWanSelfAttention(nn.Module):
 
         x = self.o(x)
         return x
+
+    def forward_merged(self, x, grid_sizes, freqs_cos, freqs_sin, kv_cache,
+                       cache_update_start, current_start,
+                       cu_shared_buffers, dn_shared_buffers,
+                       num_valid_frames_dn=None, nfpb_cu=None):
+        """SP merged-mode attention for rolling-window co-denoise.
+
+        Adapted to OUR layout: TP already head-shards q/k/v/o (shard_model_tp), so each rank
+        computes its own heads locally (no head gather/slice needed). The SEQUENCE is
+        SP-sharded (model-forward split x across the world). So for attention each rank must
+        see the FULL sequence's K/V for its heads -> all-gather K/V across the SP group,
+        attend its local Q against the full K/V, then o (RowParallel all-reduces over TP to
+        combine heads). The model-forward all-gather reassembles the sequence across the world.
+
+        NOTE: this is the simplest correct SP attention for our head-sharded weights — it
+        does NOT implement RF's separate cu/dn cache-write split (that's a streaming
+        optimization); it co-attends the whole window (global attention, which is what
+        local_attn_size=-1 means). Requires 16-rank TP4xSP4 + 60x112 to run.
+        """
+        from models.wan.tp_utils import get_sp_group, get_sp_world_size
+        b, s_local, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        assert b == 1
+        f, h, w = grid_sizes
+        frame_seqlen = h * w
+
+        # local q/k/v for this rank's heads + its sequence shard
+        q = self.norm_q(self.q(x)).view(b, s_local, n, d)
+        k = self.norm_k(self.k(x)).view(b, s_local, n, d)
+        v = self.v(x).view(b, s_local, n, d)
+
+        # RoPE on the local shard. current_start is the window's global token offset; this
+        # rank's shard starts at current_start + sp_rank * s_local.
+        sp_group = get_sp_group()
+        spw = get_sp_world_size()
+        sp_rank = _dist_get_rank(sp_group)
+        shard_start_frame = (current_start + sp_rank * s_local) // frame_seqlen
+        sf_t = torch.tensor(shard_start_frame, device=x.device)
+        # grid for this shard (s_local tokens -> s_local/frame_seqlen frames)
+        shard_frames = max(1, s_local // frame_seqlen)
+        shard_grid = (shard_frames, h, w)
+        rq = self._nki_rope_apply(q, shard_grid, freqs_cos, freqs_sin, start_frame=sf_t)
+        rk = self._nki_rope_apply(k, shard_grid, freqs_cos, freqs_sin, start_frame=sf_t)
+
+        # all-gather K/V across the SP group so every rank has the FULL window's K/V (for
+        # its heads). Each rank contributed s_local tokens -> full = spw * s_local.
+        s_full = spw * s_local
+        if spw > 1:
+            kf = torch.empty(s_full, n * d, dtype=rk.dtype, device=rk.device)
+            vf = torch.empty(s_full, n * d, dtype=v.dtype, device=v.device)
+            _dist_all_gather(kf, rk.reshape(s_local, n * d), sp_group)
+            _dist_all_gather(vf, v.reshape(s_local, n * d), sp_group)
+            kf = kf.view(1, s_full, n, d)
+            vf = vf.view(1, s_full, n, d)
+        else:
+            kf, vf = rk, v
+
+        # attend: local Q (s_local) against full K/V (s_full)
+        q_attn = rq.permute(0, 2, 1, 3)          # [1, n, s_local, d]
+        k_attn = kf.permute(0, 2, 1, 3)          # [1, n, s_full, d]
+        v_attn = vf.permute(0, 2, 1, 3)
+        attn_out = F.scaled_dot_product_attention(q_attn, k_attn, v_attn)
+        out = attn_out.permute(0, 2, 1, 3).flatten(2)   # [1, s_local, n*d]
+        return self.o(out)                        # RowParallel all-reduce over TP -> combine heads
 
 
 # ── Attention Block ─────────────────────────────────────────────────────
