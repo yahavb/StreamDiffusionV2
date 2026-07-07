@@ -296,11 +296,11 @@ spec:
             claims:
               - name: s-lnc1-trn2
             requests:
-              cpu: 44
-              memory: 1000Gi
+              cpu: 33
+              memory: 600Gi
             limits:
-              cpu: 44
-              memory: 1000Gi
+              cpu: 33
+              memory: 600Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -325,6 +325,9 @@ spec:
               value: "1"            # RF repro: warp_denoising_step=true
             - name: TIMESTEP_SHIFT
               value: "5.0"          # RF timestep_shift
+            - name: UPDATE_CACHE_EVERY_STEP
+              value: "1"            # A/B: update KV cache every denoise step (was last-only speed
+                                    # opt -> steps 1..N-1 may attend stale cache = blur). Test if sharp.
             # t2v from noise (cat prompt). Distilled student not trained on v2v.
             - name: INPUT_VIDEO_SRC
               value: ""

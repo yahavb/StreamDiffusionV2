@@ -522,7 +522,11 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
             # (cheap windowed read) and updates the cache ONCE at the end. SD was
             # passing updating_cache=True on ALL 5 steps -> the big assembly ran
             # 5x/block, the dominant per-block cost. Only update on the last step.
+            # A/B TEST (agent finding #2): the is_last_step gating (speed opt) may leave
+            # steps 1..N-1 attending a stale cache -> blur. Env UPDATE_CACHE_EVERY_STEP=1
+            # updates every step (RF-faithful?) to test. Default keeps the last-only opt.
             is_last_step = (index == num_steps - 1)
+            _upd = True if os.environ.get("UPDATE_CACHE_EVERY_STEP", "").lower() in ("1", "true") else is_last_step
             denoised_pred = self.generator(
                 noisy_image_or_video=noise,
                 conditional_dict=self.conditional_dict,
@@ -531,7 +535,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_int,
                 current_end=current_end_int,
-                updating_cache=is_last_step,
+                updating_cache=_upd,
                 shared_buffers=self.shared_buffers,
             )
 
