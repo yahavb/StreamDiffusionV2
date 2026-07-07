@@ -364,10 +364,9 @@ spec:
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: USE_NKI_KERNELS
-              value: "false"        # RE-TEST off: VAE is now the ORIGINAL full-quality decoder (RF-VAE
-                                    # port removed). Earlier NKI-off test was masked by the blurry VAE
-                                    # port. With a clean VAE, does exact SDPA attn render sharp? If yes,
-                                    # NKI attn was a 2nd stacked approximation. If still blurry -> DiT elsewhere.
+              value: "true"         # MUST be on for SP: forward_merged uses the NKI flash kernel
+                                    # (memory-efficient); with it off, plain SDPA OOMs (512MB scratchpad
+                                    # on the 25200-token window). Kernels proven accurate (0.03 vs CPU).
             # NKI VAE conv2d_k3 (9 full-res shifted copies -> 27-tensor aten::cat) fails
             # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
             - name: USE_NKI_VAE
