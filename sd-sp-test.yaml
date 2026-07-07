@@ -1,0 +1,64 @@
+# Minimal 16-rank test: SP-group all_gather at merged-attention shapes. Isolates the
+# 'Invalid NEFF' collective error. Launch: kubectl apply -f sd-sp-test.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sd-sp-test
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: sd-sp-test
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
+      containers:
+        - name: sd-sp-test
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+              BRANCH="${BRANCH:-exp/fps-1.3b}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/StreamDiffusionV2.git REPO
+              cd REPO
+              echo "commit: $(git rev-parse HEAD)"
+              export RF_DEVICE_BACKEND=neuron
+              uv pip install -r requirements-neuron.txt || pip install -r requirements-neuron.txt
+              echo "══════════ SP all_gather isolation test (16 ranks TP4xSP4) ══════════"
+              torchrun --nproc_per_node=16 test_sp_allgather.py || echo "[sp-test] non-zero exit"
+              echo "══════════ end ══════════"
+          resources:
+            claims:
+              - name: m-lnc1-trn2
+            requests:
+              cpu: 80
+              memory: 320Gi
+            limits:
+              cpu: 80
+              memory: 320Gi
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "exp/fps-1.3b"
+            - name: TP_DEGREE
+              value: "4"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
