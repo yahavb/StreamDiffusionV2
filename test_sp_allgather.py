@@ -24,19 +24,35 @@ def main():
     torch.neuron.set_device(int(os.environ["LOCAL_RANK"]))
     dev = "neuron"
 
-    # Mirror RF init_parallel_groups EXACTLY: create ALL tp groups (contiguous) THEN all
-    # sp groups (strided). Every rank calls new_group for every group, in the same order.
-    for sp_i in range(sp):
-        ranks = list(range(sp_i * tp, (sp_i + 1) * tp))
-        dist.new_group(ranks)  # tp groups (created by all, even if not a member)
-    sp_group = None
+    # DECISIVE TEST: is it the STRIDING? Build BOTH a strided group [tp_i::tp] and a
+    # CONTIGUOUS group [sp_i*sp:(sp_i+1)*sp], all_gather on each, compare.
+    strided_group = None
     for tp_i in range(tp):
-        ranks = list(range(tp_i, world, tp))
+        ranks = list(range(tp_i, world, tp))          # [0,4,8,12] ...
         g = dist.new_group(ranks)
         if rank in ranks:
-            sp_group = g
-            sp_rank = rank // tp
-    log(rank, f"world={world} tp={tp} sp={sp} sp_rank={sp_rank}")
+            strided_group = g
+    contig_group = None
+    for i in range(tp):
+        ranks = list(range(i * sp, (i + 1) * sp))     # [0,1,2,3],[4,5,6,7] ... (size sp)
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            contig_group = g
+    log(rank, f"world={world} tp={tp} sp={sp}")
+
+    for gname, grp in [("STRIDED", strided_group), ("CONTIG", contig_group)]:
+        try:
+            s_local, width = 1260, 384
+            inp = torch.randn(s_local, width, dtype=torch.bfloat16, device=dev).contiguous()
+            out = torch.empty(sp * s_local, width, dtype=torch.bfloat16, device=dev)
+            dist.all_gather_into_tensor(out, inp, group=grp)
+            torch.neuron.synchronize()
+            log(rank, f"OK   {gname} all_gather")
+        except Exception as e:
+            log(rank, f"FAIL {gname}: {str(e)[:80]}")
+    dist.destroy_process_group()
+    return
+    sp_group = strided_group; sp_rank = rank // tp  # (unreached; kept for old code below)
 
     # our merged-attention shapes: frame_seq=1680, window=3 frames (anchor phase) -> s_full
     # = 3*1680=5040, s_local = 5040/sp = 1260. head-sharded n*d: 3 heads * 128 = 384.
