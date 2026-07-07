@@ -357,12 +357,8 @@ spec:
               value: "ERROR"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
-            # LNC=1 to expose 8 logical cores per node for TP-8 (m-lnc1-trn2 grants
-            # LNC1). LNC=2 fuses core pairs -> only 4 logical cores -> can't do TP-8.
-            # (We're at 240p so the 480p VAE-compile env that needed LNC=2 is moot.)
-            # The RDH buffer bump (128MB) stays — harmless, enlarges runtime channel buf.
-            - name: NEURON_LOGICAL_NC_CONFIG
-              value: "1"
+            # NEURON_LOGICAL_NC_CONFIG: do NOT force (RF leaves it auto). Forcing it broke
+            # the contiguous-group collectives in the SP isolation test. Runtime auto-sets.
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
               value: "134217728"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
