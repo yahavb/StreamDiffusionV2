@@ -33,6 +33,15 @@ _DP_GROUP_ID: int = 0          # which DP group THIS rank is in (0..num-1)
 _DP_NUM_GROUPS: int = 1        # world_size // tp_degree
 _TP_GROUP_BASE: int = 0        # global rank of this group's local-rank-0
 
+# Sequence parallelism (for RF rolling-window merged attention). TP4xSP4=16 ranks:
+#   TP groups CONTIGUOUS (ranks 0-3, 4-7, 8-11, 12-15) — head sharding (existing).
+#   SP groups STRIDED stride=tp_degree (ranks 0,4,8,12 / 1,5,9,13 / ...) — sequence
+#   sharding. A rank's global id = sp_rank * tp_degree + tp_rank.
+_SP_GROUP: Optional[dist.ProcessGroup] = None
+_SP_RANK: int = 0
+_SP_WORLD_SIZE: int = 1
+_WORLD_GROUP: Optional[dist.ProcessGroup] = None   # the full TPxSP world (one stream)
+
 
 def init_tp_group(tp_degree: int = 4):
     """Initialize tensor parallelism process group(s).
@@ -84,6 +93,73 @@ def init_tp_group(tp_degree: int = 4):
     print(f"[TP] Initialized: tp_rank={_TP_RANK}/{_TP_WORLD_SIZE}, "
           f"dp_group={_DP_GROUP_ID}/{_DP_NUM_GROUPS}, base={_TP_GROUP_BASE}, "
           f"global_rank={rank}/{world_size}")
+
+
+def init_sp_groups(tp_degree: int = 4, sp_degree: int = 4):
+    """Initialize TP x SP process groups for RF-style merged attention (one stream).
+
+    Layout (RF-faithful, dit_pipeline.init_parallel_groups):
+      global_rank = sp_rank * tp_degree + tp_rank
+      TP groups CONTIGUOUS: [0..tp-1], [tp..2tp-1], ...  (head sharding)
+      SP groups STRIDED stride=tp_degree: [0,tp,2tp,...], [1,...], ...  (seq sharding)
+    Requires world_size == tp_degree * sp_degree (single 16-rank stream; no DP here).
+    ALL ranks must call new_group for EVERY group (collective requirement).
+    """
+    global _TP_GROUP, _TP_RANK, _TP_WORLD_SIZE, _TP_GROUP_BASE
+    global _SP_GROUP, _SP_RANK, _SP_WORLD_SIZE, _WORLD_GROUP
+    global _DP_GROUP_ID, _DP_NUM_GROUPS
+
+    if not dist.is_initialized():
+        _TP_RANK = _SP_RANK = 0
+        _TP_WORLD_SIZE = _SP_WORLD_SIZE = 1
+        _TP_GROUP = _SP_GROUP = _WORLD_GROUP = None
+        print("[SP] single-process mode (no distributed)")
+        return
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    assert world_size == tp_degree * sp_degree, (
+        f"SP mode needs world_size({world_size}) == tp_degree({tp_degree})*"
+        f"sp_degree({sp_degree})")
+
+    _WORLD_GROUP = dist.group.WORLD
+    _DP_GROUP_ID, _DP_NUM_GROUPS, _TP_GROUP_BASE = 0, 1, 0
+
+    # TP groups: contiguous
+    for sp_i in range(sp_degree):
+        ranks = list(range(sp_i * tp_degree, (sp_i + 1) * tp_degree))
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            _TP_GROUP = g
+            _TP_RANK = rank % tp_degree
+            _TP_WORLD_SIZE = tp_degree
+    # SP groups: strided
+    for tp_i in range(tp_degree):
+        ranks = list(range(tp_i, world_size, tp_degree))
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            _SP_GROUP = g
+            _SP_RANK = rank // tp_degree
+            _SP_WORLD_SIZE = sp_degree
+
+    print(f"[SP] tp_rank={_TP_RANK}/{_TP_WORLD_SIZE} sp_rank={_SP_RANK}/{_SP_WORLD_SIZE} "
+          f"global={rank}/{world_size}")
+
+
+def get_sp_group() -> Optional[dist.ProcessGroup]:
+    return _SP_GROUP
+
+
+def get_sp_rank() -> int:
+    return _SP_RANK
+
+
+def get_sp_world_size() -> int:
+    return _SP_WORLD_SIZE
+
+
+def get_world_group() -> Optional[dist.ProcessGroup]:
+    return _WORLD_GROUP
 
 
 def get_tp_group() -> Optional[dist.ProcessGroup]:
