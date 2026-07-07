@@ -24,7 +24,11 @@ def main():
     torch.neuron.set_device(int(os.environ["LOCAL_RANK"]))
     dev = "neuron"
 
-    # build SP group (strided) — same as tp_utils.init_sp_groups
+    # Mirror RF init_parallel_groups EXACTLY: create ALL tp groups (contiguous) THEN all
+    # sp groups (strided). Every rank calls new_group for every group, in the same order.
+    for sp_i in range(sp):
+        ranks = list(range(sp_i * tp, (sp_i + 1) * tp))
+        dist.new_group(ranks)  # tp groups (created by all, even if not a member)
     sp_group = None
     for tp_i in range(tp):
         ranks = list(range(tp_i, world, tp))

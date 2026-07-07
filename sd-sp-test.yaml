@@ -53,8 +53,10 @@ spec:
               value: "exp/fps-1.3b"
             - name: TP_DEGREE
               value: "4"
-            - name: NEURON_LOGICAL_NC_CONFIG
-              value: "1"
+            # NEURON_LOGICAL_NC_CONFIG: do NOT force — RF doesn't set it (runtime auto-sets).
+            # Forcing =1 caused the strided SP-group collective "no_hier no_mesh" failure.
+            - name: NEURON_FALLBACK_ENABLED
+              value: "0"            # match RF deploy
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: GITHUB_TOKEN
