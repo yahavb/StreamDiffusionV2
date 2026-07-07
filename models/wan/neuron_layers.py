@@ -708,43 +708,43 @@ class CausalWanSelfAttention(nn.Module):
         from models.wan.tp_utils import get_sp_group, get_sp_world_size
         b, s_local, n, d = *x.shape[:2], self.num_heads, self.head_dim
         assert b == 1
-        f, h, w = grid_sizes
+        f_full, h, w = grid_sizes
         frame_seqlen = h * w
-
-        # local q/k/v for this rank's heads + its sequence shard
-        q = self.norm_q(self.q(x)).view(b, s_local, n, d)
-        k = self.norm_k(self.k(x)).view(b, s_local, n, d)
-        v = self.v(x).view(b, s_local, n, d)
-
-        # RoPE on the local shard. current_start is the window's global token offset; this
-        # rank's shard starts at current_start + sp_rank * s_local.
         sp_group = get_sp_group()
         spw = get_sp_world_size()
         sp_rank = _dist_get_rank(sp_group)
-        shard_start_frame = (current_start + sp_rank * s_local) // frame_seqlen
-        sf_t = torch.tensor(shard_start_frame, device=x.device)
-        # grid for this shard (s_local tokens -> s_local/frame_seqlen frames)
-        shard_frames = max(1, s_local // frame_seqlen)
-        shard_grid = (shard_frames, h, w)
-        rq = self._nki_rope_apply(q, shard_grid, freqs_cos, freqs_sin, start_frame=sf_t)
-        rk = self._nki_rope_apply(k, shard_grid, freqs_cos, freqs_sin, start_frame=sf_t)
 
-        # all-gather K/V across the SP group so every rank has the FULL window's K/V (for
-        # its heads). Each rank contributed s_local tokens -> full = spw * s_local.
+        # local q/k/v for this rank's heads (TP) + its sequence shard (SP)
+        q = self.norm_q(self.q(x)).view(b, s_local, n * d)
+        k = self.norm_k(self.k(x)).view(b, s_local, n * d)
+        v = self.v(x).view(b, s_local, n * d)
+
+        # GATHER q/k/v to the FULL window over the SP group FIRST, then RoPE on the full
+        # frame-aligned grid (grid_sizes = the whole window). This avoids sub-frame RoPE:
+        # a per-rank shard can be a fraction of a frame (5040/4=1260 < frame 1680), which
+        # the frame-based RoPE grid can't represent. RF does the same (gather then RoPE).
         s_full = spw * s_local
         if spw > 1:
-            kf = torch.empty(s_full, n * d, dtype=rk.dtype, device=rk.device)
+            qf = torch.empty(s_full, n * d, dtype=q.dtype, device=q.device)
+            kf = torch.empty(s_full, n * d, dtype=k.dtype, device=k.device)
             vf = torch.empty(s_full, n * d, dtype=v.dtype, device=v.device)
-            _dist_all_gather(kf, rk.reshape(s_local, n * d), sp_group)
+            _dist_all_gather(qf, q.reshape(s_local, n * d), sp_group)
+            _dist_all_gather(kf, k.reshape(s_local, n * d), sp_group)
             _dist_all_gather(vf, v.reshape(s_local, n * d), sp_group)
-            kf = kf.view(1, s_full, n, d)
-            vf = vf.view(1, s_full, n, d)
         else:
-            kf, vf = rk, v
+            qf, kf, vf = q.reshape(s_local, n * d), k.reshape(s_local, n * d), v.reshape(s_local, n * d)
+        qf = qf.view(1, s_full, n, d)
+        kf = kf.view(1, s_full, n, d)
+        vf = vf.view(1, s_full, n, d)
 
-        # attend: local Q (s_local) against full K/V (s_full)
+        sf_t = torch.tensor(current_start // frame_seqlen, device=x.device)
+        rq_full = self._nki_rope_apply(qf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
+        rk_full = self._nki_rope_apply(kf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
+
+        # SP: this rank attends only its slice of the (full) queries against the full K/V.
+        rq = rq_full[:, sp_rank * s_local:(sp_rank + 1) * s_local]
         q_attn = rq.permute(0, 2, 1, 3)          # [1, n, s_local, d]
-        k_attn = kf.permute(0, 2, 1, 3)          # [1, n, s_full, d]
+        k_attn = rk_full.permute(0, 2, 1, 3)     # [1, n, s_full, d]
         v_attn = vf.permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(q_attn, k_attn, v_attn)
         out = attn_out.permute(0, 2, 1, 3).flatten(2)   # [1, s_local, n*d]

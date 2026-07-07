@@ -119,20 +119,23 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         grid_sizes = tuple(int(d) for d in x.shape[2:])
         x = x.flatten(2).transpose(1, 2)
 
-        # ── SEQUENCE PARALLEL (RF merged attention): shard the token seq across the
-        # world so each rank holds L/world_size tokens. Attention gathers full K/V
-        # internally. Gated on SP active (world_size>1) — non-SP path untouched. ──
-        from models.wan.tp_utils import get_world_group
+        # ── SEQUENCE PARALLEL — ONLY in merged mode. The regular denoise path (prepare's
+        # anchor block, per-frame RoPE) is NOT SP-aware: sharding x there breaks RoPE
+        # (grid_sizes stays full while x is 1/world). forward_merged does its OWN shard-
+        # aware RoPE + K/V all-gather, so we shard here only when mode=='merged'. ──
+        # Shard by SP degree (NOT world): TP is HEAD-parallel — TP-sibling ranks hold the
+        # SAME tokens, different heads. So the sequence splits into sp_degree shards; this
+        # rank takes shard[sp_rank]. forward_merged all-gathers K/V over the SP group.
         import torch.distributed as _dist
-        _wg = get_world_group()
-        _world = _dist.get_world_size(_wg) if (_wg is not None) else 1
-        _wrank = _dist.get_rank(_wg) if (_wg is not None) else 0
-        _sp_active = _world > 1
+        from models.wan.tp_utils import get_sp_group, get_sp_world_size, get_sp_rank
+        _spw = get_sp_world_size()
+        _sprank = get_sp_rank()
+        _sp_active = (_spw > 1) and (mode == "merged")
         if _sp_active:
             L = x.shape[1]
-            assert L % _world == 0, f"seq {L} not divisible by world {_world}"
-            _shard = L // _world
-            x = x[:, _wrank * _shard:(_wrank + 1) * _shard].contiguous()
+            assert L % _spw == 0, f"seq {L} not divisible by sp_degree {_spw}"
+            _shard = L // _spw
+            x = x[:, _sprank * _shard:(_sprank + 1) * _shard].contiguous()
 
         e = self.time_embedding(
             self._sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
@@ -166,12 +169,12 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             })
             x = block(x, **kwargs)
 
-        # SP: all-gather the sharded sequence back to full before head/unpatchify.
+        # SP: all-gather the sequence shards back (over the SP group) before head/unpatchify.
         if _sp_active:
             B, shard_len, C = x.shape
-            full = torch.empty(B * _world * shard_len, C, dtype=x.dtype, device=x.device)
-            _dist.all_gather_into_tensor(full, x.reshape(-1, C), group=_wg)
-            x = full.reshape(B, _world * shard_len, C)
+            full = torch.empty(B * _spw * shard_len, C, dtype=x.dtype, device=x.device)
+            _dist.all_gather_into_tensor(full, x.reshape(-1, C).contiguous(), group=get_sp_group())
+            x = full.reshape(B, _spw * shard_len, C)
 
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = x.flatten(1, 2)
