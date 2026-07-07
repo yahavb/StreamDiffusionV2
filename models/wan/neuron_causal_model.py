@@ -127,7 +127,8 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         # SAME tokens, different heads. So the sequence splits into sp_degree shards; this
         # rank takes shard[sp_rank]. forward_merged all-gathers K/V over the SP group.
         import torch.distributed as _dist
-        from models.wan.tp_utils import get_sp_group, get_sp_world_size, get_sp_rank
+        from models.wan.tp_utils import (get_sp_group, get_sp_world_size, get_sp_rank,
+                                          get_world_group, get_tp_rank, get_tp_world_size)
         _spw = get_sp_world_size()
         _sprank = get_sp_rank()
         _sp_active = (_spw > 1) and (mode == "merged")
