@@ -660,6 +660,10 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
 
             active = win_in[:, :cur_nf].contiguous()
             self._reset_kv_indices()
+            # SP merged mode (global co-attention over the window) when SP is active;
+            # else fall back to per-block denoise attention.
+            from models.wan.tp_utils import get_sp_world_size
+            _merged = get_sp_world_size() > 1
             denoised = self.generator(
                 noisy_image_or_video=active,
                 conditional_dict=self.conditional_dict,
@@ -670,6 +674,10 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 current_end=cur_end_f * fseq,
                 updating_cache=True,
                 shared_buffers=self.shared_buffers,
+                mode=("merged" if _merged else "denoise"),
+                cache_update_start=(cur_start_f * fseq if _merged else None),
+                cu_shared_buffers=(self.shared_buffers if _merged else None),
+                nfpb_cu=(nfpb if _merged else None),
             )
 
             output[:, cur_start_f:cur_start_f + cur_nf] = denoised

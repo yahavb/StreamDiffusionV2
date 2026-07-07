@@ -32,8 +32,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: s-lnc1-trn2
-          resourceClaimTemplateName: s-lnc1-trn2
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
       containers:
         - name: sd
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -294,7 +294,7 @@ spec:
               ls -lhR "$FINAL_DIR" | head -80
           resources:
             claims:
-              - name: s-lnc1-trn2
+              - name: m-lnc1-trn2
             requests:
               cpu: 33
               memory: 600Gi
@@ -318,9 +318,9 @@ spec:
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
             - name: HEIGHT
-              value: "480"          # RF good-config res (latent 60x80 = 480x640)
+              value: "480"          # SP needs frame_seq % 16 == 0: 480x896 -> latent 60x112 ->
             - name: WIDTH
-              value: "640"
+              value: "896"          # patch2 30x56 -> frame_seq 1680 (/16=105 ✓). 640 (1560) fails.
             - name: WARP
               value: "1"            # RF repro: warp_denoising_step=true
             - name: TIMESTEP_SHIFT
@@ -339,9 +339,11 @@ spec:
               value: ""
             # 1.3B student caps at TP-4 (12 heads). Single stream: NPROC==TP_DEGREE==4.
             - name: NPROC
-              value: "4"             # 1.3B student: TP-4 (12 heads)
+              value: "16"            # SP: world = TP4 x SP4 = 16 ranks (one stream)
             - name: TP_DEGREE
-              value: "4"
+              value: "4"             # head shard (1.3B: 12 heads, TP-4)
+            - name: SP_DEGREE
+              value: "4"             # sequence shard (rolling-window merged attention)
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS

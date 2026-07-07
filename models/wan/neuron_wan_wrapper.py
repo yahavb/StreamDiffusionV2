@@ -322,11 +322,18 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
         # Apply TP-4 sharding BEFORE moving to device (shard on CPU, then move)
         if tp_degree > 1:
             from models.wan.tp_utils import (
-                init_tp_group, get_tp_rank, shard_model_tp
+                init_tp_group, init_sp_groups, get_tp_rank, shard_model_tp
             )
-            init_tp_group(tp_degree)
+            # SP mode (rolling-window merged attention): world = tp*sp, set up BOTH TP
+            # (contiguous, head shard) and SP (strided, sequence shard) groups. Else the
+            # normal per-stream TP groups. sp_degree from env (default 1 = no SP).
+            _sp = int(os.environ.get("SP_DEGREE", "1"))
+            if _sp > 1:
+                init_sp_groups(tp_degree=tp_degree, sp_degree=_sp)
+            else:
+                init_tp_group(tp_degree)
             tp_rank = get_tp_rank()
-            LOGGER.info(f"Applying TP-{tp_degree} sharding (rank {tp_rank})")
+            LOGGER.info(f"Applying TP-{tp_degree} sharding (rank {tp_rank}), sp_degree={_sp}")
             shard_model_tp(self.model, tp_rank, tp_degree)
 
         # Move to Neuron in bfloat16 (Neuron requires matching dtypes for matmul)
@@ -356,7 +363,9 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
                 kv_cache=None, crossattn_cache=None,
                 current_start=None, current_end=None,
                 updating_cache=False, cache_start=None,
-                num_valid_frames=None, shared_buffers=None):
+                num_valid_frames=None, shared_buffers=None,
+                mode="denoise", cache_update_start=None,
+                cu_shared_buffers=None, nfpb_cu=None):
         context = conditional_dict["prompt_embeds"]
         x = noisy_image_or_video
         t = timestep
@@ -372,6 +381,8 @@ class NeuronCausalWanDiffusionWrapper(DiffusionModelInterface):
             cache_start=cache_start,
             num_valid_frames=num_valid_frames,
             shared_buffers=shared_buffers,
+            mode=mode, cache_update_start=cache_update_start,
+            cu_shared_buffers=cu_shared_buffers, nfpb_cu=nfpb_cu,
         ).permute(0, 2, 1, 3, 4)  # back to [B, F, C, H, W]
 
         # Convert flow prediction to x0
