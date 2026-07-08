@@ -149,8 +149,17 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.tp_group_base = get_tp_group_base() if dist.is_initialized() else 0
         self.dp_group_id = get_dp_group_id() if dist.is_initialized() else 0
         self.dp_num_groups = get_dp_num_groups() if dist.is_initialized() else 1
-        self.t5_rank = self.tp_group_base + T5_RANK   # absolute rank hosting T5 for THIS group
-        self.vae_rank = self.tp_group_base + VAE_RANK  # absolute rank hosting VAE for THIS group
+        # SP mode = ONE stream across all ranks (not DP): T5/VAE must live on a SINGLE
+        # absolute rank (0 / T5_RANK), NOT per-TP-block. With per-block (tp_group_base+off)
+        # under SP, vae_rank resolved to 0,4,8,12 -> FOUR ranks decoded the VAE at once ->
+        # compile service overload (errno=111). Pin to absolute ranks in SP.
+        _sp_mode = int(os.environ.get("SP_DEGREE", "1")) > 1
+        if _sp_mode:
+            self.t5_rank = T5_RANK
+            self.vae_rank = VAE_RANK
+        else:
+            self.t5_rank = self.tp_group_base + T5_RANK   # per-DP-group
+            self.vae_rank = self.tp_group_base + VAE_RANK
 
         # All ranks need the tokenizer (lightweight, CPU-only)
         wan_base = os.path.join(os.path.dirname(__file__), "wan_base")
@@ -181,8 +190,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         # all-reduces inside them). Default 1 = single-rank (original behavior).
         # The VAE is ~7-8% of the block; VAE-TP=2 roughly halves the conv work.
         self.vae_tp_degree = int(os.environ.get("VAE_TP_DEGREE", "1"))
-        self.vae_tp_ranks = [self.tp_group_base + VAE_RANK + i
-                             for i in range(self.vae_tp_degree)]
+        self.vae_tp_ranks = [self.vae_rank + i for i in range(self.vae_tp_degree)]
         is_vae_rank = self.rank in self.vae_tp_ranks
 
         # Initialize VAE (on every VAE-TP rank — with torch.compile).
