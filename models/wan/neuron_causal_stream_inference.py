@@ -213,14 +213,15 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 # is at ._model.model. shard_vae_model_tp expects the WanVAE_.
                 shard_vae_model_tp(self.vae._model.model, vtp_rank, self.vae_tp_degree)
                 LOGGER.info(f"VAE channel-TP sharded: vae_tp_rank={vtp_rank}/{self.vae_tp_degree}")
-            # Compile VAE for fast decode — gated by USE_VAE_COMPILE (default on).
-            # NOTE: VAE-TP shards change channel dims off P=128; keep EAGER when sharded.
-            if self.vae_tp_degree == 1 and os.environ.get("USE_VAE_COMPILE", "true").lower() in ("1", "true"):
-                self.vae._model = torch.compile(
-                    self.vae._model, backend='neuron', dynamic=False)
-                LOGGER.info("VAE compiled with torch.compile(backend='neuron')")
-            else:
-                LOGGER.info("VAE running EAGER (sharded or USE_VAE_COMPILE=0)")
+            # VAE compilation is now PER-SUBMODULE (@_vae_compile in modules/vae.py), like RF.
+            # Do NOT torch.compile the whole wrapper here: torch.compile only wraps .forward(),
+            # but decode goes through .decode_stream() (a different method), so the wrapper
+            # compile delegates decode to the UNCOMPILED original → eager per-op storm →
+            # compile-service death (errno=2). The leaf-module @_vae_compile fires no matter
+            # which method calls self.decoder(x). Gated by USE_VAE_COMPILE inside vae.py.
+            LOGGER.info(
+                "VAE compile = per-submodule @_vae_compile (USE_VAE_COMPILE=%s, vae_tp=%d)",
+                os.environ.get("USE_VAE_COMPILE", "true"), self.vae_tp_degree)
         else:
             self.vae = None
 

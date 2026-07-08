@@ -41,6 +41,27 @@ def _is_neuron_tensor(x):
     return x.device.type == "neuron" or (hasattr(x.device, 'type') and 'xla' in str(x.device))
 
 
+# ─── Per-module NEURON COMPILE (ported from RF utils/_compile) ─────────────
+# RF compiles EACH VAE submodule (AttentionBlock, etc.) with fullgraph=True so it becomes
+# ONE fused NEFF. This is why RF's VAE decode is fast AND doesn't storm the compile service.
+# We previously compiled the WHOLE wrapper (torch.compile(self.vae._model)) — that only wraps
+# .forward(), but decode is called via .decode_stream() (a DIFFERENT method), so OptimizedModule
+# delegated it to the UNCOMPILED original → every VAE op ran eager → per-op compile-service
+# storm (bmm/mul/amax/exp/sum/div each a separate NEFF) → service died (errno=2). Compiling the
+# leaf module instead means self.decoder(x) hits a compiled NEFF regardless of the call path.
+_USE_VAE_COMPILE = os.environ.get("USE_VAE_COMPILE", "true").lower() in ("1", "true")
+
+
+def _vae_compile(mod_or_fn):
+    if not _USE_VAE_COMPILE:
+        return mod_or_fn
+    try:
+        return torch.compile(mod_or_fn, backend="neuron", dynamic=False, fullgraph=True)
+    except Exception as e:  # non-Neuron / no backend → run eager
+        print(f"[vae.py] _vae_compile skipped ({e})")
+        return mod_or_fn
+
+
 def _nki_conv2d_forward(weight, bias, x_2d, kernel_size, C_in, C_out, H, W, padding=0):
     """Run spatial conv2d via NKI kernel. x_2d is (BT, C, H, W)."""
     BT = x_2d.shape[0]
@@ -329,10 +350,12 @@ class ResidualBlock(nn.Module):
         return x + h
 
 
+@_vae_compile
 class AttentionBlock(nn.Module):
     """
     Causal self-attention with a single head.
-    Uses standard PyTorch ops (Conv2d + SDPA) which work in Neuron eager mode.
+    @_vae_compile: one fused NEFF (fullgraph=True, backend=neuron), like RF. The PyTorch
+    else-branch below MUST stay graph-break-free (no einops, no Python tiling loop).
     """
 
     def __init__(self, dim):
@@ -350,7 +373,8 @@ class AttentionBlock(nn.Module):
     def forward(self, x):
         identity = x
         b, c, t, h, w = x.size()
-        x = rearrange(x, 'b c t h w -> (b t) c h w')
+        # b c t h w -> (b t) c h w  (no einops: rearrange is a graph break under fullgraph)
+        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         x = self.norm(x)
 
         # Use NKI kernels if available and on Neuron
@@ -400,37 +424,30 @@ class AttentionBlock(nn.Module):
                 self.proj.weight, self.proj.bias,
                 x, kernel_size=1, C_in=c, C_out=c, H=h, W=w)
         else:
-            # PyTorch fallback
+            # PyTorch fallback — RF's EXACT one-shot manual attention (models/vae.py:82).
+            # Do NOT use F.scaled_dot_product_attention (its fused op CRASHES the Neuron
+            # compile service) and do NOT tile the query with a Python loop — a loop is a
+            # graph BREAK under fullgraph=True and forces the whole block back to eager
+            # (the per-op bmm/mul/amax/exp/sum/div storm that killed the service). One-shot
+            # matmul+softmax+matmul fuses into a single NEFF, exactly like RF.
             q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,
                                              -1).permute(0, 1, 3,
                                                          2).contiguous().chunk(
                                                              3, dim=-1)
-            # q,k,v: [BT, 1, seq, c]. Do NOT use F.scaled_dot_product_attention — its fused
-            # op (_scaled_dot_product_fused_attention_overrideable) CRASHES the Neuron
-            # compile service (errno) at these VAE shapes. RF (models/vae.py) uses MANUAL
-            # matmul + stable softmax + matmul instead — that's what compiles on Neuron.
-            # Tile the query dim to bound the score-matrix memory (non-causal -> exact).
+            # q,k,v: [BT, 1, seq, c]
             D = q.shape[-1]
             scale = D ** -0.5
-            seq_q = q.shape[2]
-            Q_CHUNK = 512
-            def _manual_attn(qi):
-                scores = torch.matmul(qi, k.transpose(-2, -1)) * scale
-                m = torch.amax(scores, dim=3, keepdim=True)
-                e = torch.exp(scores - m)
-                a = e / torch.sum(e, dim=3, keepdim=True)
-                return torch.matmul(a, v)
-            if seq_q > Q_CHUNK:
-                outs = []
-                for i in range(0, seq_q, Q_CHUNK):
-                    outs.append(_manual_attn(q[:, :, i:i + Q_CHUNK, :]))
-                x = torch.cat(outs, dim=2)
-            else:
-                x = _manual_attn(q)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            m = torch.amax(scores, dim=3, keepdim=True)
+            e = torch.exp(scores - m)
+            a = e / torch.sum(e, dim=3, keepdim=True)
+            x = torch.matmul(a, v)
             x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
             x = self.proj(x)
 
-        x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
+        # reshape (b t) c h w -> b c t h w  (no einops: rearrange is a graph break)
+        _, _c, _h, _w = x.shape
+        x = x.reshape(b, t, _c, _h, _w).permute(0, 2, 1, 3, 4)
         return x + identity
 
 
