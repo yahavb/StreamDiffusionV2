@@ -418,10 +418,16 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 prompt_embeds = torch.zeros(
                     batch_size, 512, 4096, dtype=dtype, device=device)
 
-            # Step 3: Broadcast embeddings WITHIN this DP group only.
+            # Step 3: Broadcast embeddings. SP mode = ONE stream: broadcast over the WORLD
+            # group (contiguous [0..15]) from the absolute t5_rank — the per-DP TP group is
+            # STRIDED under SP and can't be a broadcast group (src not in it / no_mesh).
+            # Non-SP: broadcast within this DP group's (contiguous) TP group.
             if dist.is_initialized():
-                from models.wan.tp_utils import get_tp_group
-                dist.broadcast(prompt_embeds, src=self.t5_rank, group=get_tp_group())
+                from models.wan.tp_utils import get_tp_group, get_world_group, get_sp_world_size
+                if get_sp_world_size() > 1:
+                    dist.broadcast(prompt_embeds, src=self.t5_rank, group=get_world_group())
+                else:
+                    dist.broadcast(prompt_embeds, src=self.t5_rank, group=get_tp_group())
 
             self.conditional_dict = {'prompt_embeds': prompt_embeds}
 
