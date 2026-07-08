@@ -155,10 +155,16 @@ class RMS_norm(nn.Module):
 class Upsample(nn.Upsample):
 
     def forward(self, x):
+        """Nearest-neighbor upsample. NO fp32 cast: nearest interpolation only COPIES
+        values (no arithmetic), so it's exact in bf16 — and the x.float() cast produced a
+        standalone aten::_to_copy on a large [1,384,120,224] fp32 tensor that the Neuron
+        compile service could not build at 480x896 (errno). Upsample directly in bf16.
         """
-        Fix bfloat16 support for nearest neighbor interpolation.
-        """
-        return super().forward(x.float()).type_as(x)
+        try:
+            return super().forward(x)
+        except Exception:
+            # fallback for any dtype the kernel rejects: cast, upsample, cast back
+            return super().forward(x.float()).type_as(x)
 
 
 class Resample(nn.Module):
