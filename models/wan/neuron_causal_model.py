@@ -153,6 +153,30 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
         assert context.size(1) == self.text_len
         context = self.text_embedding(context)
 
+        # SP: x is world-sharded to L/world tokens (a slice that can cut mid-frame), so the
+        # per-frame modulation is invalid on it. Pre-expand e0 [B,F,6,C] -> [B,6,shard_len,C]
+        # per-token for THIS rank's exact token slice (RF dit_model.py:199-211). The block
+        # then uses per-token modulation (sp_sharded=True). Without this the modulation lands
+        # on the wrong tokens -> "utter noise" despite the attention math being correct.
+        sp_sharded = False
+        if _sp_active:
+            from models.wan.neuron_layers import expand_e_shard
+            frame_seqlen = grid_sizes[1] * grid_sizes[2]
+            L_full = e0.shape[1] * frame_seqlen  # num_frames * frame_seqlen
+            shard_len_e = L_full // _world0
+            # e-token shard MUST cover the SAME token range as the x shard above, else
+            # modulation lands on the wrong tokens. L_full (from grid) == L (x seq) here.
+            assert shard_len_e == _shard, \
+                f"e-shard {shard_len_e} != x-shard {_shard} (L_full={L_full} L={L})"
+            sp_start = _wrank0 * shard_len_e
+            sp_end = sp_start + shard_len_e
+            start_frame = sp_start // frame_seqlen
+            end_frame = (sp_end - 1) // frame_seqlen + 1
+            start_off = sp_start - start_frame * frame_seqlen
+            e0 = expand_e_shard(e0, start_frame, end_frame, start_off,
+                                shard_len_e, frame_seqlen)
+            sp_sharded = True
+
         kwargs = dict(
             e=e0, grid_sizes=grid_sizes,
             freqs_cos=self.freqs_cos, freqs_sin=self.freqs_sin,
@@ -162,6 +186,7 @@ class NeuronCausalWanModel(ModelMixin, ConfigMixin):
             shared_buffers=shared_buffers,
             mode=mode, cache_update_start=cache_update_start,
             cu_shared_buffers=cu_shared_buffers, nfpb_cu=nfpb_cu,
+            sp_sharded=sp_sharded,
         )
 
         # Activation checkpointing is handled by FSDP's apply_activation_checkpointing

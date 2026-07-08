@@ -315,6 +315,36 @@ def modulated_residual(x, y, scale, num_frames, frame_seqlen):
     return x + (y.unflatten(1, (num_frames, frame_seqlen)) * scale).flatten(1, 2)
 
 
+# ── SP per-TOKEN modulation (ported verbatim from RF dit_attention.py:38-57) ──────────
+# Under sequence parallelism x is sharded to L/world tokens, and that shard can cut
+# MID-frame (start_off != 0). The per-frame modulation path (unflatten tokens into whole
+# (num_frames, frame_seqlen) blocks) is therefore INVALID for a sharded x. RF instead
+# pre-expands the timestep embedding e from per-frame [B,F,6,C] to per-TOKEN [B,6,shard_len,C]
+# for this rank's exact token slice, and modulates per token (no unflatten). self.modulation
+# (the per-block learned bias [1,6,C]) stays SEPARATE and broadcasts — only e is expanded.
+def expand_e_shard(e, start_frame, end_frame, start_off, shard_len, frame_seqlen):
+    """e: [B,F,6,C] per-frame -> [B,6,shard_len,C] per-token for this rank's slice."""
+    B, _, I, C = e.shape                                      # I == 6
+    F_sub = end_frame - start_frame
+    e_sub = e[:, start_frame:end_frame]                       # [B,F_sub,6,C]
+    e_t = e_sub.transpose(1, 2)                               # [B,6,F_sub,C]
+    e_exp = e_t.unsqueeze(3).expand(B, I, F_sub, frame_seqlen, C).reshape(
+        B, I, F_sub * frame_seqlen, C)                        # [B,6,F_sub*fsl,C]
+    return e_exp[:, :, start_off:start_off + shard_len]       # [B,6,shard_len,C]
+
+
+def modulated_norm_scale_shard(norm_x, mod_slice, e_slice, ones):
+    return norm_x * (ones + (mod_slice + e_slice))
+
+
+def modulated_norm_shift_shard(y, mod_slice, e_slice):
+    return y + (mod_slice + e_slice)
+
+
+def modulated_residual_shard(x, y, mod_slice, e_slice):
+    return x + y * (mod_slice + e_slice)
+
+
 def causal_head_modulate(x, e, modulation):
     e = modulation.unsqueeze(1) + e
     e_shift = e[:, :, 0:1]
@@ -821,7 +851,33 @@ class CausalWanAttentionBlock(nn.Module):
                 crossattn_cache=None, current_start=0, cache_start=None,
                 num_valid_frames=None, shared_buffers=None,
                 mode="denoise", cache_update_start=None,
-                cu_shared_buffers=None, nfpb_cu=None):
+                cu_shared_buffers=None, nfpb_cu=None, sp_sharded=False):
+        if sp_sharded:
+            # SP: e arrives PRE-EXPANDED per-token [B,6,shard_len,C] (RF expand_e_shard);
+            # self.modulation [1,6,C] stays separate and broadcasts. No unflatten (the
+            # world-shard of x can cut mid-frame, so per-frame reshape is invalid). This
+            # mirrors RF dit_attention.py forward() lines 669-720 exactly.
+            e0s, e1s, e2s, e3s, e4s, e5s = (
+                e[:, 0], e[:, 1], e[:, 2], e[:, 3], e[:, 4], e[:, 5])
+            m0, m1, m2, m3, m4, m5 = (
+                self.modulation[:, 0], self.modulation[:, 1], self.modulation[:, 2],
+                self.modulation[:, 3], self.modulation[:, 4], self.modulation[:, 5])
+            ones_shard = torch.ones_like(e0s)
+            attn_in = modulated_norm_shift_shard(
+                modulated_norm_scale_shard(self.norm1(x), m1, e1s, ones_shard), m0, e0s)
+            y = self.self_attn.forward_merged(
+                attn_in, grid_sizes, freqs_cos, freqs_sin, kv_cache,
+                cache_update_start, current_start,
+                cu_shared_buffers, shared_buffers,
+                num_valid_frames_dn=num_valid_frames, nfpb_cu=nfpb_cu)
+            x = modulated_residual_shard(x, y, m2, e2s)
+            x = x + self.cross_attn(self.norm3(x), context, context_lens,
+                                    crossattn_cache=crossattn_cache)
+            y = self.ffn(modulated_norm_shift_shard(
+                modulated_norm_scale_shard(self.norm2(x), m4, e4s, ones_shard), m3, e3s))
+            x = modulated_residual_shard(x, y, m5, e5s)
+            return x
+
         num_frames = e.shape[1]
         frame_seqlen = x.shape[1] // num_frames
         e0, e1, e2, e3, e4, e5 = self._modulation_chunk(self.modulation, e)
