@@ -510,9 +510,12 @@ def shard_model_tp(model, tp_rank: int, tp_degree: int):
         import os as _os
         _sp_mode = int(_os.environ.get("SP_DEGREE", "1")) > 1
         if _sp_mode:
-            # q/k/v/norms FULL; only o sharded (row-parallel).
-            self_attn.o = shard_linear_row(self_attn.o, tp_rank, tp_degree)
-            # num_heads stays full; mark that this attn runs merged/full-qkv.
+            # SP: self-attn stays FULLY UNSHARDED (q/k/v/o/norms all full, all 12 heads).
+            # Each rank runs the complete attention on its WORLD-shard of tokens (L/world),
+            # gathering full K/V. NO TP head-split, so NO o all-reduce/reduce_scatter (which
+            # would wrongly sum across ranks holding DIFFERENT token shards -> noise).
+            # Proven == plain full attention by test_merged_attn (max_diff 0). Sequence
+            # parallelism alone (world-shard + gather) provides the split; TP is unused here.
             self_attn._sp_full_qkv = True
         else:
             # Q, K, V: column-parallel (split output dim = split heads)

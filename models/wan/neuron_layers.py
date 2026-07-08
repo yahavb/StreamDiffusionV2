@@ -748,12 +748,9 @@ class CausalWanSelfAttention(nn.Module):
             kf = k.view(1, s_full, n_full, d)
             vf = v.view(1, s_full, n_full, d)
 
-        # (3) slice OUR heads (tp_rank), RoPE on the full frame-aligned grid
-        hpr = n_full // tpw
-        hs, he = tp_rank * hpr, (tp_rank + 1) * hpr
-        qf = qf[:, :, hs:he, :].contiguous()
-        kf = kf[:, :, hs:he, :].contiguous()
-        vf = vf[:, :, hs:he, :].contiguous()
+        # (3) NO head slicing — this rank runs ALL heads (SP: attn fully unsharded, TP
+        # unused inside attention). RoPE on the full frame-aligned grid.
+        hpr = n_full   # all heads
         sf_t = torch.tensor(current_start // frame_seqlen, device=x.device)
         rq_full = self._nki_rope_apply(qf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
         rk_full = self._nki_rope_apply(kf, grid_sizes, freqs_cos, freqs_sin, start_frame=sf_t)
@@ -787,7 +784,7 @@ class CausalWanSelfAttention(nn.Module):
             attn_out = F.scaled_dot_product_attention(
                 rq.permute(0, 2, 1, 3), rk_full.permute(0, 2, 1, 3), vf.permute(0, 2, 1, 3))
             out = attn_out.permute(0, 2, 1, 3).flatten(2)
-        # (5) o is RowParallel over the contiguous TP group -> all-reduce combines heads
+        # (5) o is a FULL Linear (all heads present) — no TP reduce needed.
         return self.o(out)
 
 
