@@ -405,7 +405,20 @@ class AttentionBlock(nn.Module):
                                              -1).permute(0, 1, 3,
                                                          2).contiguous().chunk(
                                                              3, dim=-1)
-            x = F.scaled_dot_product_attention(q, k, v)
+            # q,k,v: [BT, 1, seq, c]. At 480x896 the bottleneck seq=6720 -> a single SDPA
+            # materializes a 6720x6720 score matrix that the Neuron compiler can't build
+            # (errno). Tile the QUERY dim (attend each block to ALL keys — non-causal, so
+            # exact) so no op exceeds Q_CHUNK x seq. Same result, bounded memory.
+            seq_q = q.shape[2]
+            Q_CHUNK = 2048
+            if seq_q > Q_CHUNK:
+                outs = []
+                for i in range(0, seq_q, Q_CHUNK):
+                    qi = q[:, :, i:i + Q_CHUNK, :]
+                    outs.append(F.scaled_dot_product_attention(qi, k, v))
+                x = torch.cat(outs, dim=2)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v)
             x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
             x = self.proj(x)
 
