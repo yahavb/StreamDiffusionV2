@@ -373,11 +373,17 @@ spec:
             # to compile (ConnectToService errno=2). Keep off -> plain-PyTorch VAE decode.
             - name: USE_NKI_VAE
               value: "0"
-            # ORIGINAL full-quality WAN VAE (USE_RF_VAE=0). The 480p aten::cat crash is now
-            # FIXED in modules/vae.py decode() (list + single cat, not per-frame growing cat).
-            # RF-VAE port was the blur suspect; use the real VAE to get RF-quality decode.
+            # USE_RF_VAE=1: the ported rolling_forcing VAE (modules/vae_rf.py), fully
+            # @_compile'd PER-SUBMODULE (SiLU/RMS_norm/Upsample/ResidualBlock/AttentionBlock
+            # + conv cores) — one NEFF each, no eager per-op storm. The monolithic vae.py
+            # only had AttentionBlock compiled -> the OTHER modules (conv/norm/silu/resample)
+            # still ran eager -> 168-op storm killed the compile service (errno=111) right
+            # after the 821s DiT run. vae_rf.py is RF's proven-working decoder; per-frame
+            # cached decode (batch_frames=False) keeps every tensor at a shape that compiles.
+            # The old "RF-VAE = blur suspect" is OBSOLETE: the blur was the DiT (fixed by the
+            # SP e-shard). A decoder cannot reintroduce geometric blur.
             - name: USE_RF_VAE
-              value: "0"
+              value: "1"
             # USE_VAE_COMPILE=1: compile the VAE (torch.compile neuron) like RF (@_compile
             # on every VAE module). EAGER VAE dispatches HUNDREDS of per-op compile-service
             # calls after the 800s DiT run -> service crashes (errno 111/2, ALL vae ops fail).
