@@ -155,15 +155,20 @@ class RMS_norm(nn.Module):
 class Upsample(nn.Upsample):
 
     def forward(self, x):
-        """Nearest-neighbor upsample. NO fp32 cast: nearest interpolation only COPIES
-        values (no arithmetic), so it's exact in bf16 — and the x.float() cast produced a
-        standalone aten::_to_copy on a large [1,384,120,224] fp32 tensor that the Neuron
-        compile service could not build at 480x896 (errno). Upsample directly in bf16.
+        """Nearest-neighbor spatial upsample. F.interpolate (both fp32 _to_copy AND bf16
+        nearest, which lowers to aten::mul) fails to compile on Neuron at 480x896 sizes.
+        Nearest 2x upsample is just each pixel repeated 2x2 -> implement with
+        repeat_interleave (pure gather/copy, NO interpolate, NO mul). Matches scale_factor
+        (2,2) exactly. Falls back to the original interpolate for non-2x/unknown configs.
         """
+        sf = self.scale_factor
+        s = sf[0] if isinstance(sf, (tuple, list)) else sf
+        if s is not None and float(s) == 2.0 and x.dim() == 4:
+            # x: [N, C, H, W] -> repeat each spatial pixel 2x2 (nearest)
+            return x.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
         try:
             return super().forward(x)
         except Exception:
-            # fallback for any dtype the kernel rejects: cast, upsample, cast back
             return super().forward(x.float()).type_as(x)
 
 
