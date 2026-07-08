@@ -405,27 +405,28 @@ class AttentionBlock(nn.Module):
                                              -1).permute(0, 1, 3,
                                                          2).contiguous().chunk(
                                                              3, dim=-1)
-            # q,k,v: [BT, 1, seq, c]. At 480x896 the bottleneck seq=6720 -> a single SDPA
-            # materializes a 6720x6720 score matrix that the Neuron compiler can't build
-            # (errno). Tile the QUERY dim (attend each block to ALL keys — non-causal, so
-            # exact) so no op exceeds Q_CHUNK x seq. Same result, bounded memory.
+            # q,k,v: [BT, 1, seq, c]. Do NOT use F.scaled_dot_product_attention — its fused
+            # op (_scaled_dot_product_fused_attention_overrideable) CRASHES the Neuron
+            # compile service (errno) at these VAE shapes. RF (models/vae.py) uses MANUAL
+            # matmul + stable softmax + matmul instead — that's what compiles on Neuron.
+            # Tile the query dim to bound the score-matrix memory (non-causal -> exact).
+            D = q.shape[-1]
+            scale = D ** -0.5
             seq_q = q.shape[2]
-            Q_CHUNK = 512   # small + FIXED query-block shape: 2048x6720 scores still
-                            # failed to compile; 512 keeps each op small and one reused NEFF.
+            Q_CHUNK = 512
+            def _manual_attn(qi):
+                scores = torch.matmul(qi, k.transpose(-2, -1)) * scale
+                m = torch.amax(scores, dim=3, keepdim=True)
+                e = torch.exp(scores - m)
+                a = e / torch.sum(e, dim=3, keepdim=True)
+                return torch.matmul(a, v)
             if seq_q > Q_CHUNK:
                 outs = []
                 for i in range(0, seq_q, Q_CHUNK):
-                    qi = q[:, :, i:i + Q_CHUNK, :]
-                    # pad the LAST (ragged) block up to Q_CHUNK so every op has the SAME
-                    # shape -> one NEFF compiled once, not a new one per odd size.
-                    pad = Q_CHUNK - qi.shape[2]
-                    if pad > 0:
-                        qi = F.pad(qi, (0, 0, 0, pad))
-                    oi = F.scaled_dot_product_attention(qi, k, v)
-                    outs.append(oi[:, :, :Q_CHUNK - pad, :] if pad > 0 else oi)
+                    outs.append(_manual_attn(q[:, :, i:i + Q_CHUNK, :]))
                 x = torch.cat(outs, dim=2)
             else:
-                x = F.scaled_dot_product_attention(q, k, v)
+                x = _manual_attn(q)
             x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
             x = self.proj(x)
 
