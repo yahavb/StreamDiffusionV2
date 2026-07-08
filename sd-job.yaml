@@ -318,9 +318,11 @@ spec:
                                                                    # render real video at 1-STEP (STEPS=0)? If noise,
                                                                    # 1-step is impossible for 1.3B -> must go 2-step.
             - name: HEIGHT
-              value: "480"          # SP needs frame_seq % 16 == 0: 480x896 -> latent 60x112 ->
+              value: "320"          # SP-valid + LIGHTER: 320x576 -> latent 40x72 -> frame_seq 720
             - name: WIDTH
-              value: "896"          # patch2 30x56 -> frame_seq 1680 (/16=105 ✓). 640 (1560) fails.
+              value: "576"          # (/16=45 ✓). VAE attn over 2880 tokens (vs 6720 at 480x896) ->
+                                    # far smaller NEFFs so the compile service survives (errno=2 was
+                                    # the service dying under the 480x896 compile load, not op size).
             - name: WARP
               value: "1"            # RF repro: warp_denoising_step=true
             - name: TIMESTEP_SHIFT
