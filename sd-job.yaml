@@ -378,11 +378,13 @@ spec:
             # RF-VAE port was the blur suspect; use the real VAE to get RF-quality decode.
             - name: USE_RF_VAE
               value: "0"
-            # 480p REQUIRES VAE eager: USE_VAE_COMPILE=1 reintroduced the aten::cat
-            # ConnectToService crash AND gave no speedup (VAE still ~4.4s/block).
-            # Tested in step1 (sd-21) — keep eager.
+            # USE_VAE_COMPILE=1: compile the VAE (torch.compile neuron) like RF (@_compile
+            # on every VAE module). EAGER VAE dispatches HUNDREDS of per-op compile-service
+            # calls after the 800s DiT run -> service crashes (errno 111/2, ALL vae ops fail).
+            # Compiled = a few NEFFs, no per-op service storm. The old aten::cat crash that
+            # forced eager is now FIXED (decode list-cat, upsample repeat_interleave, attn tiling).
             - name: USE_VAE_COMPILE
-              value: "0"
+              value: "1"
             - name: USE_TORCH_COMPILE
               value: "true"
             - name: NEURON_COMPILE_BACKEND
