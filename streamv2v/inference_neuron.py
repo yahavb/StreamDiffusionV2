@@ -236,6 +236,33 @@ def run_inference(pipeline, args, config, verbose=False):
     # across blocks (clear once here, NOT per block — per-block clearing softens output).
     pipeline.reset_decode_stream()
 
+    # ─── VAE WARMUP (HYPOTHESIS, not yet proven) ────────────────────────────────────
+    # Every prior run died in VAE decode with ConnectToService errno=2/111 = the Neuron
+    # compile SERVICE process is dead by VAE time. The one variable that differs from RF's
+    # WORKING setup: RF (serve.py:405 warmup) compiles the VAE right after load, while the
+    # service is fresh; our one-shot job compiles it only AFTER the ~800s cold DiT run, by
+    # which point the service socket is gone. So: compile the VAE NEFFs HERE, before the DiT
+    # run, with dummy decodes at the EXACT real shapes. Decode 2 blocks so BOTH NEFF families
+    # compile: chunk_idx=0 (first_chunk) AND chunk_idx>0 (the cache-reuse aten::cat that
+    # crashed). Then reset the stream so the real decode below hits warm NEFFs (cache HIT =
+    # no compile-service call). Gated by USE_VAE_WARMUP (default on) so it's easy to A/B.
+    if os.environ.get("USE_VAE_WARMUP", "1").lower() in ("1", "true"):
+        t_warm = time.perf_counter()
+        LOGGER.info("[vae-warmup] compiling VAE NEFFs before DiT run (service still fresh)...")
+        try:
+            for _wb in range(2):  # chunk 0 (first_chunk) + chunk 1 (cache-reuse cat NEFFs)
+                dummy = torch.randn(1, num_frame_per_block, 16,
+                                    args.height // 8, args.width // 8,
+                                    dtype=dtype, device=device)
+                _ = pipeline.decode_latents(dummy)
+                if hasattr(torch, 'neuron'):
+                    torch.neuron.synchronize()
+            LOGGER.info(f"[vae-warmup] done in {(time.perf_counter()-t_warm):.1f}s "
+                        f"— VAE NEFFs cached")
+        except Exception as e:
+            LOGGER.warning(f"[vae-warmup] failed ({e}) — continuing; real decode will compile")
+        pipeline.reset_decode_stream()  # clear cache + chunk_idx so real decode starts clean
+
     # ─── ROLLING-WINDOW path (RF-faithful co-denoise) ───────────────────────────────
     # USE_ROLLING_WINDOW=1: denoise the WHOLE clip with RF's sliding-window co-denoise
     # (generate_rolling_window), then VAE-decode block-by-block. This replaces the
