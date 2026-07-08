@@ -721,7 +721,8 @@ class CausalWanSelfAttention(nn.Module):
         f_full, h, w = grid_sizes
         frame_seqlen = h * w
         wg = get_world_group()
-        world = _d.get_world_size(wg)
+        _distributed = _d.is_available() and _d.is_initialized() and wg is not None
+        world = _d.get_world_size(wg) if _distributed else 1
         sp_rank, spw = get_sp_rank(), get_sp_world_size()
         tp_rank, tpw = get_tp_rank(), get_tp_world_size()
 
@@ -732,15 +733,20 @@ class CausalWanSelfAttention(nn.Module):
         # (2) all-gather over WORLD (contiguous). x was world-sharded (each rank holds
         # L/world unique tokens), so gathering over world reconstructs the FULL seq
         # directly — NO dedup (every shard is unique). world rank order = row order.
-        wrank = _d.get_rank(wg)
+        wrank = _d.get_rank(wg) if _distributed else 0
         s_full = world * s_local           # = L (full window)
-        def _gather_world(t):
-            out = torch.empty(s_full, n_full * d, dtype=t.dtype, device=t.device)
-            _d.all_gather_into_tensor(out, t.contiguous(), group=wg)
-            return out
-        qf = _gather_world(q).view(1, s_full, n_full, d)
-        kf = _gather_world(k).view(1, s_full, n_full, d)
-        vf = _gather_world(v).view(1, s_full, n_full, d)
+        if _distributed and world > 1:
+            def _gather_world(t):
+                out = torch.empty(s_full, n_full * d, dtype=t.dtype, device=t.device)
+                _d.all_gather_into_tensor(out, t.contiguous(), group=wg)
+                return out
+            qf = _gather_world(q).view(1, s_full, n_full, d)
+            kf = _gather_world(k).view(1, s_full, n_full, d)
+            vf = _gather_world(v).view(1, s_full, n_full, d)
+        else:
+            qf = q.view(1, s_full, n_full, d)
+            kf = k.view(1, s_full, n_full, d)
+            vf = v.view(1, s_full, n_full, d)
 
         # (3) slice OUR heads (tp_rank), RoPE on the full frame-aligned grid
         hpr = n_full // tpw
