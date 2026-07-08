@@ -410,12 +410,19 @@ class AttentionBlock(nn.Module):
             # (errno). Tile the QUERY dim (attend each block to ALL keys — non-causal, so
             # exact) so no op exceeds Q_CHUNK x seq. Same result, bounded memory.
             seq_q = q.shape[2]
-            Q_CHUNK = 2048
+            Q_CHUNK = 512   # small + FIXED query-block shape: 2048x6720 scores still
+                            # failed to compile; 512 keeps each op small and one reused NEFF.
             if seq_q > Q_CHUNK:
                 outs = []
                 for i in range(0, seq_q, Q_CHUNK):
                     qi = q[:, :, i:i + Q_CHUNK, :]
-                    outs.append(F.scaled_dot_product_attention(qi, k, v))
+                    # pad the LAST (ragged) block up to Q_CHUNK so every op has the SAME
+                    # shape -> one NEFF compiled once, not a new one per odd size.
+                    pad = Q_CHUNK - qi.shape[2]
+                    if pad > 0:
+                        qi = F.pad(qi, (0, 0, 0, pad))
+                    oi = F.scaled_dot_product_attention(qi, k, v)
+                    outs.append(oi[:, :, :Q_CHUNK - pad, :] if pad > 0 else oi)
                 x = torch.cat(outs, dim=2)
             else:
                 x = F.scaled_dot_product_attention(q, k, v)
