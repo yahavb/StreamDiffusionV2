@@ -372,20 +372,18 @@ spec:
             - name: INPUT_VIDEO_SRC
               value: ""
             # 1.3B student caps at TP-4 (12 heads). Single stream: NPROC==TP_DEGREE==4.
-            # ── CLEAN CONTROL (isolate the noise): SP OFF ────────────────────────────
-            # Crash is fixed but output is pure noise. Schedule + x0-return proven correct
-            # vs RF. Only untested-for-CORRECTNESS piece = the SP merged attention across 16
-            # ranks. SP_DEGREE=1 runs the SAME rolling-window loop through the KNOWN-GOOD
-            # regular "denoise" attention (mode!="merged"), head-shard only, no sequence
-            # shard. If this is SHARP -> bug is the SP merged path. If also noise -> bug is
-            # the rolling-window loop itself. Small clip so single-stream doesn't OOM.
-            # (Revert to NPROC=16/SP_DEGREE=4 after this diagnostic.)
+            # SP ON — the config merged co-denoise is built for. The SP-off control PROVED
+            # SP is not a SEPARATE bug (loop gave noise there too), and revealed the real gap:
+            # our loop dropped RF's cross-block context mechanism (phase>=1 prepends the prev
+            # window's first block as clean context, run in mode="merged"). Merged attention
+            # all-gathers q/k/v over WORLD and needs the SP-mode FULL (unsharded) q/k/v — so
+            # it requires SP_DEGREE>1. Loop now re-ported faithfully to RF _run; test it here.
             - name: NPROC
-              value: "4"             # TP4 only, single stream (no SP)
+              value: "16"            # SP: world = TP4 x SP4 = 16 ranks (one stream)
             - name: TP_DEGREE
               value: "4"             # head shard (1.3B: 12 heads, TP-4)
             - name: SP_DEGREE
-              value: "1"             # SP OFF -> rolling-window uses regular denoise attention
+              value: "4"             # sequence shard (rolling-window merged co-denoise)
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS

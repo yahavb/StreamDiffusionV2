@@ -286,6 +286,9 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         # the per-frame timesteps for each window phase. Built once here; the loop uses them.
         self.timestep_patterns = self._build_timestep_patterns()   # [num_patterns, max_frames]
         self.sigma_patterns = self._build_sigma_patterns()
+        # Clean "context block" noise level (RF context_noise, default 0 = fully clean). The
+        # prev window's first block is fed back at this timestep as cross-block context.
+        self.context_noise = float(getattr(args, "context_noise", 0.0))
 
         # State
         self.conditional_dict = None
@@ -293,6 +296,7 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         self.crossattn_cache = None
         self.hidden_states = None
         self.shared_buffers = None
+        self.cu_shared_buffers = None
         self.args = args
 
         LOGGER.info("NeuronCausalStreamInferencePipeline initialized "
@@ -371,6 +375,15 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         # Round up to ATTN_SEQLEN_MULTIPLE for NKI
         padded = ((max_attn_size + ATTN_SEQLEN_MULTIPLE - 1)
                   // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+        # dn buffers = the window's K/V; cu buffers = the prepended clean context block's
+        # K/V. RF keeps these SEPARATE (dit_pipeline: dn_buffers vs cu_buffers) — sharing one
+        # pair lets the context-block write clobber the window read. Allocate both.
+        self.cu_shared_buffers = (
+            torch.zeros([batch_size, padded, self.num_heads_per_rank, self.head_dim],
+                        dtype=dtype, device=device),
+            torch.zeros([batch_size, padded, self.num_heads_per_rank, self.head_dim],
+                        dtype=dtype, device=device),
+        )
         self.shared_buffers = (
             torch.zeros([batch_size, padded, self.num_heads_per_rank, self.head_dim],
                         dtype=dtype, device=device),
@@ -663,44 +676,76 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         noisy_cache = torch.zeros([b, num_frames + max_frames, C, H, W], dtype=dtype, device=device)
         output = torch.zeros([b, num_frames + max_frames - nfpb, C, H, W], dtype=dtype, device=device)
 
+        # RF _run is a FIXED-shape loop: every phase feeds a max_frames-wide padded window
+        # (num_valid_frames marks the real ones), and phase>=1 PREPENDS the previous window's
+        # first block as a CLEAN context block (at context_noise) run in mode="merged" so the
+        # window co-attends to it — this cross-block co-denoise is RF's actual sharpness
+        # mechanism. Our earlier port dropped it (SP-off used plain denoise; SP-on used merged
+        # WITHOUT the context block) -> pure noise both ways. This mirrors _run faithfully.
+        from models.wan.tp_utils import get_sp_world_size
+        _sp = get_sp_world_size() > 1
+
+        # persistent scratch (RF pre-allocates; we reuse across phases)
+        prev_first_block = torch.zeros([b, nfpb, C, H, W], dtype=dtype, device=device)
+        ctx_ts = int(round(self.context_noise))
+
         for phase in range(window_num):
             sb, eb = win_start[phase], win_end[phase]
             cur_start_f = sb * nfpb
             cur_end_f = (eb + 1) * nfpb
             cur_nf = cur_end_f - cur_start_f
 
-            # assemble this window's input: prior partially-denoised frames + fresh noise
-            # for the newest block (RF copies noise into the tail slot).
+            # padded window input: max_frames wide, only [:cur_nf] valid (RF padded_input).
             win_in = noisy_cache[:, cur_start_f:cur_start_f + max_frames].clone()
             if cur_nf == max_frames or cur_start_f == 0:
                 off = cur_nf - nfpb
                 win_in[:, off:off + nfpb] = noise[:, cur_end_f - nfpb:cur_end_f]
 
-            # per-frame timesteps for this phase (diagonal); slice to the active frames
-            ts_full = self.timestep_patterns[pat_idx[phase]]         # [max_frames]
-            ts = ts_full[:cur_nf].to(torch.int64).unsqueeze(0)        # [1, cur_nf]
-
-            active = win_in[:, :cur_nf].contiguous()
+            ts_full = self.timestep_patterns[pat_idx[phase]]          # [max_frames]
             self._reset_kv_indices()
-            # SP merged mode (global co-attention over the window) when SP is active;
-            # else fall back to per-block denoise attention.
-            from models.wan.tp_utils import get_sp_world_size
-            _merged = get_sp_world_size() > 1
-            denoised = self.generator(
-                noisy_image_or_video=active,
-                conditional_dict=self.conditional_dict,
-                timestep=ts,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=cur_start_f * fseq,
-                current_end=cur_end_f * fseq,
-                updating_cache=True,
-                shared_buffers=self.shared_buffers,
-                mode=("merged" if _merged else "denoise"),
-                cache_update_start=(cur_start_f * fseq if _merged else None),
-                cu_shared_buffers=(self.shared_buffers if _merged else None),
-                nfpb_cu=(nfpb if _merged else None),
-            )
+
+            if phase >= 1:
+                # prepend the prev window's first (most-denoised) block as clean context and
+                # co-denoise the window against it via merged attention (RF phase>=1 branch).
+                x_full = torch.cat([prev_first_block, win_in[:, :cur_nf]], dim=1).contiguous()
+                ts_full_in = torch.cat([
+                    torch.full([1, nfpb], ctx_ts, dtype=torch.int64, device=device),
+                    ts_full[:cur_nf].to(torch.int64).unsqueeze(0)], dim=1)
+                cu_start_block = win_start[phase - 1]
+                pred_full = self.generator(
+                    noisy_image_or_video=x_full,
+                    conditional_dict=self.conditional_dict,
+                    timestep=ts_full_in,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=cur_start_f * fseq,
+                    updating_cache=True,
+                    num_valid_frames=cur_nf,
+                    shared_buffers=self.shared_buffers,
+                    mode="merged",
+                    cache_update_start=cu_start_block * nfpb * fseq,
+                    cu_shared_buffers=self.cu_shared_buffers,
+                    nfpb_cu=nfpb,
+                )
+                denoised = pred_full[:, nfpb:]           # drop the context block
+            else:
+                ts = ts_full[:cur_nf].to(torch.int64).unsqueeze(0)
+                denoised = self.generator(
+                    noisy_image_or_video=win_in[:, :cur_nf].contiguous(),
+                    conditional_dict=self.conditional_dict,
+                    timestep=ts,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=cur_start_f * fseq,
+                    updating_cache=True,
+                    num_valid_frames=cur_nf,
+                    shared_buffers=self.shared_buffers,
+                    mode="denoise",
+                )
+
+            # carry this window's first block forward as next phase's clean context
+            if phase < window_num - 1:
+                prev_first_block = denoised[:, :nfpb].detach().clone()
 
             output[:, cur_start_f:cur_start_f + cur_nf] = denoised
 
@@ -712,7 +757,6 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 if step_index >= nds - 1:
                     continue  # fully denoised block — no renoise
                 blk = denoised[:, local * nfpb:(local + 1) * nfpb].flatten(0, 1)
-                sig_next = block_sigma[step_index + 1]
                 renoised = self.scheduler.add_noise(
                     blk, torch.randn_like(blk),
                     self.denoising_step_list[step_index + 1] * torch.ones(
