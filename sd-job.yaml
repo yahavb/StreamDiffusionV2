@@ -126,8 +126,23 @@ spec:
               echo "RUN_DIR=$RUN_DIR  (final -> $FINAL_DIR)"
               exec > >(tee "$RUN_DIR/run.log") 2>&1
 
+              # NEFF cache lives on LOCAL /tmp (POSIX, fast). /var/mdl is S3 — NEVER point
+              # the live high-frequency cache there. But persist it ACROSS runs by tar'ing
+              # to/from /var/mdl once (bulk cp, off critical path). A shape compiled ONCE in
+              # any prior run becomes a permanent cache HIT here -> real decode reads the .neff
+              # from disk, no compile-service call, so service death at decode stops mattering.
+              # This is the robust fix for the flaky VAE errno=2 (warmup can't cover NEFFs
+              # whose exact stride/layout only exists post-generate_rolling_window).
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
               mkdir -p /tmp/neff_cache
+              NEFF_CACHE_TAR="/var/mdl/stream_diffusion/neff_cache_${HEIGHT:-320}x${WIDTH:-576}_sp${SP_DEGREE:-1}.tar"
+              if [ -f "$NEFF_CACHE_TAR" ]; then
+                echo "=== restoring NEFF cache from $NEFF_CACHE_TAR ==="
+                cp "$NEFF_CACHE_TAR" /tmp/nc.tar && tar xf /tmp/nc.tar -C /tmp/neff_cache && rm -f /tmp/nc.tar
+                echo "  restored $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs"
+              else
+                echo "=== no NEFF cache tar yet ($NEFF_CACHE_TAR) — cold compile, will save at end ==="
+              fi
 
               # ─── stage the v2v input video from S3 (INPUT_VIDEO_SRC) to LOCAL /tmp ───
               # NEVER read the input from /var/mdl on the critical path (S3-backed, slow,
@@ -247,6 +262,13 @@ spec:
               # under inspect instrumentation and OOM'd a core (878MB on NC4) last run.
               if [ -n "${GENERATOR_CKPT:-}" ]; then
                 echo "=== [profiler] SKIPPED (validate-distilled run — just need the video) ==="
+                # persist NEFF cache (bulk cp to /var/mdl, off critical path) so the NEXT run
+                # is a cache hit and real decode never depends on the compile service surviving.
+                echo "=== saving NEFF cache -> $NEFF_CACHE_TAR ($(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs) ==="
+                mkdir -p "$(dirname "$NEFF_CACHE_TAR")"
+                tar cf /tmp/nc_out.tar -C /tmp/neff_cache . 2>/dev/null \
+                  && cp /tmp/nc_out.tar "$NEFF_CACHE_TAR" && rm -f /tmp/nc_out.tar \
+                  && echo "  saved" || echo "  NEFF cache save failed (non-fatal)"
                 echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
                 mkdir -p "$FINAL_DIR"; cp -r "$RUN_DIR"/. "$FINAL_DIR"/ 2>&1 || echo "copy failed"
                 echo "=== DONE. VALIDATE THE VIDEOS: $FINAL_DIR/pancake*.mp4 (in-distribution prompt, branch exp/fps-1.3b @ $GIT_SHA) ==="
@@ -285,6 +307,16 @@ spec:
               done
               echo "step5 pairs: $(ls "$PAIRS"/*.neff 2>/dev/null | wc -l)"
               bash scripts/neuron/run_dma_analysis.sh "$PAIRS" 2>&1 | tee "$PROF_DIR/dma_analysis.txt" || echo "DMA analysis failed (non-fatal)"
+
+              # ─── persist the NEFF cache to /var/mdl (bulk cp, off critical path) ───
+              # Save whatever compiled this run so the NEXT run is a cache hit. Merges over
+              # runs: cold run seeds it, later runs top it up with any new shapes. Self-heals
+              # the flaky VAE errno within 1-2 runs.
+              echo "=== saving NEFF cache -> $NEFF_CACHE_TAR ($(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs) ==="
+              mkdir -p "$(dirname "$NEFF_CACHE_TAR")"
+              tar cf /tmp/nc_out.tar -C /tmp/neff_cache . 2>/dev/null \
+                && cp /tmp/nc_out.tar "$NEFF_CACHE_TAR" && rm -f /tmp/nc_out.tar \
+                && echo "  saved" || echo "  NEFF cache save failed (non-fatal)"
 
               # ─── copy the WHOLE local run folder to /var/mdl ONCE, off critical path ───
               echo "=== copying $RUN_DIR -> $FINAL_DIR (S3, end of job) ==="
