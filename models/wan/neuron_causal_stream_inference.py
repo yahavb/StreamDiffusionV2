@@ -742,6 +742,14 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         the latents to the VAE-TP group first. Only vae_rank returns the video
         (all ranks compute the full output via all-reduce, but we keep one copy).
         """
+        # Force contiguous: the real decode passes latents[:, b:b+nfpb] — a STRIDED view
+        # into the 27-frame rolling-window output buffer, whose stride (S(1244160,2880,...))
+        # differs from a fresh [1,nfpb,...] tensor. That stride is part of the NEFF cache key,
+        # so a strided input and a contiguous warmup dummy compile as DIFFERENT NEFFs — the
+        # warmup then never covers the real slice-prologue and it recompiles at decode (dies
+        # if the service is down). .contiguous() collapses both paths to ONE key -> warmup
+        # (and the persistent cache) always covers it.
+        latents = latents.contiguous()
         if self.vae_tp_degree <= 1:
             return self.vae.decode_to_pixel(latents) if self.rank == self.vae_rank else None
 
