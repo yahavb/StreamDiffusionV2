@@ -119,7 +119,7 @@ spec:
               # path AND ffmpeg can't write mp4 trailers there (Invalid argument). Copy
               # the whole run folder to /var/mdl ONCE at the very end, off critical path.
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
-              RUN_DIR="/tmp/run/$TS"
+              export RUN_DIR="/tmp/run/$TS"
               FINAL_DIR="/var/mdl/stream_diffusion/runs/$TS"
               PROF_DIR="$RUN_DIR/profile"
               mkdir -p "$PROF_DIR"

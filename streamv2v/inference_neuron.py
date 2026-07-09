@@ -284,6 +284,26 @@ def run_inference(pipeline, args, config, verbose=False):
             torch.neuron.synchronize()
         LOGGER.info(f"[rolling-window] full-clip denoise: {(time.perf_counter()-t_gen):.1f}s "
                     f"for {num_frames} frames")
+
+        # ── ORACLE SPLIT: dump DiT latents + log stats (decide DiT-bug vs VAE-bug) ──
+        # 15 runs of noise; never split DiT-correctness from VAE-correctness. Dump the raw
+        # DiT output latents so RF's proven serve.py VAE can decode them offline. And log
+        # stats now: a DENOISED latent is NOT ~N(0,1) — if mean~0/std~1/full range, the DiT
+        # never denoised (DiT bug, VAE irrelevant); if it has structure, suspect our VAE.
+        try:
+            _lat_cpu = latents.detach().to("cpu").float()
+            _rank = getattr(pipeline, "rank", 0)
+            if _rank == getattr(pipeline, "vae_rank", 0):
+                _dump = os.path.join(os.environ.get("RUN_DIR", "/tmp"), "dit_latents.pt")
+                torch.save({"latents": _lat_cpu, "num_frames": num_frames,
+                            "height": args.height, "width": args.width}, _dump)
+                LOGGER.info(f"[oracle] dumped DiT latents -> {_dump}  shape={tuple(_lat_cpu.shape)}")
+            LOGGER.info(f"[oracle] DiT latent stats: mean={_lat_cpu.mean():.4f} "
+                        f"std={_lat_cpu.std():.4f} min={_lat_cpu.min():.3f} "
+                        f"max={_lat_cpu.max():.3f} absmean={_lat_cpu.abs().mean():.4f}")
+        except Exception as e:
+            LOGGER.warning(f"[oracle] latent dump/stats failed: {e}")
+
         rw_videos = []
         for b in range(0, num_frames, num_frame_per_block):
             blk_lat = latents[:, b:b + num_frame_per_block]
