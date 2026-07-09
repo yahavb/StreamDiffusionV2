@@ -729,6 +729,13 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                 )
                 denoised = pred_full[:, nfpb:]           # drop the context block
             else:
+                # phase 0: no prior context block yet. Still use mode="merged" — it's our
+                # ONLY SP-aware attention path (SP mode leaves q/k/v FULL/unsharded; the
+                # regular "denoise" forward head-shards to 3 heads and crashes on the full
+                # 12-head SP weights: "expanded size (3) must match (12)"). RF's denoise
+                # forward is SP-aware too, but ours isn't — so route phase 0 through merged
+                # with the window as its own cache (cache_update_start = window start, cu
+                # buffers = window buffers). Co-attention over just the window, no context.
                 ts = ts_full[:cur_nf].to(torch.int64).unsqueeze(0)
                 denoised = self.generator(
                     noisy_image_or_video=win_in[:, :cur_nf].contiguous(),
@@ -740,7 +747,10 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
                     updating_cache=True,
                     num_valid_frames=cur_nf,
                     shared_buffers=self.shared_buffers,
-                    mode="denoise",
+                    mode="merged",
+                    cache_update_start=cur_start_f * fseq,
+                    cu_shared_buffers=self.cu_shared_buffers,
+                    nfpb_cu=nfpb,
                 )
 
             # carry this window's first block forward as next phase's clean context
