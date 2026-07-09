@@ -250,11 +250,18 @@ def run_inference(pipeline, args, config, verbose=False):
         t_warm = time.perf_counter()
         LOGGER.info("[vae-warmup] compiling VAE NEFFs before DiT run (service still fresh)...")
         try:
-            for _wb in range(2):  # chunk 0 (first_chunk) + chunk 1 (cache-reuse cat NEFFs)
-                dummy = torch.randn(1, num_frame_per_block, 16,
-                                    args.height // 8, args.width // 8,
-                                    dtype=dtype, device=device)
-                _ = pipeline.decode_latents(dummy)
+            # Run #af61362 proved the timing hypothesis: warmup compiled the VAE (246s) and
+            # cut errno failures 643->14. The 14 that remained were input-SLICE prologues
+            # (SLICE_1x6x16x40x72 -> 1x3x16x40x72): the real loop slices latents[:, b:b+3]
+            # from the FULL-clip parent, a STRIDED view, while my dummy was a contiguous
+            # randn([1,3,...]) -> different NEFF cache key -> those prologues never warmed.
+            # Fix: build the SAME parent shape [1,num_frames,16,H,W] and slice it EXACTLY
+            # like the real loop, so the fused slice-prologue keys match too.
+            _wf = num_frames  # same as the real rolling-window decode below
+            warm_parent = torch.randn(1, _wf, 16, args.height // 8, args.width // 8,
+                                      dtype=dtype, device=device)
+            for b in range(0, _wf, num_frame_per_block):
+                _ = pipeline.decode_latents(warm_parent[:, b:b + num_frame_per_block])
                 if hasattr(torch, 'neuron'):
                     torch.neuron.synchronize()
             LOGGER.info(f"[vae-warmup] done in {(time.perf_counter()-t_warm):.1f}s "
