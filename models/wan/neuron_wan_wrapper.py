@@ -153,13 +153,16 @@ class NeuronWanVAEWrapper(VAEInterface):
             # decode_latents loop.
             idx = getattr(self, "_decode_chunk_idx", 0)
             with torch.no_grad():
-                # batch_frames=False -> always per-frame decode ([decoder(x[:,:,i:i+1])...]).
-                # The batched chunk_idx>0 path decodes all N frames at once (e.g. [6,384,
-                # 120,208]) — a cold shape that floods/crashes the compile service
-                # (errno=111). Per-frame keeps every decode tensor at 1 frame (a shape
-                # that already compiles); cache/chunk_idx still streams continuity.
+                # DECODE EXACTLY LIKE RF: batch_frames=True (RF's default). chunk_idx=0 ->
+                # per-frame; chunk_idx>0 -> whole block in ONE decoder call. This yields the
+                # SAME, STABLE shapes RF uses (and warms/caches). We previously forced
+                # batch_frames=False (always per-frame) to dodge the "cold whole-block shape
+                # crashes the service" errno — but that's OBSOLETE now: the VAE warmup +
+                # persistent NEFF cache compile that whole-block shape once while the service
+                # is fresh. Per-frame was ALSO producing unstable internal temporal-cache cat
+                # shapes (1x6/1x9) the warmup never covered -> the crash we kept chasing.
                 out = self._model.decode_to_pixel(
-                    latent, use_cache=True, chunk_idx=idx, batch_frames=False)
+                    latent, use_cache=True, chunk_idx=idx, batch_frames=True)
             self._decode_chunk_idx = idx + 1
             return out
         device = latent.device
