@@ -742,14 +742,17 @@ class NeuronCausalStreamInferencePipeline(nn.Module):
         the latents to the VAE-TP group first. Only vae_rank returns the video
         (all ranks compute the full output via all-reduce, but we keep one copy).
         """
-        # Force contiguous: the real decode passes latents[:, b:b+nfpb] — a STRIDED view
-        # into the 27-frame rolling-window output buffer, whose stride (S(1244160,2880,...))
-        # differs from a fresh [1,nfpb,...] tensor. That stride is part of the NEFF cache key,
-        # so a strided input and a contiguous warmup dummy compile as DIFFERENT NEFFs — the
-        # warmup then never covers the real slice-prologue and it recompiles at decode (dies
-        # if the service is down). .contiguous() collapses both paths to ONE key -> warmup
-        # (and the persistent cache) always covers it.
-        latents = latents.contiguous()
+        # Canonicalize the decode input: copy the block into a FRESH allocation so NO
+        # upstream slice/view can fuse into the VAE's first op (the div.out prologue). A bare
+        # .contiguous() on a slice-of-N view still carries the parent width into the fused
+        # prologue key (SLICE_1x9.._to_1x3, SLICE_1x15.._to_1x3, ...) — a different NEFF per
+        # caller (rolling-window=15-wide, anchor=9-wide), which the fixed-shape warmup can't
+        # all cover, so one recompiles at decode against a dead service. empty+copy_ severs
+        # the view: every decode sees an identical canonical [1,nfpb,16,H,W] -> ONE prologue
+        # NEFF, which warmup + the persistent cache always cover.
+        _canon = torch.empty(tuple(latents.shape), dtype=latents.dtype, device=latents.device)
+        _canon.copy_(latents)
+        latents = _canon
         if self.vae_tp_degree <= 1:
             return self.vae.decode_to_pixel(latents) if self.rank == self.vae_rank else None
 
