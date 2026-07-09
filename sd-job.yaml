@@ -340,12 +340,20 @@ spec:
             - name: INPUT_VIDEO_SRC
               value: ""
             # 1.3B student caps at TP-4 (12 heads). Single stream: NPROC==TP_DEGREE==4.
+            # ── CLEAN CONTROL (isolate the noise): SP OFF ────────────────────────────
+            # Crash is fixed but output is pure noise. Schedule + x0-return proven correct
+            # vs RF. Only untested-for-CORRECTNESS piece = the SP merged attention across 16
+            # ranks. SP_DEGREE=1 runs the SAME rolling-window loop through the KNOWN-GOOD
+            # regular "denoise" attention (mode!="merged"), head-shard only, no sequence
+            # shard. If this is SHARP -> bug is the SP merged path. If also noise -> bug is
+            # the rolling-window loop itself. Small clip so single-stream doesn't OOM.
+            # (Revert to NPROC=16/SP_DEGREE=4 after this diagnostic.)
             - name: NPROC
-              value: "16"            # SP: world = TP4 x SP4 = 16 ranks (one stream)
+              value: "4"             # TP4 only, single stream (no SP)
             - name: TP_DEGREE
               value: "4"             # head shard (1.3B: 12 heads, TP-4)
             - name: SP_DEGREE
-              value: "4"             # sequence shard (rolling-window merged attention)
+              value: "1"             # SP OFF -> rolling-window uses regular denoise attention
             # 1-STEP: the config we distilled for. This is the whole point — does 1 step
             # produce video (not noise) after distillation? "0" = single final step.
             - name: STEPS
